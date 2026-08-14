@@ -1,0 +1,7 @@
+[package]
+name = "pinbridge-tool"
+version = "0.1.0"
+edition = "2021"
+description = "Glue for building a PinTool DLL in Rust on top of the PinBridge C ABI"
+
+[dependencies]

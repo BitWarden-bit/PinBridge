@@ -1,0 +1,202 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" ToolsVersion="Current" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Release|x64"><Configuration>Release</Configuration><Platform>x64</Platform></ProjectConfiguration>
+    <ProjectConfiguration Include="Debug|x64"><Configuration>Debug</Configuration><Platform>x64</Platform></ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals"><ProjectGuid>{E95E531D-1F07-4935-89BD-7DC43775F1D2}</ProjectGuid><RootNamespace>PinBridge</RootNamespace><Keyword>Win32Proj</Keyword></PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration"><ConfigurationType>DynamicLibrary</ConfigurationType><PlatformToolset>v145</PlatformToolset><WholeProgramOptimization>false</WholeProgramOptimization></PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration"><ConfigurationType>DynamicLibrary</ConfigurationType><PlatformToolset>v145</PlatformToolset></PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <PropertyGroup>
+    <PinRoot Condition="'$(PinRoot)'==''">$(PIN_ROOT)</PinRoot><OutDir>$(MSBuildProjectDirectory)\..\build\pin\x64\$(Configuration)\</OutDir><IntDir>$(OutDir)obj\</IntDir><TargetName>pinbridge</TargetName><GenerateManifest>false</GenerateManifest><LinkIncremental>false</LinkIncremental>
+  </PropertyGroup>
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <AdditionalOptions>/GR- /GS- /EHs- /EHa- /FP:strict /Oi- /FIinclude/msvc_compat.h %(AdditionalOptions)</AdditionalOptions>
+      <AdditionalIncludeDirectories>$(MSBuildProjectDirectory)\..\include;$(MSBuildProjectDirectory)\..\src;$(PinRoot)\source\include\pin;$(PinRoot)\source\include\pin\gen;$(PinRoot)\extras\xed-intel64\include\xed;$(PinRoot)\extras\components\include;$(PinRoot)\extras\stlport\include;$(PinRoot)\extras;$(PinRoot)\extras\libstdc++\include;$(PinRoot)\extras\crt\include;$(PinRoot)\extras\crt;$(PinRoot)\extras\crt\include\arch-x86_64;$(PinRoot)\extras\crt\include\kernel\uapi;$(PinRoot)\extras\crt\include\kernel\uapi\asm-x86;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <PreprocessorDefinitions>TARGET_IA32E;HOST_IA32E;TARGET_WINDOWS;PIN_CRT=1;__LP64__;PB_BUILDING_DLL;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <RuntimeLibrary>MultiThreadedDLL</RuntimeLibrary><BufferSecurityCheck>false</BufferSecurityCheck><FunctionLevelLinking>true</FunctionLevelLinking><RuntimeTypeInfo>false</RuntimeTypeInfo><WarningLevel>Level3</WarningLevel><DisableSpecificWarnings>4530;%(DisableSpecificWarnings)</DisableSpecificWarnings>
+    </ClCompile>
+    <Link>
+      <AdditionalOptions>/export:main %(AdditionalOptions)</AdditionalOptions><AdditionalDependencies>pin.lib;pinipc.lib;xed.lib;pincrt.lib;kernel32.lib;crtbeginS.obj;%(AdditionalDependencies)</AdditionalDependencies><AdditionalLibraryDirectories>$(PinRoot)\intel64\lib;$(PinRoot)\intel64\lib-ext;$(PinRoot)\extras\xed-intel64\lib;$(PinRoot)\intel64\runtime\pincrt;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories><IgnoreAllDefaultLibraries>true</IgnoreAllDefaultLibraries><GenerateDebugInformation>true</GenerateDebugInformation><SubSystem>NotSet</SubSystem><EntryPointSymbol>Ptrace_DllMainCRTStartup</EntryPointSymbol><BaseAddress>0xC5000000</BaseAddress><TargetMachine>MachineX64</TargetMachine><AllowIsolation>true</AllowIsolation>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'"><ClCompile><Optimization>MaxSpeed</Optimization><IntrinsicFunctions>false</IntrinsicFunctions><WholeProgramOptimization>false</WholeProgramOptimization></ClCompile><Link><OptimizeReferences>true</OptimizeReferences></Link></ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'"><ClCompile><Optimization>Disabled</Optimization></ClCompile><Link><OptimizeReferences>false</OptimizeReferences></Link></ItemDefinitionGroup>
+  <ItemGroup>
+    <ClCompile Include="..\src\tool_main.cpp" />
+    <ClCompile Include="..\src\pin_client_glue.cpp" />
+    <ClCompile Include="..\src\pinbridge_ins_capture.cpp" />
+    <ClCompile Include="..\src\ins_capture_backend_pin.cpp" />
+    <ClCompile Include="..\src\pinbridge_disasm.cpp" />
+    <ClCompile Include="..\src\disasm_backend_pin.cpp" />
+    <ClCompile Include="..\src\pinbridge_api.cpp" />
+    <ClCompile Include="..\src\pinbridge_context.cpp" />
+    <ClCompile Include="..\src\pinbridge_context_constants.cpp" />
+    <ClCompile Include="..\src\pinbridge_control_queries.cpp" />
+    <ClCompile Include="..\src\pinbridge_control_attach.cpp" />
+    <ClCompile Include="..\src\pinbridge_control_callbacks.cpp" />
+    <ClCompile Include="..\src\pinbridge_control_fetch.cpp" />
+    <ClCompile Include="..\src\pinbridge_control_internal_exception.cpp" />
+    <ClCompile Include="..\src\pinbridge_control_memory_translation.cpp" />
+    <ClCompile Include="..\src\pinbridge_control_out_of_memory.cpp" />
+    <ClCompile Include="..\src\pinbridge_control_probe_detach.cpp" />
+    <ClCompile Include="..\src\pinbridge_process_follow_child.cpp" />
+    <ClCompile Include="..\src\pinbridge_control_insert_call_probed.cpp" />
+    <ClCompile Include="..\src\pinbridge_control_call_application.cpp" />
+    <ClCompile Include="..\src\pinbridge_bbl_instrumentation.cpp" />
+    <ClCompile Include="..\src\pinbridge_trace_instrumentation.cpp" />
+    <ClCompile Include="..\src\pinbridge_trace_smc.cpp" />
+    <ClCompile Include="..\src\pinbridge_trace_version.cpp" />
+    <ClCompile Include="..\src\pinbridge_error_file.cpp" />
+    <ClCompile Include="..\src\pinbridge_callbacks.cpp" />
+    <ClCompile Include="..\src\pinbridge_physical_context.cpp" />
+    <ClCompile Include="..\src\pinbridge_process.cpp" />
+    <ClCompile Include="..\src\pinbridge_deprecated.cpp" />
+    <ClCompile Include="..\src\pinbridge_replay.cpp" />
+    <ClCompile Include="..\src\pinbridge_ins_modification.cpp" />
+    <ClCompile Include="..\src\pinbridge_buffer.cpp" />
+    <ClCompile Include="..\src\pinbridge_img.cpp" />
+    <ClCompile Include="..\src\pinbridge_syscall.cpp" />
+    <ClCompile Include="..\src\pinbridge_symbols.cpp" />
+    <ClCompile Include="..\src\pinbridge_proto.cpp" />
+    <ClCompile Include="..\src\pinbridge_inst_args.cpp" />
+    <ClCompile Include="..\src\pinbridge_rtn_varargs.cpp" />
+    <ClCompile Include="..\src\pinbridge_knobs.cpp" />
+    <ClCompile Include="..\src\pinbridge_appdebug.cpp" />
+    <ClCompile Include="..\src\pinbridge_exception.cpp" />
+    <ClCompile Include="..\src\pinbridge_lock.cpp" />
+    <ClCompile Include="..\src\pinbridge_message.cpp" />
+    <ClCompile Include="..\src\pinbridge_threads.cpp" />
+    <ClCompile Include="..\src\pinbridge_ins_instrumentation.cpp" />
+    <ClCompile Include="..\src\pinbridge_ins_inspection_extras.cpp" />
+    <ClCompile Include="..\src\pinbridge_utils_core.cpp" />
+    <ClCompile Include="..\src\pinbridge_utils_format.cpp" />
+    <ClCompile Include="..\src\pinbridge_control_state.cpp" />
+    <ClCompile Include="..\src\pinbridge_debug_info.cpp" />
+    <ClCompile Include="..\src\pinbridge_ins_queries.cpp" />
+    <ClCompile Include="..\src\pinbridge_reg_queries.cpp" />
+    <ClCompile Include="..\src\pinbridge_reg_functions.cpp" />
+    <ClCompile Include="..\src\pinbridge_regset.cpp" />
+    <ClCompile Include="..\src\pinbridge_sec.cpp" />
+    <ClCompile Include="..\src\pinbridge_structure_queries.cpp" />
+    <ClCompile Include="..\src\pinbridge_structure_callbacks.cpp" />
+    <ClCompile Include="..\src\pin_backend_pin.cpp" />
+    <ClCompile Include="..\src\context_backend_pin.cpp" />
+    <ClCompile Include="..\src\context_constant_backend_pin.cpp" />
+    <ClCompile Include="..\src\control_query_backend_pin.cpp" />
+    <ClCompile Include="..\src\control_attach_backend_pin.cpp" />
+    <ClCompile Include="..\src\control_callback_backend_pin.cpp" />
+    <ClCompile Include="..\src\control_fetch_backend_pin.cpp" />
+    <ClCompile Include="..\src\control_internal_exception_backend_pin.cpp" />
+    <ClCompile Include="..\src\control_memory_translation_backend_pin.cpp" />
+    <ClCompile Include="..\src\control_out_of_memory_backend_pin.cpp" />
+    <ClCompile Include="..\src\control_probe_detach_backend_pin.cpp" />
+    <ClCompile Include="..\src\process_follow_child_backend_pin.cpp" />
+    <ClCompile Include="..\src\control_insert_call_probed_backend_pin.cpp" />
+    <ClCompile Include="..\src\control_call_application_backend_pin.cpp" />
+    <ClCompile Include="..\src\bbl_instrumentation_backend_pin.cpp" />
+    <ClCompile Include="..\src\trace_instrumentation_backend_pin.cpp" />
+    <ClCompile Include="..\src\trace_smc_backend_pin.cpp" />
+    <ClCompile Include="..\src\trace_version_backend_pin.cpp" />
+    <ClCompile Include="..\src\error_file_backend_pin.cpp" />
+    <ClCompile Include="..\src\callbacks_backend_pin.cpp" />
+    <ClCompile Include="..\src\physical_context_backend_pin.cpp" />
+    <ClCompile Include="..\src\process_backend_pin.cpp" />
+    <ClCompile Include="..\src\deprecated_backend_pin.cpp" />
+    <ClCompile Include="..\src\replay_backend_pin.cpp" />
+    <ClCompile Include="..\src\ins_modification_backend_pin.cpp" />
+    <ClCompile Include="..\src\buffer_backend_pin.cpp" />
+    <ClCompile Include="..\src\img_backend_pin.cpp" />
+    <ClCompile Include="..\src\syscall_backend_pin.cpp" />
+    <ClCompile Include="..\src\symbols_backend_pin.cpp" />
+    <ClCompile Include="..\src\proto_backend_pin.cpp" />
+    <ClCompile Include="..\src\inst_args_backend_pin.cpp" />
+    <ClCompile Include="..\src\rtn_varargs_backend_pin.cpp" />
+    <ClCompile Include="..\src\knobs_backend_pin.cpp" />
+    <ClCompile Include="..\src\appdebug_backend_pin.cpp" />
+    <ClCompile Include="..\src\exception_backend_pin.cpp" />
+    <ClCompile Include="..\src\lock_backend_pin.cpp" />
+    <ClCompile Include="..\src\message_backend_pin.cpp" />
+    <ClCompile Include="..\src\threads_backend_pin.cpp" />
+    <ClCompile Include="..\src\ins_instrumentation_backend_pin.cpp" />
+    <ClCompile Include="..\src\ins_inspection_extras_backend_pin.cpp" />
+    <ClCompile Include="..\src\utils_core_backend_pin.cpp" />
+    <ClCompile Include="..\src\utils_format_backend_pin.cpp" />
+    <ClCompile Include="..\src\control_state_backend_pin.cpp" />
+    <ClCompile Include="..\src\debug_info_backend_pin.cpp" />
+    <ClCompile Include="..\src\pin_query_backend_pin.cpp" />
+    <ClCompile Include="..\src\reg_query_backend_pin.cpp" />
+    <ClCompile Include="..\src\reg_function_backend_pin.cpp" />
+    <ClCompile Include="..\src\regset_backend_pin.cpp" />
+    <ClCompile Include="..\src\sec_backend_pin.cpp" />
+    <ClCompile Include="..\src\structure_query_backend_pin.cpp" />
+    <ClCompile Include="..\src\structure_callback_backend_pin.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="..\include\pinbridge\pinbridge.h" />
+    <ClInclude Include="..\include\pinbridge\generated\ins_inspection_queries.inc" />
+    <ClInclude Include="..\include\pinbridge\generated\context_constants.inc" />
+    <ClInclude Include="..\include\pinbridge\generated\processor_state.inc" />
+    <ClInclude Include="..\include\pinbridge\generated\reg_ids.inc" />
+    <ClInclude Include="..\include\pinbridge\generated\reg_metadata.inc" />
+    <ClInclude Include="..\include\pinbridge\generated\version_constants.inc" />
+    <ClInclude Include="..\include\pinbridge\generated\reg_queries.inc" />
+    <ClInclude Include="..\include\pinbridge\generated\sec_types.inc" />
+    <ClInclude Include="..\include\pinbridge\generated\structure_queries.inc" />
+    <ClInclude Include="..\include\pinbridge\generated\error_file_enums.inc" />
+    <ClInclude Include="..\include\pinbridge\generated\inst_args.inc" />
+    <ClInclude Include="..\src\pin_backend.h" />
+    <ClInclude Include="..\src\ins_capture_backend.h" />
+    <ClInclude Include="..\src\disasm_backend.h" />
+    <ClInclude Include="..\src\context_backend.h" />
+    <ClInclude Include="..\src\context_constant_backend.h" />
+    <ClInclude Include="..\src\control_query_backend.h" />
+    <ClInclude Include="..\src\control_attach_backend.h" />
+    <ClInclude Include="..\src\control_callback_backend.h" />
+    <ClInclude Include="..\src\control_fetch_backend.h" />
+    <ClInclude Include="..\src\control_internal_exception_backend.h" />
+    <ClInclude Include="..\src\lock_backend.h" />
+    <ClInclude Include="..\src\message_backend.h" />
+    <ClInclude Include="..\src\threads_backend.h" />
+    <ClInclude Include="..\src\control_memory_translation_backend.h" />
+    <ClInclude Include="..\src\control_out_of_memory_backend.h" />
+    <ClInclude Include="..\src\control_probe_detach_backend.h" />
+    <ClInclude Include="..\src\process_follow_child_backend.h" />
+    <ClInclude Include="..\src\control_insert_call_probed_backend.h" />
+    <ClInclude Include="..\src\control_call_application_backend.h" />
+    <ClInclude Include="..\src\bbl_instrumentation_backend.h" />
+    <ClInclude Include="..\src\trace_instrumentation_backend.h" />
+    <ClInclude Include="..\src\trace_smc_backend.h" />
+    <ClInclude Include="..\src\trace_version_backend.h" />
+    <ClInclude Include="..\src\error_file_backend.h" />
+    <ClInclude Include="..\src\callbacks_backend.h" />
+    <ClInclude Include="..\src\physical_context_backend.h" />
+    <ClInclude Include="..\src\process_backend.h" />
+    <ClInclude Include="..\src\deprecated_backend.h" />
+    <ClInclude Include="..\src\replay_backend.h" />
+    <ClInclude Include="..\src\ins_modification_backend.h" />
+    <ClInclude Include="..\src\buffer_backend.h" />
+    <ClInclude Include="..\src\img_backend.h" />
+    <ClInclude Include="..\src\syscall_backend.h" />
+    <ClInclude Include="..\src\symbols_backend.h" />
+    <ClInclude Include="..\src\proto_backend.h" />
+    <ClInclude Include="..\src\inst_args_backend.h" />
+    <ClInclude Include="..\src\rtn_varargs_backend.h" />
+    <ClInclude Include="..\src\ins_inspection_extras_backend.h" />
+    <ClInclude Include="..\src\utils_core_backend.h" />
+    <ClInclude Include="..\src\utils_format_backend.h" />
+    <ClInclude Include="..\src\debug_info_backend.h" />
+    <ClInclude Include="..\src\pin_query_backend.h" />
+    <ClInclude Include="..\src\reg_query_backend.h" />
+    <ClInclude Include="..\src\reg_function_backend.h" />
+    <ClInclude Include="..\src\regset_backend.h" />
+    <ClInclude Include="..\src\sec_backend.h" />
+    <ClInclude Include="..\src\regset_conversion_pin.h" />
+    <ClInclude Include="..\src\structure_query_backend.h" />
+    <ClInclude Include="..\src\structure_callback_backend.h" />
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+</Project>

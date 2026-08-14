@@ -1,0 +1,15 @@
+[package]
+name = "pintool-rs"
+version = "0.1.0"
+edition = "2021"
+description = "Minimal PinTool written in Rust on top of the PinBridge C ABI"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+pinbridge-sys = { path = "../pinbridge-sys" }
+pinbridge-tool = { path = "../pinbridge-tool" }
+
+[build-dependencies]
+pinbridge-tool = { path = "../pinbridge-tool" }

@@ -1,0 +1,22 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "pinbridge-ui",
+  "version": "0.1.0",
+  "identifier": "com.pinbridge.ui",
+  "build": {
+    "frontendDist": "./ui/dist"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "title": "PinBridge",
+        "width": 1180,
+        "height": 760
+      }
+    ]
+  },
+  "bundle": {
+    "active": false
+  }
+}

@@ -1,0 +1,11 @@
+#include "appdebug_backend.h"
+#include <cstring>
+namespace {uint64_t loader;PbDebugBreakpointCallback br;PbDebugInterpreterCallback in;PbDebugStatus status=PB_DEBUG_STATUS_DISABLED;}
+PbStatus PbBackendImgGetLoaderInfo(PbImgHandle,uint64_t*o){*o=loader;return PB_OK;} PbStatus PbBackendImgSetLoaderInfo(PbImgHandle,uint64_t v){loader=v;return PB_OK;}
+PbStatus PbBackendAddBreakpoint(PbDebugBreakpointCallback c,void*,uint64_t*o){if(br)return PB_ERR_INVALID_STATE;br=c;*o=31;return PB_OK;} PbStatus PbBackendAddInterpreter(PbDebugInterpreterCallback c,void*,uint64_t*o){if(in)return PB_ERR_INVALID_STATE;in=c;*o=32;return PB_OK;}
+PbStatus PbBackendAddRegisterEmulator(const PbDebuggerRegDescription*,uint32_t,PbGetEmulatedRegisterCallback,PbSetEmulatedRegisterCallback,PbGetTargetDescriptionCallback,void*){return PB_OK;}
+PbStatus PbBackendApplicationBreakpoint(PbConstContextHandle,PbThreadId,uint8_t,const char*){return PB_ERR_INVALID_STATE;} PbStatus PbBackendChangePending(PbThreadId,uint8_t,const char*,uint8_t*o){*o=0;return PB_OK;}
+PbStatus PbBackendGetConnection(PbDebugConnectionInfo*i,uint8_t*e){i->type=PB_DEBUG_CONNECTION_TYPE_NONE;i->stop_at_entry=0;i->tcp_port=0;*e=0;return PB_OK;} PbStatus PbBackendGetDebugStatus(PbDebugStatus*o){*o=status;return PB_OK;} PbStatus PbBackendGetDebuggerType(PbDebuggerType*o){*o=PB_DEBUGGER_TYPE_UNKNOWN;return PB_OK;}
+PbStatus PbBackendGetPending(PbThreadId,char*b,uint64_t c,uint64_t*r,uint8_t*p){const char s[]="";*p=0;*r=sizeof(s);if(!b||c<sizeof(s))return PB_ERR_BUFFER_TOO_SMALL;std::memcpy(b,s,sizeof(s));return PB_OK;}
+PbStatus PbBackendIntercept(PbDebuggingEvent,PbInterceptDebuggingEventCallback,void*){return PB_OK;} PbStatus PbBackendRemoveBreakpoint(PbDebugBreakpointCallback c){if(br!=c)return PB_ERR_INVALID_STATE;br=0;return PB_OK;} PbStatus PbBackendRemoveInterpreter(PbDebugInterpreterCallback c){if(in!=c)return PB_ERR_INVALID_STATE;in=0;return PB_OK;}
+PbStatus PbBackendResetBreakpoint(uint64_t){return PB_OK;} PbStatus PbBackendSetDebugMode(const PbDebugMode*m,uint8_t*o){*o=1;status=m->type==PB_DEBUG_CONNECTION_TYPE_NONE?PB_DEBUG_STATUS_DISABLED:PB_DEBUG_STATUS_UNCONNECTED;return PB_OK;} PbStatus PbBackendWaitDebugger(uint32_t,uint8_t*o){*o=0;return PB_OK;}

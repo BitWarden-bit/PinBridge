@@ -1,0 +1,15 @@
+# Applies to every crate in this workspace. Pin on Windows maps tool DLLs
+# with its own loader, which cannot resolve vcruntime/ucrt imports, so the
+# CRT is linked statically into each cdylib.
+[build]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+# crates.io 直连在国内会无限期卡下载;走 rsproxy 稀疏镜像(项目级配置,不改全局)。
+[source.crates-io]
+replace-with = "rsproxy-sparse"
+
+[source.rsproxy-sparse]
+registry = "sparse+https://rsproxy.cn/index/"
+
+[net]
+git-fetch-with-cli = true

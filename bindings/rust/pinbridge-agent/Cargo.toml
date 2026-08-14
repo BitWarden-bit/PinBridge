@@ -1,0 +1,21 @@
+[package]
+name = "pinbridge-agent"
+version = "0.1.0"
+edition = "2021"
+description = "Rust debugger agent base on the PinBridge C ABI: event engines, bounded rings, batch worker"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+pinbridge-sys = { path = "../pinbridge-sys" }
+pinbridge-tool = { path = "../pinbridge-tool" }
+pinbridge-proto = { path = "../pinbridge-proto" }
+pinbridge-client = { path = "../pinbridge-client" }
+# Embedded CPython for the in-agent scripting host. No auto-initialize: the
+# interpreter is started manually on the scripting thread (PyConfig path) so
+# agent_main never touches the OS loader during Pin's tool-load sequence.
+pyo3 = { version = "0.22" }
+
+[build-dependencies]
+pinbridge-tool = { path = "../pinbridge-tool" }

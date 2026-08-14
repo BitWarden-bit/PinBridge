@@ -1,0 +1,14 @@
+[workspace]
+resolver = "2"
+members = ["pinbridge-sys", "pinbridge-tool", "pinbridge-proto", "pinbridge-agent", "pintool-rs", "pinbridge-client", "pinbridge-tui", "pinbridge-ui", "pinbridge-cli"]
+
+[profile.release]
+# A tool DLL runs inside Pin's process on application threads; unwinding
+# across the FFI boundary is undefined, so panics abort instead.
+panic = "abort"
+
+[patch.crates-io]
+# Vendored pyo3 0.22.6 with the GIL refcount made TLS-free (see the
+# PINBRIDGE PATCH block in third_party/pyo3/src/gil.rs). Required because
+# Pin maps the agent privately and its module TLS index is never assigned.
+pyo3 = { path = "third_party/pyo3" }

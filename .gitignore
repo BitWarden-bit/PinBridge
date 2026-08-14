@@ -1,0 +1,28 @@
+# Build outputs
+/build/
+**/target/
+tmp-liveness/
+.vs/
+*.user
+
+# Node (pinbridge-ui frontend)
+node_modules/
+bindings/rust/pinbridge-ui/ui/dist/
+
+# Python
+__pycache__/
+*.pyc
+
+# Logs, dumps, scratch
+*.log
+*.obj
+*.dmp
+*.pdb
+crash_dump.txt
+heap_log.txt
+ui_script_log.txt
+rpc_fixture_info.txt
+script_e2e_*.py
+script_e2e_*.log
+script_e2e_*.txt
+sample_window.pbtr

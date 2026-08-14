@@ -1,0 +1,15 @@
+[package]
+name = "pinbridge-ui"
+version = "0.1.0"
+edition = "2021"
+description = "Tauri (HTML/WebView) dashboard for pinbridge-agent"
+
+[build-dependencies]
+tauri-build = "2"
+
+[dependencies]
+tauri = "2"
+tauri-plugin-dialog = "2"
+serde_json = "1"
+pinbridge-client = { path = "../pinbridge-client" }
+pinbridge-proto = { path = "../pinbridge-proto" }

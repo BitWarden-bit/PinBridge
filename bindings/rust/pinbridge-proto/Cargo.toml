@@ -1,0 +1,7 @@
+[package]
+name = "pinbridge-proto"
+version = "0.1.0"
+edition = "2021"
+description = "Binary query protocol shared by pinbridge-agent (server) and out-of-process UIs (clients)"
+
+[dependencies]

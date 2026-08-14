@@ -1,0 +1,10 @@
+[package]
+name = "pinbridge-cli"
+version = "0.1.0"
+edition = "2021"
+description = "Headless console for pinbridge-agent: every query op as a scriptable command with JSON output"
+
+[dependencies]
+pinbridge-client = { path = "../pinbridge-client" }
+pinbridge-proto = { path = "../pinbridge-proto" }
+serde_json = "1"

@@ -1,0 +1,8 @@
+[package]
+name = "pinbridge-client"
+version = "0.1.0"
+edition = "2021"
+description = "Client + backend launcher for the pinbridge-agent query protocol, shared by UI frontends"
+
+[dependencies]
+pinbridge-proto = { path = "../pinbridge-proto" }

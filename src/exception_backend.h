@@ -1,0 +1,20 @@
+#ifndef PINBRIDGE_EXCEPTION_BACKEND_H
+#define PINBRIDGE_EXCEPTION_BACKEND_H
+#include "pinbridge/pinbridge.h"
+PbStatus PbBackendExceptionRelease(PbExceptionInfoHandle);
+PbStatus PbBackendExceptionCount(PbExceptionInfoHandle,uint32_t*);
+PbStatus PbBackendExceptionString(PbExceptionInfoHandle,char*,uint64_t,uint64_t*);
+PbStatus PbBackendExceptionAddress(PbExceptionInfoHandle,uint64_t*);
+PbStatus PbBackendExceptionClass(PbExceptionCode,PbExceptionClass*);
+PbStatus PbBackendExceptionCode(PbExceptionInfoHandle,PbExceptionCode*);
+PbStatus PbBackendExceptionFaultAddress(PbExceptionInfoHandle,uint64_t*,uint8_t*);
+PbStatus PbBackendExceptionFaultType(PbExceptionInfoHandle,PbFaultyAccessType*);
+PbStatus PbBackendExceptionFpErrors(PbExceptionInfoHandle,uint32_t*);
+PbStatus PbBackendExceptionWindowsArg(PbExceptionInfoHandle,uint32_t,uint64_t*);
+PbStatus PbBackendExceptionWindowsCode(PbExceptionInfoHandle,uint32_t*);
+PbStatus PbBackendExceptionInitAccess(PbExceptionCode,uint64_t,uint64_t,PbFaultyAccessType,PbExceptionInfoHandle*);
+PbStatus PbBackendExceptionInit(PbExceptionCode,uint64_t,PbExceptionInfoHandle*);
+PbStatus PbBackendExceptionInitWindows(uint32_t,uint64_t,const uint64_t*,uint32_t,PbExceptionInfoHandle*);
+PbStatus PbBackendExceptionRaise(PbConstContextHandle,PbThreadId,PbExceptionInfoHandle);
+PbStatus PbBackendExceptionSetAddress(PbExceptionInfoHandle,uint64_t);
+#endif

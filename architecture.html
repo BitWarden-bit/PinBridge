@@ -1,0 +1,435 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PinBridge — 架构设计</title>
+<style>
+  :root {
+    --bg: #eef2f7;
+    --card: #ffffff;
+    --line: #d4dce6;
+    --line-strong: #b9c4d4;
+    --ink: #1a2332;
+    --muted: #5f6b7d;
+    --faint: #8a96a8;
+    --header: #1e3a5f;      /* 模块标题栏深蓝 */
+    --header-ink: #eaf1fb;
+
+    /* 分层渐变（浅→深，表示自上而下） */
+    --c-front: #93c5fd;
+    --c-client:#60a5fa;
+    --c-proto: #3b82f6;
+    --c-agent: #2563eb;
+    --c-bridge:#1d4ed8;
+    --c-pin:   #1e40af;
+    --c-target:#172554;
+
+    /* 语义色（数据流） */
+    --flow-hot: #dc2626;    /* 热路径 */
+    --flow-ctl: #2563eb;    /* 控制面 */
+    --flow-rec: #059669;    /* 录制/重放 */
+
+    --mono: "Cascadia Code", "JetBrains Mono", Consolas, "SFMono-Regular", monospace;
+    --sans: "Segoe UI", "Microsoft YaHei", -apple-system, "Helvetica Neue", Arial, sans-serif;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--ink);
+    font-family: var(--sans);
+    padding: 34px 22px 72px;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 1200px; margin: 0 auto; }
+
+  /* ---------- 页眉 ---------- */
+  .masthead { display: flex; align-items: flex-end; justify-content: space-between; gap: 20px; margin-bottom: 14px; }
+  .masthead .title { display: flex; align-items: center; gap: 12px; }
+  .masthead .logo {
+    width: 40px; height: 40px; border-radius: 9px; flex: 0 0 auto;
+    background: linear-gradient(135deg, #1e3a5f, #2563eb);
+    color: #fff; font-weight: 800; font-size: 18px;
+    display: flex; align-items: center; justify-content: center; letter-spacing: .5px;
+  }
+  .masthead h1 { font-size: 22px; font-weight: 700; letter-spacing: .3px; }
+  .masthead .sub { color: var(--muted); font-size: 13px; margin-top: 3px; }
+  .meta { text-align: right; font-size: 12px; color: var(--muted); line-height: 1.7; font-family: var(--mono); white-space: nowrap; }
+  .meta b { color: var(--ink); font-weight: 600; }
+
+  /* ---------- 图例 ---------- */
+  .legend {
+    display: flex; flex-wrap: wrap; gap: 7px 16px; align-items: center;
+    padding: 10px 14px; background: var(--card); border: 1px solid var(--line);
+    border-radius: 8px; margin-bottom: 22px; font-size: 12px; color: var(--muted);
+  }
+  .legend .lbl { font-weight: 600; color: var(--ink); margin-right: 2px; }
+  .legend span { display: inline-flex; align-items: center; gap: 6px; }
+  .sw { width: 12px; height: 12px; border-radius: 3px; display: inline-block; border: 1px solid rgba(0,0,0,.15); }
+
+  /* ---------- 分层泳道 ---------- */
+  .tier { display: flex; align-items: stretch; gap: 0; }
+  .tier-label {
+    flex: 0 0 34px; width: 34px;
+    background: var(--header); color: #dfe9f7;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 11.5px; font-weight: 600; letter-spacing: 2px;
+    writing-mode: vertical-rl;
+    border-radius: 8px 0 0 8px;
+  }
+  .tier-body {
+    flex: 1; background: var(--card); border: 1px solid var(--line);
+    border-left: none; border-radius: 0 8px 8px 0;
+    padding: 14px 16px;
+  }
+  .tier-head { display: flex; align-items: baseline; gap: 10px; margin-bottom: 12px; }
+  .tier-title { font-size: 14.5px; font-weight: 700; color: var(--ink); }
+  .tier-role { font-size: 12px; color: var(--muted); }
+  .tier-tech {
+    margin-left: auto; font-size: 11px; font-family: var(--mono);
+    color: var(--c-bridge); font-weight: 600;
+  }
+
+  /* 模块框（带标题栏） */
+  .mods { display: flex; flex-wrap: wrap; gap: 10px; }
+  .mod {
+    flex: 1 1 220px; min-width: 190px;
+    border: 1px solid var(--line-strong); border-radius: 7px; overflow: hidden;
+    background: #fbfcfe;
+  }
+  .mod .hd {
+    background: var(--header); color: var(--header-ink);
+    font-size: 12.5px; font-weight: 600; padding: 6px 10px;
+    display: flex; align-items: center; gap: 7px;
+  }
+  .mod .hd .k { font-family: var(--mono); font-weight: 400; font-size: 10.5px; opacity: .8; }
+  .mod .bd { padding: 8px 10px; font-size: 11.8px; line-height: 1.55; color: var(--ink); }
+  .mod .bd small { color: var(--muted); display: block; }
+  .mod .bd code { font-family: var(--mono); font-size: 10.8px; color: #35517d; background: #eef3fb; padding: 0 4px; border-radius: 4px; }
+
+  /* 子容器（agent 内部） */
+  .sub {
+    margin-top: 10px; border: 1px dashed var(--line-strong); border-radius: 7px;
+    background: #f7fafd; padding: 10px;
+  }
+  .sub .cap { font-size: 11px; font-weight: 700; color: var(--c-bridge); margin-bottom: 8px; letter-spacing: .3px; }
+  .sub .mod { flex: 1 1 200px; }
+
+  /* 端口标注 */
+  .port {
+    display: inline-flex; align-items: center; gap: 6px;
+    font-family: var(--mono); font-size: 10.8px; color: #35517d;
+    background: #eef3fb; border: 1px solid #d5e1f5; border-radius: 5px;
+    padding: 2px 8px; margin: 2px 4px 2px 0;
+  }
+  .port::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: #2563eb; }
+
+  /* ---------- 层间连接 ---------- */
+  .link { display: flex; flex-direction: column; align-items: center; padding: 3px 0 3px 34px; }
+  .link .stem { width: 2px; height: 13px; background: var(--line-strong); }
+  .link .joint {
+    display: flex; align-items: center; gap: 8px;
+    font-size: 11.5px; color: #4a5870; font-family: var(--mono);
+    background: var(--card); border: 1px solid var(--line-strong);
+    border-radius: 999px; padding: 4px 13px; white-space: nowrap;
+  }
+  .link .joint::before, .link .joint::after { content: ""; height: 1px; width: 22px; background: var(--line-strong); }
+  .link .head { width: 0; height: 0; border-left: 6px solid transparent; border-right: 6px solid transparent; border-top: 8px solid var(--line-strong); }
+  .link.note { flex-direction: row; justify-content: center; gap: 10px; padding-top: 2px; }
+  .link.note .joint::before, .link.note .joint::after { display: none; }
+
+  /* ---------- 分区标题 ---------- */
+  .section {
+    font-size: 16px; font-weight: 700; color: var(--ink);
+    margin: 38px 0 14px; display: flex; align-items: center; gap: 10px;
+  }
+  .section::before { content: ""; width: 4px; height: 18px; border-radius: 2px; background: var(--c-bridge); }
+
+  /* ---------- 数据流 ---------- */
+  .flows { display: flex; gap: 12px; flex-wrap: wrap; }
+  .flow {
+    flex: 1 1 360px; background: var(--card); border: 1px solid var(--line);
+    border-radius: 8px; overflow: hidden; border-top: 3px solid;
+  }
+  .flow.hot  { border-top-color: var(--flow-hot); }
+  .flow.ctl  { border-top-color: var(--flow-ctl); }
+  .flow.rec  { border-top-color: var(--flow-rec); }
+  .flow .fh { padding: 10px 14px; border-bottom: 1px solid var(--line); background: #fbfcfe; }
+  .flow .fh h3 { font-size: 13.5px; font-weight: 700; display: flex; align-items: center; gap: 8px; }
+  .flow .fh .d { font-size: 11px; color: var(--muted); margin-top: 2px; }
+  .pill { font-size: 10.5px; padding: 2px 8px; border-radius: 999px; font-weight: 700; color: #fff; }
+  .flow.hot .pill { background: var(--flow-hot); }
+  .flow.ctl .pill { background: var(--flow-ctl); }
+  .flow.rec .pill { background: var(--flow-rec); }
+  .step { display: flex; gap: 10px; padding: 8px 14px; border-bottom: 1px dashed #e4e9f1; font-size: 12px; line-height: 1.5; }
+  .step:last-child { border-bottom: none; }
+  .step .n {
+    flex: 0 0 20px; height: 20px; border-radius: 5px; font-size: 10.5px; font-weight: 700;
+    display: inline-flex; align-items: center; justify-content: center; color: #fff; margin-top: 1px;
+  }
+  .step code { font-family: var(--mono); font-size: 10.8px; color: #35517d; background: #eef3fb; padding: 0 4px; border-radius: 4px; }
+  .flow.hot .step .n { background: var(--flow-hot); }
+  .flow.ctl .step .n { background: var(--flow-ctl); }
+  .flow.rec .step .n { background: var(--flow-rec); }
+  .step.warn { background: #fdf4f4; color: #7a2e2e; }
+  .step.warn .n { background: #b91c1c !important; }
+  .step.warn code { background: #fbe6e6; color: #7a2e2e; }
+
+  /* ---------- 路线图 ---------- */
+  .roadmap { display: flex; gap: 12px; flex-wrap: wrap; }
+  .stage { flex: 1 1 300px; background: var(--card); border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+  .stage .sh { padding: 10px 14px; color: #fff; font-size: 13px; font-weight: 700; }
+  .stage .sb { padding: 10px 14px; font-size: 12px; line-height: 1.6; color: var(--ink); }
+  .stage .sb code { font-family: var(--mono); font-size: 10.8px; color: #35517d; background: #eef3fb; padding: 0 4px; border-radius: 4px; }
+  .stage.s1 .sh { background: var(--c-proto); }
+  .stage.s2 .sh { background: var(--c-bridge); }
+  .stage.s3 .sh { background: var(--flow-rec); }
+
+  /* ---------- 页脚 ---------- */
+  .foot {
+    margin-top: 34px; padding: 16px 18px; border-radius: 8px;
+    background: var(--card); border: 1px solid var(--line);
+    font-size: 12.5px; line-height: 1.8; color: var(--muted);
+  }
+  .foot b { color: var(--ink); }
+  .foot .tags { margin-top: 8px; display: flex; flex-wrap: wrap; gap: 6px; }
+  .foot .tags span {
+    font-family: var(--mono); font-size: 10.5px; color: #35517d;
+    background: #eef3fb; border: 1px solid #d5e1f5; border-radius: 5px; padding: 2px 8px;
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <!-- ===================== 页眉 ===================== -->
+  <div class="masthead">
+    <div class="title">
+      <div class="logo">PB</div>
+      <div>
+        <h1>PinBridge — 架构设计</h1>
+        <div class="sub">Intel Pin 3.31 PinTool SDK 冻结 C ABI + C++ 适配层 + Rust 消费栈 · 面向 VMP 脱壳/逆向的「录制 → 重放 → 污点分析」底座</div>
+      </div>
+    </div>
+    <div class="meta">
+      <div><b>ABI</b> v1.5 &nbsp;|&nbsp; <b>导出</b> 689 × pb_*</div>
+      <div><b>Pin</b> 3.31 (build 98869)</div>
+      <div><b>平台</b> Windows x64</div>
+    </div>
+  </div>
+
+  <!-- ===================== 图例 ===================== -->
+  <div class="legend">
+    <span class="lbl">分层</span>
+    <span><i class="sw" style="background:var(--c-front)"></i>前端</span>
+    <span><i class="sw" style="background:var(--c-proto)"></i>协议</span>
+    <span><i class="sw" style="background:var(--c-agent)"></i>agent</span>
+    <span><i class="sw" style="background:var(--c-bridge)"></i>ABI 桥</span>
+    <span><i class="sw" style="background:var(--c-pin)"></i>Pin JIT</span>
+    <span><i class="sw" style="background:var(--c-target)"></i>目标</span>
+    <span class="lbl" style="margin-left:14px">数据流</span>
+    <span><i class="sw" style="background:var(--flow-hot)"></i>热路径</span>
+    <span><i class="sw" style="background:var(--flow-ctl)"></i>控制面</span>
+    <span><i class="sw" style="background:var(--flow-rec)"></i>录制/重放</span>
+  </div>
+
+  <!-- ===================== 主图：分层泳道 ===================== -->
+
+  <!-- 1. 前端 -->
+  <div class="tier">
+    <div class="tier-label" style="background:var(--c-front)">前端</div>
+    <div class="tier-body">
+      <div class="tier-head">
+        <span class="tier-title">前端层 Frontends</span>
+        <span class="tier-role">美化层 · 一切功能先进 CLI/协议，UI 是之后的薄壳</span>
+        <span class="tier-tech">headless 一级公民</span>
+      </div>
+      <div class="mods">
+        <div class="mod"><div class="hd">pinbridge-cli <span class="k">· bin</span></div>
+          <div class="bd"><small>headless 控制台（主入口）</small><code>ping | counters | events | script | trace | bp | stop…</code></div></div>
+        <div class="mod"><div class="hd">pinbridge-tui <span class="k">· ratatui</span></div>
+          <div class="bd"><small>终端仪表盘（轻量备选）</small><code>Plugins 面板 · 前端即启动器</code></div></div>
+        <div class="mod"><div class="hd">pinbridge-ui <span class="k">· Tauri</span></div>
+          <div class="bd"><small>WebView HTML 仪表盘（主前端）</small><code>vanilla JS · 无需 npm</code></div></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="link"><span class="stem"></span><span class="joint">三端共用统一客户端</span><span class="head"></span></div>
+
+  <!-- 2. client -->
+  <div class="tier">
+    <div class="tier-label" style="background:var(--c-client)">客户端</div>
+    <div class="tier-body">
+      <div class="tier-head">
+        <span class="tier-title">pinbridge-client</span>
+        <span class="tier-role">客户端 + 后端启动器（拉起 pin+agent+目标 → 等端口 → 连接 → 退出回收进程树）</span>
+        <span class="tier-tech">Rust crate</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="link"><span class="stem"></span><span class="joint">pinbridge-proto · 二进制查询协议 · loopback TCP :9001</span><span class="head"></span></div>
+
+  <!-- 3. agent -->
+  <div class="tier">
+    <div class="tier-label" style="background:var(--c-agent)">Agent</div>
+    <div class="tier-body">
+      <div class="tier-head">
+        <span class="tier-title">pinbridge-agent.dll</span>
+        <span class="tier-role">调试器基座 (Rust cdylib) · 被 Pin 私有映射进目标进程</span>
+        <span class="tier-tech">查询线程 / 脚本线程 / 录制线程</span>
+      </div>
+      <div class="mods">
+        <div class="mod"><div class="hd">查询服务线程 <span class="k">query_server</span></div>
+          <div class="bd"><small>Pin 内部线程 · 纯被动 · 无客户端零成本</small><code>每 op 一条短连接（长连接饿死单线程）</code></div></div>
+        <div class="mod"><div class="hd">脚本线程 <span class="k">scripting/host</span></div>
+          <div class="bd"><small>内嵌 CPython 3.10 · 多插件热加载</small><code>pyo3 vendored · GIL 无 TLS 补丁</code></div></div>
+        <div class="mod"><div class="hd">录制 drain 线程 <span class="k">record.rs</span></div>
+          <div class="bd"><small>独立大容量 slab → .pbtr 落盘</small><code>1M 槽 · kind 9/10/11</code></div></div>
+      </div>
+      <div class="sub">
+        <div class="cap">运行时核心</div>
+        <div class="mods">
+          <div class="mod"><div class="hd">有界事件环 ring</div>
+            <div class="bd"><small>64K 定长槽 · 定长 POD · 零分配零 I/O</small><code>kind 1–8：hook_regs / memory / exec / branch / syscall / ctx / module</code></div></div>
+          <div class="mod"><div class="hd">控制面 &amp; 观测引擎</div>
+            <div class="bd"><small>断点与观测</small><code>bp(64) · hooks(4096) · stepper(si/so) · syscall_engine · exc policy</code></div></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="link"><span class="stem"></span><span class="joint">pb_* C ABI 调用 · __cdecl · 无 C++/异常/STL 跨界</span><span class="head"></span></div>
+
+  <!-- 4. bridge -->
+  <div class="tier">
+    <div class="tier-label" style="background:var(--c-bridge)">ABI 桥</div>
+    <div class="tier-body">
+      <div class="tier-head">
+        <span class="tier-title">pinbridge.dll</span>
+        <span class="tier-role">C++ ABI 桥 — 把 Pin C++ API 冻结成稳定 C ABI</span>
+        <span class="tier-tech">facade → backend 接口 → Pin 实现</span>
+      </div>
+      <div class="mods">
+        <div class="mod"><div class="hd">导出面</div>
+          <div class="bd"><small>689 pb_* 导出 · ABI v1.5</small><code>1213 常量 / 17 结构体 / 42 回调 typedef</code></div></div>
+        <div class="mod"><div class="hd">三层结构</div>
+          <div class="bd"><small>facade → backend → Pin</small><code>pinbridge_*.cpp → *_backend.h → *_backend_pin.cpp</code></div></div>
+        <div class="mod"><div class="hd">固定抓取族 ×6</div>
+          <div class="bd"><small>JIT-only 固定 IARG 组合</small><code>capture_regs / memory_operands / exec / branch_edge / exec_bytes / memory_operands_values</code></div></div>
+        <div class="mod"><div class="hd">ABI 纪律</div>
+          <div class="bd"><small>跨语言可用的根因</small><code>opaque handle · 三段式 (buf, cap, req*) · 无内存所有权跨界 → CRT 完全隔离</code></div></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="link"><span class="stem"></span><span class="joint">Pin C++ API · INS_InsertCall · IPOINT_BEFORE / AFTER</span><span class="head"></span></div>
+
+  <!-- 5. pin -->
+  <div class="tier">
+    <div class="tier-label" style="background:var(--c-pin)">Pin</div>
+    <div class="tier-body">
+      <div class="tier-head">
+        <span class="tier-title">Intel Pin 3.31 JIT 引擎</span>
+        <span class="tier-role">重编译目标指令，在 instrumentation time 插入分析回调</span>
+        <span class="tier-tech">Pin 是宿主</span>
+      </div>
+      <div class="mods">
+        <div class="mod"><div class="hd">启动命令</div>
+          <div class="bd"><code>pin.exe -t pinbridge_agent.dll -- target.exe</code></div></div>
+        <div class="mod"><div class="hd">加载关系</div>
+          <div class="bd"><small>agent.dll / pinbridge.dll 都是被私有映射的工具 DLL</small><code>Pin 用自己的 loader 映射（非系统 loader）</code></div></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="link"><span class="stem"></span><span class="joint">分析回调 · application threads · 范围过滤后</span><span class="head"></span></div>
+
+  <!-- 6. target -->
+  <div class="tier">
+    <div class="tier-label" style="background:var(--c-target)">目标</div>
+    <div class="tier-body">
+      <div class="tier-head">
+        <span class="tier-title">目标进程 target.exe</span>
+        <span class="tier-role">VMP 壳 / 脱壳目标 / 任意 Windows 程序</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===================== 数据流 ===================== -->
+  <div class="section">三条数据流</div>
+  <div class="flows">
+
+    <div class="flow hot">
+      <div class="fh">
+        <h3><span class="pill">A</span> 事件热路径</h3>
+        <div class="d">高频 · instrumentation time 决策 · 零成本</div>
+      </div>
+      <div class="step"><span class="n">1</span>目标指令 → Pin JIT 重编译 → 插桩点</div>
+      <div class="step"><span class="n">2</span>范围过滤 <code>RANGE / HOOK / syscallfilter</code>（编译期折叠）</div>
+      <div class="step"><span class="n">3</span>固定 IARG 抓取：寄存器 / 内存操作数 / 分支 / 指令字节 / 值</div>
+      <div class="step"><span class="n">4</span>写 ring（64K 定长槽 · 零分配零 I/O · 不 panic）</div>
+      <div class="step"><span class="n">5</span>消费者被动翻页：查询线程 / 脚本线程 / 录制 drain</div>
+      <div class="step warn"><span class="n">!</span>同步只用 <code>pb_pin_mutex_*</code>；<code>std::sync::Mutex</code> 进热路径会 9/10 崩溃</div>
+    </div>
+
+    <div class="flow ctl">
+      <div class="fh">
+        <h3><span class="pill">B</span> 控制 / 观测面</h3>
+        <div class="d">低频 · 请求-响应 · loopback RPC</div>
+      </div>
+      <div class="step"><span class="n">1</span>CLI / TUI / UI → pinbridge-client → query_server</div>
+      <div class="step"><span class="n">2</span>控制：<code>stop/resume · read/write · bp(64) · hooks(4096)</code></div>
+      <div class="step"><span class="n">3</span>单步：<code>si/so</code>（落点回调内停泊，非异步挂起）</div>
+      <div class="step"><span class="n">4</span>观测：<code>modules/threads/exports · setreg · syscallfilter · engine</code></div>
+      <div class="step"><span class="n">5</span>断点命中 → 停泊 → 改上下文 → resume</div>
+      <div class="step warn"><span class="n">!</span>stop/resume 与调用线程配对；跨线程 resume 直接杀进程</div>
+    </div>
+
+    <div class="flow rec">
+      <div class="fh">
+        <h3><span class="pill">C</span> 脚本 &amp; 录制/重放</h3>
+        <div class="d">污点分析主链 · 编排 → 录制 → 离线重放</div>
+      </div>
+      <div class="step"><span class="n">1</span>脚本线程每 tick ~5ms：拉事件页 ≤2048 条 + 停点快照</div>
+      <div class="step"><span class="n">2</span>插件 <code>pb.*</code> 动作 = 一次 loopback RPC（微秒级）</div>
+      <div class="step"><span class="n">3</span><code>pb.trace_start</code> → 独立 slab 录制 kind 9/10/11</div>
+      <div class="step"><span class="n">4</span>drain 线程落盘 <code>.pbtr</code>（PBTR v1 · 88B 记录流）</div>
+      <div class="step"><span class="n">5</span>离线 <code>taint.py</code>：前向污点 + 后向切片（capstone）</div>
+      <div class="step warn"><span class="n">!</span>具体 EA 消灭别名 → 无需指针分析；ring 溢出 = 窗口作废</div>
+    </div>
+
+  </div>
+
+  <!-- ===================== 路线图 ===================== -->
+  <div class="section">污点分析三层路线图</div>
+  <div class="roadmap">
+    <div class="stage s1">
+      <div class="sh">① 编排层 · 已完成</div>
+      <div class="sb">内嵌 CPython 多插件脚本宿主：事件订阅、断点/hook、内存与寄存器读写、停走单步、符号解析。<code>pb_init / on_event_batch / on_bp_hit / bp_set / hook_set / read_mem / get_reg…</code></div>
+    </div>
+    <div class="stage s2">
+      <div class="sh">② 录制通道 · 已交付 (ABI v1.5)</div>
+      <div class="sb">把「跑过的那段执行」无损落盘：<code>trace start/stop/tracest</code>，独立 1M 槽 slab，Pin 内部线程 drain。档2 抓取：<code>exec_bytes(9) / mem_value(10) / marker(11)</code> → <code>.pbtr</code>。</div>
+    </div>
+    <div class="stage s3">
+      <div class="sh">③ 重放分析层 · 原型中</div>
+      <div class="sb">纯 Python 离线引擎：<code>pbtrace.py / recorder.py / taint.py</code>，前向污点传播 + 后向切片（capstone 解码）。具体 EA 消灭别名，不做指针分析。<code>16 个离线单测</code>。</div>
+    </div>
+  </div>
+
+  <!-- ===================== 页脚 ===================== -->
+  <div class="foot">
+    <b>设计哲学：</b>Pin 负责指令重编译与插桩回调；<b>pinbridge.dll</b> 把 C++ API 冻结成 C ABI；<b>pinbridge-agent.dll</b>
+    做「过滤插桩 → 定长事件 → 有界 ring」外加控制/脚本/录制三个旁路；<b>协议/客户端</b> 提供统一二进制查询面；
+    <b>前端</b> 只消费聚合与水位；<b>离线 replay</b> 在录制轨迹上做污点与切片。
+    <div class="tags">
+      <span>CRT 隔离</span><span>类型隔离</span><span>内存所有权隔离</span><span>线程隔离</span><span>I/O 隔离</span>
+      <span>900 万事件/s vs 60 帧/s</span><span>热路径写 ring 永不阻塞 UI</span>
+    </div>
+  </div>
+
+</div>
+</body>
+</html>

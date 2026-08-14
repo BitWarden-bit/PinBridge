@@ -1,0 +1,10 @@
+[package]
+name = "pinbridge-sys"
+version = "1.0.0"
+edition = "2021"
+description = "Raw FFI bindings for the PinBridge C ABI (pinbridge.dll), generated from pinbridge.h"
+license = "MIT OR Apache-2.0"
+links = "pinbridge"
+build = "build.rs"
+
+[dependencies]

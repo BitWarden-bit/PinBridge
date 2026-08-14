@@ -1,0 +1,6 @@
+{
+  "identifier": "default",
+  "description": "default window capabilities",
+  "windows": ["main"],
+  "permissions": ["core:default", "dialog:default"]
+}
