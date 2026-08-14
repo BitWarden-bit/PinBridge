@@ -208,7 +208,7 @@
       <div class="logo">PB</div>
       <div>
         <h1>PinBridge — 架构设计</h1>
-        <div class="sub">Intel Pin 3.31 PinTool SDK 冻结 C ABI + C++ 适配层 + Rust 消费栈 · 面向 VMP 脱壳/逆向的「录制 → 重放 → 污点分析」底座</div>
+        <div class="sub">给 Windows 程序做动态分析（脱壳 / 逆向 / 对抗 VMP 混淆）的工具台：底层把 Intel Pin 的能力翻译成谁都能调用的 C 接口，中间是一个住进目标进程的调试代理，上面用 Python 插件写分析逻辑；逐指令的重活靠「先录下来，再离线慢慢拆」。</div>
       </div>
     </div>
     <div class="meta">
@@ -221,16 +221,16 @@
   <!-- ===================== 图例 ===================== -->
   <div class="legend">
     <span class="lbl">分层</span>
-    <span><i class="sw" style="background:var(--c-front)"></i>前端</span>
-    <span><i class="sw" style="background:var(--c-proto)"></i>协议</span>
-    <span><i class="sw" style="background:var(--c-agent)"></i>agent</span>
-    <span><i class="sw" style="background:var(--c-bridge)"></i>ABI 桥</span>
-    <span><i class="sw" style="background:var(--c-pin)"></i>Pin JIT</span>
-    <span><i class="sw" style="background:var(--c-target)"></i>目标</span>
+    <span><i class="sw" style="background:var(--c-front)"></i>前端（你操作的界面）</span>
+    <span><i class="sw" style="background:var(--c-proto)"></i>协议（通话规矩）</span>
+    <span><i class="sw" style="background:var(--c-agent)"></i>调试代理</span>
+    <span><i class="sw" style="background:var(--c-bridge)"></i>C 接口桥</span>
+    <span><i class="sw" style="background:var(--c-pin)"></i>Pin 插桩引擎</span>
+    <span><i class="sw" style="background:var(--c-target)"></i>被分析的程序</span>
     <span class="lbl" style="margin-left:14px">数据流</span>
-    <span><i class="sw" style="background:var(--flow-hot)"></i>热路径</span>
-    <span><i class="sw" style="background:var(--flow-ctl)"></i>控制面</span>
-    <span><i class="sw" style="background:var(--flow-rec)"></i>录制/重放</span>
+    <span><i class="sw" style="background:var(--flow-hot)"></i>事件高速通道</span>
+    <span><i class="sw" style="background:var(--flow-ctl)"></i>命令通道</span>
+    <span><i class="sw" style="background:var(--flow-rec)"></i>录制 / 离线分析</span>
   </div>
 
   <!-- ===================== 主图：分层泳道 ===================== -->
@@ -240,164 +240,158 @@
     <div class="tier-label" style="background:var(--c-front)">前端</div>
     <div class="tier-body">
       <div class="tier-head">
-        <span class="tier-title">前端层 Frontends</span>
-        <span class="tier-role">美化层 · 一切功能先进 CLI/协议，UI 是之后的薄壳</span>
-        <span class="tier-tech">headless 一级公民</span>
+        <span class="tier-title">前端层 —— 你直接操作的东西</span>
+        <span class="tier-role">三个界面只是「显示器 + 遥控器」，所有功能先在命令行/协议里可用，界面是后加的薄壳</span>
+        <span class="tier-tech">无界面优先</span>
       </div>
       <div class="mods">
-        <div class="mod"><div class="hd">pinbridge-cli <span class="k">· bin</span></div>
-          <div class="bd"><small>headless 控制台（主入口）</small><code>ping | counters | events | script | trace | bp | stop…</code></div></div>
-        <div class="mod"><div class="hd">pinbridge-tui <span class="k">· ratatui</span></div>
-          <div class="bd"><small>终端仪表盘（轻量备选）</small><code>Plugins 面板 · 前端即启动器</code></div></div>
-        <div class="mod"><div class="hd">pinbridge-ui <span class="k">· Tauri</span></div>
-          <div class="bd"><small>WebView HTML 仪表盘（主前端）</small><code>vanilla JS · 无需 npm</code></div></div>
+        <div class="mod"><div class="hd">pinbridge-cli <span class="k">· 命令行（主力）</span></div>
+          <div class="bd"><small>每个功能一条子命令，输出 JSON —— 方便脚本和 AI 驱动</small><code>ping | counters | events | script | trace | bp | stop…</code></div></div>
+        <div class="mod"><div class="hd">pinbridge-tui <span class="k">· 终端仪表盘</span></div>
+          <div class="bd"><small>一条命令拉起整个调试会话；带插件日志面板</small><code>ratatui</code></div></div>
+        <div class="mod"><div class="hd">pinbridge-ui <span class="k">· 图形界面</span></div>
+          <div class="bd"><small>网页式仪表盘（Tauri/WebView），好看但不承担独有功能</small><code>vanilla JS</code></div></div>
       </div>
     </div>
   </div>
 
-  <div class="link"><span class="stem"></span><span class="joint">三端共用统一客户端</span><span class="head"></span></div>
+  <div class="link"><span class="stem"></span><span class="joint">三个前端共用同一个客户端库；它还负责一键启动：拉起 Pin+代理+目标 → 等就绪 → 连上 → 退出时收拾干净</span><span class="head"></span></div>
 
   <!-- 2. client -->
   <div class="tier">
-    <div class="tier-label" style="background:var(--c-client)">客户端</div>
+    <div class="tier-label" style="background:var(--c-client)">协议</div>
     <div class="tier-body">
       <div class="tier-head">
-        <span class="tier-title">pinbridge-client</span>
-        <span class="tier-role">客户端 + 后端启动器（拉起 pin+agent+目标 → 等端口 → 连接 → 退出回收进程树）</span>
-        <span class="tier-tech">Rust crate</span>
+        <span class="tier-title">pinbridge-client + pinbridge-proto</span>
+        <span class="tier-role">通话规矩：本机回环 TCP（127.0.0.1:9001，只接受本机连接）上的一套自定义二进制协议。每条命令一个请求-应答，没有花哨握手。</span>
+        <span class="tier-tech">任何语言都能实现客户端 —— AI 也行</span>
       </div>
     </div>
   </div>
 
-  <div class="link"><span class="stem"></span><span class="joint">pinbridge-proto · 二进制查询协议 · loopback TCP :9001</span><span class="head"></span></div>
+  <div class="link"><span class="stem"></span><span class="joint">请求 [长度 + 命令号 + 参数] → 应答 [长度 + 命令号 + 状态 + 结果]</span><span class="head"></span></div>
 
   <!-- 3. agent -->
   <div class="tier">
-    <div class="tier-label" style="background:var(--c-agent)">Agent</div>
+    <div class="tier-label" style="background:var(--c-agent)">调试代理</div>
     <div class="tier-body">
       <div class="tier-head">
-        <span class="tier-title">pinbridge-agent.dll</span>
-        <span class="tier-role">调试器基座 (Rust cdylib) · 被 Pin 私有映射进目标进程</span>
-        <span class="tier-tech">查询线程 / 脚本线程 / 录制线程</span>
+        <span class="tier-title">调试代理 pinbridge_agent.dll —— 整套系统的 runtime 核心</span>
+        <span class="tier-role">一个被 Pin 加载进目标进程的 DLL（PinTool）。你在进程外下的每条命令、注入的每个 Python 插件，最终都是它在目标进程内部执行。</span>
+        <span class="tier-tech">Rust 编写 · 三条工作线程</span>
       </div>
       <div class="mods">
-        <div class="mod"><div class="hd">查询服务线程 <span class="k">query_server</span></div>
-          <div class="bd"><small>Pin 内部线程 · 纯被动 · 无客户端零成本</small><code>每 op 一条短连接（长连接饿死单线程）</code></div></div>
-        <div class="mod"><div class="hd">脚本线程 <span class="k">scripting/host</span></div>
-          <div class="bd"><small>内嵌 CPython 3.10 · 多插件热加载</small><code>pyo3 vendored · GIL 无 TLS 补丁</code></div></div>
-        <div class="mod"><div class="hd">录制 drain 线程 <span class="k">record.rs</span></div>
-          <div class="bd"><small>独立大容量 slab → .pbtr 落盘</small><code>1M 槽 · kind 9/10/11</code></div></div>
+        <div class="mod"><div class="hd">查询服务线程</div>
+          <div class="bd"><small>接令办事的窗口：前端每条命令（停/走/读内存/下断点…）都是一次短连接，它执行完立刻回结果。没客户端时纯睡觉，零开销。</small><code>query_server.rs</code></div></div>
+        <div class="mod"><div class="hd">脚本线程（内嵌 Python 3.10）</div>
+          <div class="bd"><small>你的 .py 插件随时注入、随时卸载 —— 哪怕目标正停在断点上。插件声明「我关心什么事件」，事件来了它回调你的函数。</small><code>scripting/ · 解释器编进代理，无外部依赖</code></div></div>
+        <div class="mod"><div class="hd">录制线程</div>
+          <div class="bd"><small>trace 录制专用：先把事件存进一块大内存（默认 100 万条），再慢慢写成文件，不拖慢目标。</small><code>record.rs → .pbtr</code></div></div>
       </div>
       <div class="sub">
-        <div class="cap">运行时核心</div>
+        <div class="cap">运行时核心（在目标指令被执行的瞬间工作）</div>
         <div class="mods">
-          <div class="mod"><div class="hd">有界事件环 ring</div>
-            <div class="bd"><small>64K 定长槽 · 定长 POD · 零分配零 I/O</small><code>kind 1–8：hook_regs / memory / exec / branch / syscall / ctx / module</code></div></div>
-          <div class="mod"><div class="hd">控制面 &amp; 观测引擎</div>
-            <div class="bd"><small>断点与观测</small><code>bp(64) · hooks(4096) · stepper(si/so) · syscall_engine · exc policy</code></div></div>
+          <div class="mod"><div class="hd">事件环形缓冲</div>
+            <div class="bd"><small>一块 64K 格的循环存储：目标产生的每个事件（执行了哪条指令、碰了哪个内存…）占一格，写满就覆盖最旧的，像循环录像带。格子定长、写入时不分配内存，所以撑得住每秒上千万条。</small><code>ring.rs</code></div></div>
+          <div class="mod"><div class="hd">调试 &amp; 观测引擎</div>
+            <div class="bd"><small>断点（64 个，命中即精确停住）、hook 点（4096 个，专门抓函数前四个参数 —— 「hook 全部 ntdll 导出」就靠它）、单步、syscall 监控、异常监控。</small><code>bp.rs · hooks.rs · stepper.rs · syscall_engine.rs</code></div></div>
         </div>
       </div>
     </div>
   </div>
 
-  <div class="link"><span class="stem"></span><span class="joint">pb_* C ABI 调用 · __cdecl · 无 C++/异常/STL 跨界</span><span class="head"></span></div>
+  <div class="link"><span class="stem"></span><span class="joint">代理通过 689 个纯 C 函数调用 Pin —— 调用约定 __cdecl</span><span class="head"></span></div>
 
   <!-- 4. bridge -->
   <div class="tier">
-    <div class="tier-label" style="background:var(--c-bridge)">ABI 桥</div>
+    <div class="tier-label" style="background:var(--c-bridge)">C 接口桥</div>
     <div class="tier-body">
       <div class="tier-head">
-        <span class="tier-title">pinbridge.dll</span>
-        <span class="tier-role">C++ ABI 桥 — 把 Pin C++ API 冻结成稳定 C ABI</span>
-        <span class="tier-tech">facade → backend 接口 → Pin 实现</span>
+        <span class="tier-title">pinbridge.dll —— 把 Pin 翻译成通用 C 接口的桥</span>
+        <span class="tier-role">Pin 本身是 C++ 的，别的语言没法直接调用。这个 DLL 把 Pin 的能力逐个包装成 689 个纯 C 函数（pb_* 开头），版本冻结（v1.5）：接口一旦发布就永不变更，任何语言（Rust/C/Python/Go…）都能通过它写 PinTool。</span>
+        <span class="tier-tech">C++ 编写 · 只暴露 C</span>
       </div>
       <div class="mods">
         <div class="mod"><div class="hd">导出面</div>
-          <div class="bd"><small>689 pb_* 导出 · ABI v1.5</small><code>1213 常量 / 17 结构体 / 42 回调 typedef</code></div></div>
-        <div class="mod"><div class="hd">三层结构</div>
-          <div class="bd"><small>facade → backend → Pin</small><code>pinbridge_*.cpp → *_backend.h → *_backend_pin.cpp</code></div></div>
-        <div class="mod"><div class="hd">固定抓取族 ×6</div>
-          <div class="bd"><small>JIT-only 固定 IARG 组合</small><code>capture_regs / memory_operands / exec / branch_edge / exec_bytes / memory_operands_values</code></div></div>
-        <div class="mod"><div class="hd">ABI 纪律</div>
-          <div class="bd"><small>跨语言可用的根因</small><code>opaque handle · 三段式 (buf, cap, req*) · 无内存所有权跨界 → CRT 完全隔离</code></div></div>
+          <div class="bd"><small>689 个 pb_* 函数，外加常量、结构体、回调类型定义</small><code>ABI v1.5 冻结</code></div></div>
+        <div class="mod"><div class="hd">三层实现</div>
+          <div class="bd"><small>每个功能分三层：对外门面 → 抽象接口 → 真正的 Pin 调用。好处：测试时可以把「真正的 Pin」换成假的（mock），不开 Pin 也能跑 60 项契约测试。</small><code>facade → backend → Pin 实现</code></div></div>
+        <div class="mod"><div class="hd">六种预制采集器</div>
+          <div class="bd"><small>C 接口不支持可变参数，Pin 的「任意组合采集」没法直接暴露。所以预做了 6 种最常用组合：抓四个参数寄存器 / 记每次内存访问 / 记每条指令执行 / 记分支去向 / 记指令字节 / 记内存读写的值。</small><code>capture_regs · memory_operands · exec · branch_edge · exec_bytes · memory_operands_values</code></div></div>
+        <div class="mod"><div class="hd">隔离纪律（为什么稳）</div>
+          <div class="bd"><small>桥两边互不分配对方的内存；要字符串就「你给缓冲区、它告诉你需要多大」；句柄不透明。因此桥和使用方的 C 运行库完全隔开，不存在跨 DLL 释放内存导致的崩溃。</small><code>opaque handle · 三段式缓冲区 · CRT 隔离</code></div></div>
       </div>
     </div>
   </div>
 
-  <div class="link"><span class="stem"></span><span class="joint">Pin C++ API · INS_InsertCall · IPOINT_BEFORE / AFTER</span><span class="head"></span></div>
+  <div class="link"><span class="stem"></span><span class="joint">桥内部调用的才是 Pin 的 C++ API</span><span class="head"></span></div>
 
   <!-- 5. pin -->
   <div class="tier">
     <div class="tier-label" style="background:var(--c-pin)">Pin</div>
     <div class="tier-body">
       <div class="tier-head">
-        <span class="tier-title">Intel Pin 3.31 JIT 引擎</span>
-        <span class="tier-role">重编译目标指令，在 instrumentation time 插入分析回调</span>
-        <span class="tier-tech">Pin 是宿主</span>
-      </div>
-      <div class="mods">
-        <div class="mod"><div class="hd">启动命令</div>
-          <div class="bd"><code>pin.exe -t pinbridge_agent.dll -- target.exe</code></div></div>
-        <div class="mod"><div class="hd">加载关系</div>
-          <div class="bd"><small>agent.dll / pinbridge.dll 都是被私有映射的工具 DLL</small><code>Pin 用自己的 loader 映射（非系统 loader）</code></div></div>
+        <span class="tier-title">Intel Pin 3.31 —— 指令插桩引擎（进程的真正宿主）</span>
+        <span class="tier-role">它在目标程序运行时把机器码即时重编译（JIT），并按我们的要求在某些指令前后安插回调（「执行到这里就记一笔」）。代理 DLL 和桥 DLL 都是以「工具插件」身份被它用私有方式加载的。</span>
+        <span class="tier-tech">启动：pin.exe -t pinbridge_agent.dll -- 目标.exe</span>
       </div>
     </div>
   </div>
 
-  <div class="link"><span class="stem"></span><span class="joint">分析回调 · application threads · 范围过滤后</span><span class="head"></span></div>
+  <div class="link"><span class="stem"></span><span class="joint">回调跑在目标自己的线程上 —— 所以代理内部的纪律极严（见下方数据流 A 的警告）</span><span class="head"></span></div>
 
   <!-- 6. target -->
   <div class="tier">
     <div class="tier-label" style="background:var(--c-target)">目标</div>
     <div class="tier-body">
       <div class="tier-head">
-        <span class="tier-title">目标进程 target.exe</span>
-        <span class="tier-role">VMP 壳 / 脱壳目标 / 任意 Windows 程序</span>
+        <span class="tier-title">目标进程 —— 被分析的 Windows 程序</span>
+        <span class="tier-role">VMP 壳样本、要脱壳的程序、或任意 exe</span>
       </div>
     </div>
   </div>
 
   <!-- ===================== 数据流 ===================== -->
-  <div class="section">三条数据流</div>
+  <div class="section">三条数据流（系统里真正在跑的三条路）</div>
   <div class="flows">
 
     <div class="flow hot">
       <div class="fh">
-        <h3><span class="pill">A</span> 事件热路径</h3>
-        <div class="d">高频 · instrumentation time 决策 · 零成本</div>
+        <h3><span class="pill">A</span> 事件高速通道</h3>
+        <div class="d">每秒可达千万级 —— 目标跑指令时事件怎么流出来</div>
       </div>
-      <div class="step"><span class="n">1</span>目标指令 → Pin JIT 重编译 → 插桩点</div>
-      <div class="step"><span class="n">2</span>范围过滤 <code>RANGE / HOOK / syscallfilter</code>（编译期折叠）</div>
-      <div class="step"><span class="n">3</span>固定 IARG 抓取：寄存器 / 内存操作数 / 分支 / 指令字节 / 值</div>
-      <div class="step"><span class="n">4</span>写 ring（64K 定长槽 · 零分配零 I/O · 不 panic）</div>
-      <div class="step"><span class="n">5</span>消费者被动翻页：查询线程 / 脚本线程 / 录制 drain</div>
-      <div class="step warn"><span class="n">!</span>同步只用 <code>pb_pin_mutex_*</code>；<code>std::sync::Mutex</code> 进热路径会 9/10 崩溃</div>
+      <div class="step"><span class="n">1</span>Pin 重编译目标代码时，按我们的要求安插「记录点」</div>
+      <div class="step"><span class="n">2</span>只在你关心的地址范围内安插（范围过滤），范围外零成本</div>
+      <div class="step"><span class="n">3</span>目标执行到记录点，预制采集器抓取现场：寄存器 / 内存地址 / 分支去向 / 指令字节</div>
+      <div class="step"><span class="n">4</span>现场打包成定长小记录，写进环形缓冲 —— 不分配内存、不做 I/O、永不等锁</div>
+      <div class="step"><span class="n">5</span>谁想看谁自己翻页：查询服务、脚本线程、录制线程都是被动读者，写事件永远不等任何人</div>
+      <div class="step warn"><span class="n">!</span>这条路上禁用标准库锁和内存分配（实测会高概率搞死进程）—— 只允许用 Pin 自己的锁</div>
     </div>
 
     <div class="flow ctl">
       <div class="fh">
-        <h3><span class="pill">B</span> 控制 / 观测面</h3>
-        <div class="d">低频 · 请求-响应 · loopback RPC</div>
+        <h3><span class="pill">B</span> 命令通道</h3>
+        <div class="d">低频 —— 你下的每条命令怎么走</div>
       </div>
-      <div class="step"><span class="n">1</span>CLI / TUI / UI → pinbridge-client → query_server</div>
-      <div class="step"><span class="n">2</span>控制：<code>stop/resume · read/write · bp(64) · hooks(4096)</code></div>
-      <div class="step"><span class="n">3</span>单步：<code>si/so</code>（落点回调内停泊，非异步挂起）</div>
-      <div class="step"><span class="n">4</span>观测：<code>modules/threads/exports · setreg · syscallfilter · engine</code></div>
-      <div class="step"><span class="n">5</span>断点命中 → 停泊 → 改上下文 → resume</div>
-      <div class="step warn"><span class="n">!</span>stop/resume 与调用线程配对；跨线程 resume 直接杀进程</div>
+      <div class="step"><span class="n">1</span>你（前端 / 脚本 / AI）发命令：停、走、读内存、下断点、改寄存器…</div>
+      <div class="step"><span class="n">2</span>命令经客户端库 → 本机回环协议 → 查询服务线程执行</div>
+      <div class="step"><span class="n">3</span>断点命中时目标<b>精确</b>停住（停在断点指令执行之前），你看完现场再让它继续</div>
+      <div class="step"><span class="n">4</span>单步 <code>si/so</code>：靠「让线程停在回调里等信号」实现，落点精确；<code>so</code> 遇 CALL 自动放一次性断点</div>
+      <div class="step"><span class="n">5</span>观测命令：模块 / 线程 / 导出枚举、符号解析、反汇编、引擎开关、syscall 号码过滤</div>
+      <div class="step warn"><span class="n">!</span>「停止」和「继续」必须由同一条专用线程执行（Pin 的配对限制），换线程执行会直接崩</div>
     </div>
 
     <div class="flow rec">
       <div class="fh">
-        <h3><span class="pill">C</span> 脚本 &amp; 录制/重放</h3>
-        <div class="d">污点分析主链 · 编排 → 录制 → 离线重放</div>
+        <h3><span class="pill">C</span> 脚本 &amp; 录制 / 离线分析</h3>
+        <div class="d">污点分析主链 —— 先录后拆</div>
       </div>
-      <div class="step"><span class="n">1</span>脚本线程每 tick ~5ms：拉事件页 ≤2048 条 + 停点快照</div>
-      <div class="step"><span class="n">2</span>插件 <code>pb.*</code> 动作 = 一次 loopback RPC（微秒级）</div>
-      <div class="step"><span class="n">3</span><code>pb.trace_start</code> → 独立 slab 录制 kind 9/10/11</div>
-      <div class="step"><span class="n">4</span>drain 线程落盘 <code>.pbtr</code>（PBTR v1 · 88B 记录流）</div>
-      <div class="step"><span class="n">5</span>离线 <code>taint.py</code>：前向污点 + 后向切片（capstone）</div>
-      <div class="step warn"><span class="n">!</span>具体 EA 消灭别名 → 无需指针分析；ring 溢出 = 窗口作废</div>
+      <div class="step"><span class="n">1</span>Python 插件声明关心的事件；脚本线程每 ~5ms 收一批送进你的回调</div>
+      <div class="step"><span class="n">2</span>插件里每个动作（读内存、下断点…）= 一次进程内回环调用，微秒级</div>
+      <div class="step"><span class="n">3</span>要逐指令分析时：<code>pb.trace_start()</code> 圈定地址范围开始录制</div>
+      <div class="step"><span class="n">4</span>录制线程把事件写成 <code>.pbtr</code> 文件（每条指令的字节 + 每次内存访问的地址和值）</div>
+      <div class="step"><span class="n">5</span>离线用 <code>taint.py</code> 慢慢拆：前向污点（这数据流向哪）+ 反向切片（这值谁算出来的）</div>
+      <div class="step warn"><span class="n">!</span>录制里有每次内存访问的具体地址，所以「谁写了这个地址」一查便知，不需要静态分析里最头疼的别名推断；代价是录制必须无损 —— 丢了事件，这个窗口就得重录</div>
     </div>
 
   </div>
@@ -407,26 +401,25 @@
   <div class="roadmap">
     <div class="stage s1">
       <div class="sh">① 编排层 · 已完成</div>
-      <div class="sb">内嵌 CPython 多插件脚本宿主：事件订阅、断点/hook、内存与寄存器读写、停走单步、符号解析。<code>pb_init / on_event_batch / on_bp_hit / bp_set / hook_set / read_mem / get_reg…</code></div>
+      <div class="sb">Python 插件系统：事件来了自动回调你的函数；插件里可以下断点、读写内存、改寄存器、停走单步、查符号。换分析思路不用重新编译 —— 改 .py 文本随时注入。<code>pb_init / on_event_batch / on_bp_hit / bp_set / hook_set / read_mem…</code></div>
     </div>
     <div class="stage s2">
-      <div class="sh">② 录制通道 · 已交付 (ABI v1.5)</div>
-      <div class="sb">把「跑过的那段执行」无损落盘：<code>trace start/stop/tracest</code>，独立 1M 槽 slab，Pin 内部线程 drain。档2 抓取：<code>exec_bytes(9) / mem_value(10) / marker(11)</code> → <code>.pbtr</code>。</div>
+      <div class="sh">② 录制通道 · 已完成（ABI v1.5）</div>
+      <div class="sb">把目标「跑过的那段窗口」原样录下来：每条指令的字节、每次内存访问的地址和值，写满 100 万条的内存缓冲后由后台线程落盘。命令：<code>trace start / trace stop</code>，产物 <code>.pbtr</code>。</div>
     </div>
     <div class="stage s3">
-      <div class="sh">③ 重放分析层 · 原型中</div>
-      <div class="sb">纯 Python 离线引擎：<code>pbtrace.py / recorder.py / taint.py</code>，前向污点传播 + 后向切片（capstone 解码）。具体 EA 消灭别名，不做指针分析。<code>16 个离线单测</code>。</div>
+      <div class="sh">③ 离线分析层 · 原型已验证</div>
+      <div class="sb">纯 Python 离线库（<code>examples/python/replay/</code>）：capstone 解码、字节级影子内存、前向污点传播 + 反向切片。已对测试程序切出精确切片；16 个单元测试。</div>
     </div>
   </div>
 
   <!-- ===================== 页脚 ===================== -->
   <div class="foot">
-    <b>设计哲学：</b>Pin 负责指令重编译与插桩回调；<b>pinbridge.dll</b> 把 C++ API 冻结成 C ABI；<b>pinbridge-agent.dll</b>
-    做「过滤插桩 → 定长事件 → 有界 ring」外加控制/脚本/录制三个旁路；<b>协议/客户端</b> 提供统一二进制查询面；
-    <b>前端</b> 只消费聚合与水位；<b>离线 replay</b> 在录制轨迹上做污点与切片。
+    <b>一句话总结：</b>Pin 负责「在目标代码里安插记录点」；<b>pinbridge.dll</b> 负责「把 Pin 翻译成谁都能调用的 C 接口」；
+    <b>调试代理</b>负责「住在目标进程里干活」——抓事件、管断点、跑 Python 插件、录 trace；<b>协议和前端</b>负责「把数据和按钮递到你手上」；
+    真正的分析逻辑（污点、反混淆、脱壳策略）永远是 .py 文本，不用编译，随时注入。
     <div class="tags">
-      <span>CRT 隔离</span><span>类型隔离</span><span>内存所有权隔离</span><span>线程隔离</span><span>I/O 隔离</span>
-      <span>900 万事件/s vs 60 帧/s</span><span>热路径写 ring 永不阻塞 UI</span>
+      <span>各层互不分配对方内存</span><span>接口冻结永不变</span><span>事件每秒千万级 vs 界面每秒 60 帧</span><span>界面卡死不影响采集</span><span>先录后拆：重活全在离线 Python</span>
     </div>
   </div>
 
