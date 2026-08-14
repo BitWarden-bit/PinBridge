@@ -129,18 +129,6 @@ examples/python/      插件示例 + replay/(录制重放库)
 docs/                 scripting.md / taint-roadmap.md
 ```
 
-## 工程纪律(踩坑沉淀,改动者必读)
-
-- 分析回调:零分配、零 I/O、不 panic(`panic = "abort"`);同步只能用 Pin 自己的锁
-  —— `std::sync::Mutex` 进热路径实测 9/10 杀进程;TLS 在 Pin 私有映射模块里不可用
-  (std thread_local 写 = 野指针写)
-- Pin 的 stop/resume 与调用线程配对,必须单线程所有者(breaker 线程);跨线程 resume
-  直接 pinvm assert;TF 硬件单步在 Pin 下杀 VM(弃用,改用落点回调内停泊)
-- Pin 的 Windows loader:不解析 API-set 伪 DLL、不跟随 PE 导出转发器 —— 解决:
-  `+crt-static` + `/DELAYLOAD`(api-ms-win / WS2_32 / python310.dll);delay-load
-  盖不住 CPython 数据导入(LNK1194)→ `__imp_` 单元 + GetProcAddress 填充
-- Python 只跑在脚本线程,永不进分析回调;脚本动作全走 loopback RPC
-
 ## 限制与 backlog
 
 - 平台:Windows x64 / Pin 3.31 (build 98869) / Python 3.10;Linux 平台层未做
