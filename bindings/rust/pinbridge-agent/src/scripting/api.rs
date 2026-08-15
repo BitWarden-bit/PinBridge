@@ -636,11 +636,11 @@ fn pb_intercept(
     );
     with_current_plugin_mut(|plugin| plugin.decisions.insert(id, subscription))
         .ok_or_else(no_plugin)?;
-    super::host::publish_decision_interests();
+    super::interceptors::publish_interests();
     if let Some((address, created_by_scripts)) = created_hook {
         if !rpc(|client| client.hook_set(address)).unwrap_or(false) {
             let _ = with_current_plugin_mut(|plugin| plugin.decisions.remove(&id));
-            super::host::publish_decision_interests();
+            super::interceptors::publish_interests();
             return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
                 "hook interceptor could not arm the native Hook point",
             ));
@@ -662,7 +662,7 @@ fn pb_unintercept(id: u64) -> PyResult<bool> {
             decisions::queue_hook_removal(address);
         }
     }
-    super::host::publish_decision_interests();
+    super::interceptors::publish_interests();
     Ok(true)
 }
 

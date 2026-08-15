@@ -117,7 +117,9 @@ Python 处理函数不能通过返回值绕过其他插件。旧脚本直接调�
 
 - `scripting/subscriptions.rs`：订阅数据、断点所有权和动作类型；
 - `scripting/api.rs`：Python 参数校验和注册入口；
-- `scripting/host.rs`：取得停止快照、调用处理函数、合并并执行最终决定；
+- `scripting/host.rs`：解释器生命周期、异步事件循环和断点停止快照；
+- `scripting/interceptors/`：同步决定总调度，以及相互独立的
+  `child`、`hook`、`syscall`、`exception` 处理与补丁合并；
 - `context.rs` / 查询协议：提供一次性寄存器快照；
 - `bp.rs`：只负责原生断点表、命中和停止，不保存 Python 对象。
 

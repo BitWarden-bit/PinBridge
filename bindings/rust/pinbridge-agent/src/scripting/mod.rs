@@ -30,6 +30,7 @@ pub mod api;
 mod decisions;
 mod events;
 mod host;
+mod interceptors;
 pub mod output;
 mod python_data;
 mod subscriptions;
