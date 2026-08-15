@@ -10,11 +10,12 @@ $repo = (Resolve-Path -LiteralPath (Join-Path $dir "..\..")).Path
 $bundle = Split-Path -Parent $repo
 $target = Join-Path $dir "hook_python_demo_x64.exe"
 $plugin = Join-Path $dir "hook_intercept.py"
+$failurePlugin = Join-Path $dir "hook_init_failure.py"
 $cli = Join-Path $repo "bindings\rust\target\release\pinbridge-cli.exe"
 $agent = Join-Path $repo "bindings\rust\target\release\pinbridge_agent.dll"
 $pin = Join-Path $bundle "VMP_Offline_Recovery_Kit_20260803_FINAL\runtime\pin\intel64\bin\pin.exe"
 
-foreach ($path in @($target, $plugin, $cli, $agent, $pin)) {
+foreach ($path in @($target, $plugin, $failurePlugin, $cli, $agent, $pin)) {
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
         throw "required file not found: $path"
     }
@@ -97,6 +98,33 @@ try {
     }
     if (-not $connected) { throw "control plane did not become ready" }
 
+    # A failed plugin must remain diagnosable as state=2 while every native
+    # breakpoint and both Hook leases it acquired are released before the
+    # target is allowed to execute the tested functions.
+    [void](Invoke-Cli -Command @("script", "run", $failurePlugin))
+    $failureQuarantined = $false
+    while ([datetime]::UtcNow -lt $deadline -and -not $failureQuarantined) {
+        try {
+            $plugins = Invoke-Cli -Command @("script", "list") | ConvertFrom-Json
+            $failed = @($plugins.plugins | Where-Object {
+                $_.name -eq "hook_init_failure.py" -and [int]$_.state -eq 2
+            }).Count -eq 1
+            $hooks = Invoke-Cli -Command @("hooks") | ConvertFrom-Json
+            $breakpoints = Invoke-Cli -Command @("bps") | ConvertFrom-Json
+            $failureQuarantined = $failed -and [int]$hooks.count -eq 0 -and
+                [int]$breakpoints.count -eq 0
+        } catch {}
+        if (-not $failureQuarantined) { Start-Sleep -Milliseconds 50 }
+    }
+    if (-not $failureQuarantined) {
+        throw "failed plugin retained native Hook or breakpoint resources"
+    }
+    $failureOutput = Invoke-Cli -Command @("script", "output")
+    if (-not $failureOutput.Contains("HOOK_INIT_FAILURE_ARMED") -or
+        -not $failureOutput.Contains("released 1 breakpoints and 2 Hook leases")) {
+        throw "failed-plugin quarantine diagnostics were incomplete"
+    }
+
     $loaded = $false
     while ([datetime]::UtcNow -lt $deadline -and -not $loaded) {
         try {
@@ -145,6 +173,7 @@ try {
         sync_decisions = 3
         named_observers_exact_once = $true
         observation_dropped = 0
+        failed_plugin_quarantined = $true
         skipped_original = $true
         target_output = $targetOutput
     } | ConvertTo-Json -Depth 3

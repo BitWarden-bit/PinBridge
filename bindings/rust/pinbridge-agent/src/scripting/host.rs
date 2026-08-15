@@ -652,11 +652,111 @@ fn cmd_unload(name: &str) {
     }
 }
 
+#[derive(Default)]
+struct NativeOwnership {
+    breakpoint_ids: Vec<u32>,
+    // Deliberately retains duplicates: every event/decision subscription
+    // acquired one lease, even when several subscriptions share an address.
+    hook_addresses: Vec<u64>,
+}
+
+/// Drains everything an active plugin published into native execution.
+/// The caller must hold the GIL because clearing the subscription maps drops
+/// their Py callback references.
+fn drain_runtime_ownership(plugin: &mut Plugin) -> NativeOwnership {
+    let ownership = NativeOwnership {
+        breakpoint_ids: plugin.breakpoints.keys().copied().collect(),
+        hook_addresses: plugin
+            .decisions
+            .values()
+            .filter_map(|subscription| subscription.address)
+            .chain(
+                plugin
+                    .events
+                    .values()
+                    .filter_map(|subscription| subscription.hook_address),
+            )
+            .collect(),
+    };
+    plugin.breakpoints.clear();
+    plugin.decisions.clear();
+    plugin.events.clear();
+    plugin.instrumentation = None;
+    plugin.memory_translation = None;
+    plugin.code_fetch = None;
+    plugin.xed_decode = None;
+    plugin.filters = super::Filters::default();
+    ownership
+}
+
+fn release_native_ownership(ownership: NativeOwnership) {
+    for id in ownership.breakpoint_ids {
+        if subscriptions::release_native(id) {
+            subscriptions::queue_native_removal(id);
+        }
+    }
+    for address in ownership.hook_addresses {
+        if super::decisions::release_hook(address) {
+            super::decisions::queue_hook_removal(address);
+        }
+    }
+}
+
+/// Keeps failed plugins visible in `script list`, but immediately disables
+/// every callback/policy and releases every script-owned native point.  This
+/// is called after each phase that may execute Python, so no failure path has
+/// to duplicate resource teardown.
+fn quarantine_error_plugins(reason: &str) {
+    let pending = with_registry(|registry| {
+        registry
+            .values()
+            .any(|plugin| plugin.state == STATE_ERROR && !plugin.quarantined)
+    });
+    if !pending {
+        return;
+    }
+    let quarantined = Python::with_gil(|_py| {
+        with_registry_mut(|registry| {
+            let mut drained = Vec::new();
+            for (name, plugin) in registry.iter_mut() {
+                if plugin.state != STATE_ERROR || plugin.quarantined {
+                    continue;
+                }
+                let ownership = drain_runtime_ownership(plugin);
+                plugin.quarantined = true;
+                drained.push((name.clone(), ownership));
+            }
+            drained
+        })
+    });
+    if quarantined.is_empty() {
+        return;
+    }
+    for (name, ownership) in quarantined {
+        let breakpoint_count = ownership.breakpoint_ids.len();
+        let hook_lease_count = ownership.hook_addresses.len();
+        release_native_ownership(ownership);
+        output::push(
+            &name,
+            &format!(
+                "quarantined after {reason}: released {breakpoint_count} breakpoints and {hook_lease_count} Hook leases"
+            ),
+        );
+        crate::log::line(&format!(
+            "plugin quarantined after {reason}: {name} breakpoints={breakpoint_count} hook_leases={hook_lease_count}"
+        ));
+    }
+    super::interceptors::publish_interests();
+    super::native_policies::refresh_best_effort("plugin quarantined");
+    mark_native_dirty();
+    super::publish_list_snapshot();
+}
+
 /// Removes a plugin: on_unload under the GIL with the plugin context set,
 /// then drop (Py objects released under the GIL). Lifecycle is recorded in
 /// the output ring and the agent log.
 fn retire_plugin(name: &str, reason: &str) {
-    let (existed, breakpoint_ids, hook_addresses) = Python::with_gil(|py| {
+    let (existed, ownership) = Python::with_gil(|py| {
         let on_unload = with_registry(|r| {
             r.get(name)
                 .and_then(|p| p.on_unload.as_ref().map(|cb| cb.clone_ref(py)))
@@ -670,37 +770,17 @@ fn retire_plugin(name: &str, reason: &str) {
             });
         }
         with_registry_mut(|r| {
-            let Some(plugin) = r.remove(name) else {
-                return (false, Vec::new(), Vec::new());
+            let Some(mut plugin) = r.remove(name) else {
+                return (false, NativeOwnership::default());
             };
-            let ids = plugin.breakpoints.keys().copied().collect();
-            let hook_addresses = plugin
-                .decisions
-                .values()
-                .filter_map(|subscription| subscription.address)
-                .chain(
-                    plugin
-                        .events
-                        .values()
-                        .filter_map(|subscription| subscription.hook_address),
-                )
-                .collect();
+            let ownership = drain_runtime_ownership(&mut plugin);
             // Drop every Py callback while the GIL is held.
             drop(plugin);
-            (true, ids, hook_addresses)
+            (true, ownership)
         })
     });
     if existed {
-        for id in breakpoint_ids {
-            if subscriptions::release_native(id) {
-                subscriptions::queue_native_removal(id);
-            }
-        }
-        for address in hook_addresses {
-            if super::decisions::release_hook(address) {
-                super::decisions::queue_hook_removal(address);
-            }
-        }
+        release_native_ownership(ownership);
         super::interceptors::publish_interests();
         super::native_policies::refresh_best_effort("plugin retired");
         output::push(name, reason);
@@ -761,6 +841,7 @@ fn exec_one(name: &str, code: Py<PyAny>, port: u16) {
             name: name.to_string(),
             module: module.clone().unbind(),
             state: STATE_RUNNING,
+            quarantined: false,
             on_exception: None,
             on_syscall: None,
             on_bp_hit: None,
@@ -960,6 +1041,7 @@ fn tick(pending: &mut Vec<(String, Py<PyAny>)>, port: u16) {
     if startup_gate_open() {
         exec_pending(pending, port);
     }
+    quarantine_error_plugins("initialization failure");
     if !python_ready() {
         return;
     }
@@ -968,6 +1050,7 @@ fn tick(pending: &mut Vec<(String, Py<PyAny>)>, port: u16) {
     // registration boundaries.
     crate::instrumentation_lifecycle::emit_pending_routine_snapshot();
     super::interceptors::dispatch_pending();
+    quarantine_error_plugins("synchronous callback failure");
     // adapt the pull size to last tick's measured Python cost (routed count)
     adapt_page_limit();
 
@@ -1153,6 +1236,7 @@ fn tick(pending: &mut Vec<(String, Py<PyAny>)>, port: u16) {
         }
         (action, completed)
     });
+    quarantine_error_plugins("event callback failure");
     if dispatch_completed && exit_delivery_pending {
         crate::lifecycle::acknowledge_exit_delivery();
     }

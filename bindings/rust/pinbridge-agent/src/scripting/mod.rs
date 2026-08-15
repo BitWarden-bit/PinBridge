@@ -133,6 +133,9 @@ pub struct Plugin {
     #[allow(dead_code)]
     pub module: Py<PyModule>,
     pub state: u8, // STATE_RUNNING | STATE_ERROR
+    /// Error plugins remain listed for diagnosis, but their Python/native
+    /// runtime ownership is drained exactly once.
+    pub quarantined: bool,
     pub on_exception: Option<Py<PyAny>>,
     pub on_syscall: Option<Py<PyAny>>,
     pub on_bp_hit: Option<Py<PyAny>>,

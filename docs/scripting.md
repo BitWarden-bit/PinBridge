@@ -61,7 +61,9 @@ PATH 上的 python / 标准 per-user 安装目录找）自动摆到 agent 旁边
   `on_unload` 再退役）。
 - `PINBRIDGE_AGENT_PLUGINS=<dir>`：启动时按文件名排序自动加载目录下全部 `*.py`，单个失败
   不影响其余。
-- 插件异常只把该插件置为 error 状态（agent 和其他插件不死）,`script list` 看得到。
+- 插件异常只把该插件置为 error 状态（agent 和其他插件不死），`script list` 继续保留它供诊断。
+  宿主随后统一隔离该插件：撤销高频原生策略，释放它拥有的精确断点以及每一份异步/同步
+  Hook 租约，并重新计算原生过滤开关；错误插件不会留下仍能命中但已无人处理的原生点。
 
 ## 脚本 API v2(`import pb`)
 
