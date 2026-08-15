@@ -142,10 +142,15 @@ fn parse_exports(base: u64) -> Option<Vec<ExportEntry>> {
     let header = read_mem(base, 0x40)?;
     let pe_off = u32::from_le_bytes(header[0x3c..0x40].try_into().ok()?) as u64;
     let magic = read_u16(base + pe_off + 24)?; // optional header magic
-    if magic != 0x20b {
-        return None; // PE32+ only
-    }
-    let export_rva = read_u32(base + pe_off + 24 + 112)? as u64; // data dir[0]
+    // IMAGE_OPTIONAL_HEADER32 and IMAGE_OPTIONAL_HEADER64 place the data
+    // directory at different offsets. The export table fields themselves are
+    // identical once its RVA has been located.
+    let data_directory_offset = match magic {
+        0x10b => 96u64,  // PE32
+        0x20b => 112u64, // PE32+
+        _ => return None,
+    };
+    let export_rva = read_u32(base + pe_off + 24 + data_directory_offset)? as u64;
     if export_rva == 0 {
         return None;
     }
@@ -236,13 +241,23 @@ fn resolve_inner(r: &mut Resolver, address: u64, depth: u8) -> Resolution {
             }
         }
     }
-    // IAT thunk chase: `jmp qword [rip+disp]` -> stored import pointer
+    // IAT thunk chase: x64 uses `jmp qword [rip+disp]`, while x86 uses
+    // `jmp dword [imm32]`.
     if depth == 0 {
         if let Some(bytes) = read_mem(address, 6) {
             if bytes[0] == 0xFF && bytes[1] == 0x25 {
-                let disp = i32::from_le_bytes(bytes[2..6].try_into().unwrap()) as i64;
-                let slot = (address + 6).wrapping_add(disp as u64);
-                if let Some(target) = read_u64(slot) {
+                let slot = if crate::arch::is_64() {
+                    let disp = i32::from_le_bytes(bytes[2..6].try_into().unwrap()) as i64;
+                    (address + 6).wrapping_add(disp as u64)
+                } else {
+                    u32::from_le_bytes(bytes[2..6].try_into().unwrap()) as u64
+                };
+                let target = if crate::arch::is_64() {
+                    read_u64(slot)
+                } else {
+                    read_u32(slot).map(|value| value as u64)
+                };
+                if let Some(target) = target {
                     if target != address {
                         return resolve_inner(r, target, depth + 1);
                     }

@@ -4,9 +4,14 @@
 
 #include <string>
 
+#if defined(TARGET_IA32E)
 static_assert(sizeof(ADDRINT) == sizeof(uint64_t), "ADDRINT is not 64-bit");
-static_assert(sizeof(FLT64) == sizeof(double), "FLT64 is not a C double");
 static_assert(sizeof(size_t) == sizeof(uint64_t), "size_t is not 64-bit");
+#else
+static_assert(sizeof(ADDRINT) == sizeof(uint32_t), "ADDRINT is not 32-bit");
+static_assert(sizeof(size_t) == sizeof(uint32_t), "size_t is not 32-bit");
+#endif
+static_assert(sizeof(FLT64) == sizeof(double), "FLT64 is not a C double");
 
 void* PbBackendAddrintToPointer(uint64_t address)
 { return Addrint2VoidStar(static_cast<ADDRINT>(address)); }

@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>PinBridge Next — 架构分层图</title>
+<style>
+  :root {
+    --ink: #111;
+    --sub: #555;
+    --faint: #888;
+    --line: #333;
+    --fill: #f2f2f2;
+    --mono: "Cascadia Code", "JetBrains Mono", Consolas, monospace;
+    --sans: "Segoe UI", "Microsoft YaHei", -apple-system, "Helvetica Neue", Arial, sans-serif;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: #fff; color: var(--ink); font-family: var(--sans); padding: 30px 22px 40px; }
+  .wrap { max-width: 920px; margin: 0 auto; }
+
+  /* 图题 */
+  .fighead { display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 10px; }
+  .fighead h1 { font-size: 16px; font-weight: 700; }
+  .fighead .meta { font-family: var(--mono); font-size: 10.5px; color: var(--sub); }
+
+  /* 图框 */
+  .figure { border: 1.5px solid var(--ink); }
+
+  /* 分层 */
+  .layer { display: flex; border-bottom: 1px solid var(--line); }
+  .layer:last-child { border-bottom: none; }
+  .idx {
+    flex: 0 0 96px; border-right: 1px solid var(--line); background: var(--fill);
+    padding: 9px 11px; display: flex; flex-direction: column; justify-content: center;
+  }
+  .idx .no { font-family: var(--mono); font-size: 9.5px; color: var(--faint); }
+  .idx .name { font-weight: 700; font-size: 12.5px; }
+  .idx .en { font-family: var(--mono); font-size: 9.5px; color: var(--faint); margin-top: 1px; }
+  .body { flex: 1; padding: 9px 10px; display: flex; flex-wrap: wrap; gap: 8px; align-items: stretch; }
+
+  /* 组件框 */
+  .bx { border: 1px solid var(--line); background: #fff; padding: 5px 10px; min-width: 120px; }
+  .bx.wide { flex: 1; }
+  .bx .n { font-family: var(--mono); font-size: 11.5px; font-weight: 700; }
+  .bx .d { font-size: 10.5px; color: var(--sub); margin-top: 1px; }
+  .bx .n .tag { font-weight: 400; color: var(--faint); font-size: 10px; }
+
+  /* 组容器 */
+  .grp { border: 1px dashed var(--line); padding: 6px 8px 8px; display: flex; flex-wrap: wrap; gap: 8px; flex: 1; }
+  .grp .cap { width: 100%; font-size: 10px; color: var(--sub); font-weight: 600; letter-spacing: 1px; }
+
+  /* 层间接口 */
+  .iface {
+    display: flex; flex-direction: column; align-items: center;
+    border-bottom: 1px solid var(--line); background: #fafafa; padding: 3px 0;
+  }
+  .iface .st { width: 1.5px; height: 7px; background: var(--line); }
+  .iface .tx { font-family: var(--mono); font-size: 10.5px; color: var(--sub); padding: 1px 0; }
+  .iface .tx b { color: var(--ink); }
+
+  /* 图注 */
+  .caption { margin-top: 8px; font-size: 11px; color: var(--sub); }
+  .caption b { color: var(--ink); }
+  .note { margin-top: 5px; font-size: 10.5px; color: var(--faint); font-family: var(--mono); }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <div class="fighead">
+    <h1>PinBridge Next — 架构分层图</h1>
+    <div class="meta">ABI v1.5 · 689 × pb_* · Pin 3.31.98869 · Windows x64</div>
+  </div>
+
+  <div class="figure">
+
+    <div class="layer">
+      <div class="idx"><div class="no">L1</div><div class="name">前端层</div><div class="en">frontends</div></div>
+      <div class="body">
+        <div class="bx wide"><div class="n">pinbridge-cli</div><div class="d">JSON 控制台 · 调试 shell</div></div>
+        <div class="bx wide"><div class="n">pinbridge-tui</div><div class="d">ratatui 仪表盘</div></div>
+        <div class="bx wide"><div class="n">pinbridge-ui</div><div class="d">Tauri 主前端</div></div>
+      </div>
+    </div>
+
+    <div class="iface"><div class="st"></div><div class="tx">▼ 统一客户端 · 前端即启动器（拉起/回收后端进程树）</div><div class="st"></div></div>
+
+    <div class="layer">
+      <div class="idx"><div class="no">L2</div><div class="name">客户端层</div><div class="en">client</div></div>
+      <div class="body">
+        <div class="bx wide"><div class="n">pinbridge-client</div><div class="d">协议客户端 + 后端启动器</div></div>
+      </div>
+    </div>
+
+    <div class="iface"><div class="st"></div><div class="tx">▼ <b>pinbridge-proto</b> 二进制查询协议 · loopback TCP :9001 · 每 op 一条短连接</div><div class="st"></div></div>
+
+    <div class="layer">
+      <div class="idx"><div class="no">L3</div><div class="name">Agent 层</div><div class="en">agent.dll</div></div>
+      <div class="body">
+        <div class="grp">
+          <div class="cap">运行时核心 · 热路径</div>
+          <div class="bx wide"><div class="n">ring</div><div class="d">64K 定长槽 · kind 1–8</div></div>
+          <div class="bx wide"><div class="n">控制面引擎</div><div class="d">bp(64) · hooks(4096) · si/so · syscall</div></div>
+        </div>
+        <div class="bx"><div class="n">query_server</div><div class="d">查询线程 · 被动</div></div>
+        <div class="bx"><div class="n">scripting</div><div class="d">CPython 插件宿主</div></div>
+        <div class="bx"><div class="n">record</div><div class="d">PBTR drain 线程</div></div>
+      </div>
+    </div>
+
+    <div class="iface"><div class="st"></div><div class="tx">▼ <b>pb_* C ABI</b>（__cdecl · 无 C++/异常/STL 跨界）　▲ Pin 事件 / 分析回调</div><div class="st"></div></div>
+
+    <div class="layer">
+      <div class="idx"><div class="no">L4</div><div class="name">ABI 桥</div><div class="en">pinbridge.dll</div></div>
+      <div class="body">
+        <div class="bx"><div class="n">Pin C++ → 纯 C</div><div class="d">689 个 pb_* 导出 · ABI v1.5 冻结</div></div>
+        <div class="bx"><div class="n">跨语言调用</div><div class="d">无 C++ 类型/异常/STL 跨界</div></div>
+        <div class="bx"><div class="n">CRT 隔离</div><div class="d">无内存所有权跨界</div></div>
+        <div class="bx"><div class="n">指令级抓取 ×6</div><div class="d">寄存器 / 内存 / 分支 / 指令字节</div></div>
+      </div>
+    </div>
+
+    <div class="iface"><div class="st"></div><div class="tx">▼ Pin C++ API · <b>INS_InsertCall</b> · IPOINT_BEFORE / AFTER</div><div class="st"></div></div>
+
+    <div class="layer">
+      <div class="idx"><div class="no">L5</div><div class="name">Pin 层</div><div class="en">Pin 3.31</div></div>
+      <div class="body">
+        <div class="bx wide"><div class="n">pin.exe -t pinbridge_agent.dll -- target.exe</div><div class="d">JIT 重编译 · instrumentation time 插桩 · 范围过滤编译期折叠</div></div>
+        <div class="bx"><div class="n">私有 loader</div><div class="d">工具 DLL 私有映射</div></div>
+      </div>
+    </div>
+
+    <div class="iface"><div class="st"></div><div class="tx">▼ JIT 重编译 · 插桩点注入　▲ 分析回调（application threads）</div><div class="st"></div></div>
+
+    <div class="layer">
+      <div class="idx"><div class="no">L6</div><div class="name">目标进程</div><div class="en">target.exe</div></div>
+      <div class="body">
+        <div class="bx wide"><div class="n">target.exe</div><div class="d">VMP 壳样本 / 任意 Windows x64 程序</div></div>
+      </div>
+    </div>
+
+  </div>
+
+  <div class="caption"><b>图 1</b>　PinBridge Next 分层架构　（▼ 请求方向　▲ 回调/事件方向）</div>
+  <div class="note">热路径：目标指令 → Pin JIT → 范围过滤 → 固定 IARG 抓取 → 写 ring；查询/脚本/录制线程被动翻页，写 ring 永不阻塞 UI（实测 1360 万事件 / 1.5s）。</div>
+
+</div>
+</body>
+</html>

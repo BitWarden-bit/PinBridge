@@ -1,6 +1,7 @@
 #include "pin.H"
 
 #include "reg_function_backend.h"
+#include "reg_mapping_pin.h"
 
 #include <cstring>
 
@@ -18,7 +19,10 @@ uint16_t PbBackendConvertX87AbridgedTagToFull(const uint8_t* fxsave_bytes)
 
 uint64_t PbBackendRegStringShort(uint32_t reg, char* buffer, uint64_t capacity)
 {
-    const std::string value = REG_StringShort(static_cast<REG>(reg));
+    REG native_reg;
+    if (!PbPinRegFromId(reg, &native_reg))
+        return 0;
+    const std::string value = REG_StringShort(native_reg);
     const uint64_t required = static_cast<uint64_t>(value.size()) + 1u;
     if (buffer && capacity >= required)
         std::memcpy(buffer, value.c_str(), static_cast<size_t>(required));

@@ -5,7 +5,8 @@
 //!   2. analysis time — one atomic flag check before recording an event.
 
 use crate::event::{
-    Event, EVENT_BRANCH_EDGE, EVENT_EXEC, EVENT_HOOK_REGS, EVENT_MEMORY, EVENT_SYSCALL,
+    Event, EVENT_BRANCH_EDGE, EVENT_EXEC, EVENT_HOOK_REGS, EVENT_HOOK_RETURN, EVENT_MEMORY,
+    EVENT_SYSCALL,
 };
 use crate::ring::submit;
 use core::ffi::c_void;
@@ -174,16 +175,18 @@ pub unsafe extern "C" fn on_ins(ins: PbInsHandle, _user_data: *mut c_void) {
         pb_ins_insert_capture_regs(ins, Some(on_hook_regs), core::ptr::null_mut());
     }
 
-    // runtime hook point set (HOOK_* ops): same capture call + callback as
-    // the env range above, so kind-1 events keep their arg layout
+    // Runtime hook points receive a borrowed Pin context. The callback still
+    // emits the normal kind-1 event, then applies any precompiled action rules
+    // directly to that context before the application instruction continues.
     if crate::hooks::any() && crate::hooks::contains(address) {
-        pb_ins_insert_capture_regs(ins, Some(on_hook_regs), core::ptr::null_mut());
+        crate::hooks::mark_return(address, query_bool(ins, pb_ins_is_ret));
+        pb_ins_insert_capture_regs_ctx(ins, Some(on_hook_context), core::ptr::null_mut());
     }
 
     // record channel: independent of the main trace range and engine
     // enables; insertions are inert until a session arms (analysis-time
     // re-check inside the record callbacks)
-    let (rec_lo, rec_hi) = crate::record::range();
+    let (rec_lo, rec_hi) = crate::record::instrumentation_range();
     let recording = crate::record::instrumentation_enabled()
         && in_range(address, rec_lo, rec_hi);
 
@@ -246,6 +249,78 @@ unsafe extern "C" fn on_hook_regs(
         arg3: r9,
         ..Event::EMPTY
     });
+}
+
+unsafe extern "C" fn on_hook_context(
+    address: u64,
+    thread_id: u32,
+    context: PbContextHandle,
+    rcx: u64,
+    rdx: u64,
+    r8: u64,
+    r9: u64,
+    _user_data: *mut c_void,
+) {
+    if crate::hooks::take_replay_guard(thread_id, address) {
+        return;
+    }
+    // Keep the pre-action ABI stack arguments in the event as a4..a7. The
+    // fixed a0..a3 slots remain the captured register values for compatibility
+    // with existing hook scripts.
+    let mut stack_args = [0u64; 4];
+    let is_return = crate::hooks::is_return(address);
+    if !is_return {
+        for (index, value) in stack_args.iter_mut().enumerate() {
+            let _ = pb_pin_get_context_stack_arg(
+                context as PbConstContextHandle,
+                index as u32,
+                value,
+            );
+        }
+    }
+    if is_return {
+        let mut return_value = 0;
+        let _ = pb_pin_get_context_reg(
+            context as PbConstContextHandle,
+            crate::arch::return_reg(),
+            &mut return_value,
+        );
+        submit(Event {
+            kind: EVENT_HOOK_RETURN,
+            thread_id,
+            address,
+            // Return hooks use a0 for the value visible immediately before
+            // the native action; the remaining slots retain the normal
+            // register/stack snapshot for diagnostics.
+            arg0: return_value,
+            arg1: rcx,
+            arg2: rdx,
+            arg3: r8,
+            arg4: r9,
+            arg5: stack_args[0],
+            arg6: stack_args[1],
+            arg7: stack_args[2],
+            ..Event::EMPTY
+        });
+    } else {
+        submit(Event {
+            kind: EVENT_HOOK_REGS,
+            thread_id,
+            address,
+            arg0: rcx,
+            arg1: rdx,
+            arg2: r8,
+            arg3: r9,
+            arg4: stack_args[0],
+            arg5: stack_args[1],
+            arg6: stack_args[2],
+            arg7: stack_args[3],
+            ..Event::EMPTY
+        });
+    }
+    if crate::hooks::apply_rules(address, thread_id, context, [rcx, rdx, r8, r9]) > 0 {
+        let _ = crate::hooks::execute_modified_context(thread_id, address, context);
+    }
 }
 
 unsafe extern "C" fn on_memory(

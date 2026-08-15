@@ -1,6 +1,7 @@
 #include "pin.H"
 
 #include "context_backend.h"
+#include "reg_mapping_pin.h"
 #include "regset_conversion_pin.h"
 
 #include <cstring>
@@ -14,8 +15,8 @@ static_assert(FPSTATE_ALIGNMENT == 64, "unexpected Pin FPSTATE alignment");
 
 bool RegBufferSize(PbRegId value, uint64_t* size)
 {
-    const REG reg = static_cast<REG>(value);
-    if (!REG_is_reg(reg))
+    REG reg;
+    if (!PbPinRegFromId(value, &reg))
         return false;
     const UINT32 pin_size = REG_Size(reg);
     if (pin_size == 0)
@@ -26,8 +27,8 @@ bool RegBufferSize(PbRegId value, uint64_t* size)
 
 bool ScalarContextReg(PbRegId value)
 {
-    const REG reg = static_cast<REG>(value);
-    if (!REG_is_reg(reg))
+    REG reg;
+    if (!PbPinRegFromId(value, &reg))
         return false;
     return REG_valid_for_iarg_reg_value(reg) || REG_is_fr_for_get_context(reg);
 }
@@ -35,14 +36,34 @@ bool ScalarContextReg(PbRegId value)
 /* Write path gate. The read-oriented check above rejects registers that are
    not valid IARG_REG_VALUE / get-context scalars but are still perfectly
    settable via PIN_SetContextReg — REG_INST_PTR (needed to redirect
-   execution through writeable/stopped contexts) and REG_RFLAGS. */
+   execution through writeable/stopped contexts) and the flags register
+   (REG_RFLAGS on intel64, REG_EFLAGS on ia32; both alias REG_GFLAGS). */
 bool WriteableContextReg(PbRegId value)
 {
-    const REG reg = static_cast<REG>(value);
-    if (!REG_is_reg(reg))
+    REG reg;
+    if (!PbPinRegFromId(value, &reg))
         return false;
     return REG_valid_for_iarg_reg_value(reg) || REG_is_fr_for_get_context(reg) ||
-           reg == REG_INST_PTR || reg == REG_RFLAGS;
+           reg == REG_INST_PTR || reg == REG_GFLAGS;
+}
+
+bool StackArgAddress(const CONTEXT* context, uint32_t index, ADDRINT* out_address)
+{
+    if (!context || !out_address)
+        return false;
+#if defined(TARGET_IA32E)
+    const REG stack_reg = REG_RSP;
+    const uint64_t offset = 0x28ull + static_cast<uint64_t>(index) * 8ull;
+#else
+    const REG stack_reg = REG_ESP;
+    const uint64_t offset = 4ull + static_cast<uint64_t>(index) * 4ull;
+#endif
+    const uint64_t stack = static_cast<uint64_t>(
+        PIN_GetContextReg(context, stack_reg));
+    if (offset > static_cast<uint64_t>(~static_cast<ADDRINT>(0)) - stack)
+        return false;
+    *out_address = static_cast<ADDRINT>(stack + offset);
+    return true;
 }
 
 } // namespace
@@ -117,8 +138,10 @@ PbStatus PbBackendGetContextRegval(
     *required_size = size;
     if (capacity < size)
         return PB_ERR_BUFFER_TOO_SMALL;
-    PIN_GetContextRegval(
-        static_cast<const CONTEXT*>(context), static_cast<REG>(reg), buffer);
+    REG native_reg;
+    if (!PbPinRegFromId(reg, &native_reg))
+        return PB_ERR_INVALID_ARGUMENT;
+    PIN_GetContextRegval(static_cast<const CONTEXT*>(context), native_reg, buffer);
     return PB_OK;
 }
 
@@ -133,8 +156,11 @@ PbStatus PbBackendSetContextReg(void* context, PbRegId reg, uint64_t value)
 {
     if (!WriteableContextReg(reg))
         return PB_ERR_INVALID_ARGUMENT;
-    PIN_SetContextReg(
-        static_cast<CONTEXT*>(context), static_cast<REG>(reg), static_cast<ADDRINT>(value));
+    REG native_reg;
+    if (!PbPinRegFromId(reg, &native_reg))
+        return PB_ERR_INVALID_ARGUMENT;
+    PIN_SetContextReg(static_cast<CONTEXT*>(context), native_reg,
+                      static_cast<ADDRINT>(value));
     return PB_OK;
 }
 
@@ -144,8 +170,39 @@ PbStatus PbBackendSetContextRegval(
     uint64_t size = 0;
     if (!RegBufferSize(reg, &size) || value_size != size)
         return PB_ERR_INVALID_ARGUMENT;
-    PIN_SetContextRegval(
-        static_cast<CONTEXT*>(context), static_cast<REG>(reg), value);
+    REG native_reg;
+    if (!PbPinRegFromId(reg, &native_reg))
+        return PB_ERR_INVALID_ARGUMENT;
+    PIN_SetContextRegval(static_cast<CONTEXT*>(context), native_reg, value);
+    return PB_OK;
+}
+
+PbStatus PbBackendGetContextStackArg(
+    const void* context, uint32_t index, uint64_t* out_value)
+{
+    if (!out_value)
+        return PB_ERR_INVALID_ARGUMENT;
+    ADDRINT address = 0;
+    if (!StackArgAddress(static_cast<const CONTEXT*>(context), index, &address))
+        return PB_ERR_INVALID_ARGUMENT;
+    ADDRINT value = 0;
+    if (PIN_SafeCopy(&value, reinterpret_cast<const VOID*>(address), sizeof(value))
+        != sizeof(value))
+        return PB_ERR_INVALID_STATE;
+    *out_value = static_cast<uint64_t>(value);
+    return PB_OK;
+}
+
+PbStatus PbBackendSetContextStackArg(
+    void* context, uint32_t index, uint64_t value)
+{
+    ADDRINT address = 0;
+    if (!StackArgAddress(static_cast<const CONTEXT*>(context), index, &address))
+        return PB_ERR_INVALID_ARGUMENT;
+    const ADDRINT narrowed = static_cast<ADDRINT>(value);
+    if (PIN_SafeCopy(reinterpret_cast<VOID*>(address), &narrowed, sizeof(narrowed))
+        != sizeof(narrowed))
+        return PB_ERR_INVALID_STATE;
     return PB_OK;
 }
 

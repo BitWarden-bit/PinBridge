@@ -47,6 +47,13 @@ pub mod op {
     pub const TRACE_START: u8 = 0x35;
     pub const TRACE_STOP: u8 = 0x36;
     pub const TRACE_STATUS: u8 = 0x37;
+    /// Structured trace specification: multiple ranges and thread allowlist.
+    pub const TRACE_START_SPEC: u8 = 0x38;
+    /// Add address ranges to an armed structured trace.
+    pub const TRACE_EXTEND: u8 = 0x39;
+
+    // Target memory layout inspection.
+    pub const MEMORY_REGION: u8 = 0x28;
 
     // script host
     pub const SCRIPT_LOAD: u8 = 0x40;
@@ -62,11 +69,31 @@ pub mod op {
     pub const HOOK_REMOVE: u8 = 0x51;
     pub const HOOK_CLEAR: u8 = 0x52;
     pub const HOOK_LIST: u8 = 0x53;
+    pub const HOOK_RULE_SET: u8 = 0x54;
+    pub const HOOK_RULE_CLEAR: u8 = 0x55;
 }
 
 pub const STATUS_OK: u8 = 0;
 pub const STATUS_BAD_REQUEST: u8 = 1;
 pub const STATUS_INTERNAL: u8 = 2;
+
+/// Target-architecture ids, appended to the PING reply so clients can tell
+/// which Pin runtime (ia32/intel64) the agent was loaded into. Readers that
+/// predate these fields simply ignore the trailing bytes, so the extension is
+/// wire-backward-compatible.
+pub const ARCH_X86: u32 = 0;
+pub const ARCH_X64: u32 = 1;
+
+/// Maps a pointer width (4 or 8 bytes) to the wire arch id above. Anything
+/// else returns 0xFFFF_FFFF so a malformed agent can never be mistaken for a
+/// valid architecture.
+pub fn arch_from_pointer_width(width: u32) -> u32 {
+    match width {
+        4 => ARCH_X86,
+        8 => ARCH_X64,
+        _ => u32::MAX,
+    }
+}
 
 /// Wire image of one agent event (88 bytes payload).
 #[repr(C)]

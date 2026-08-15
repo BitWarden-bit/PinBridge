@@ -104,6 +104,7 @@ fn cmd_launch(state: State<'_, Arc<AppState>>, target: String, pin: Option<Strin
     let options = launch::LaunchOptions {
         pin: pin.or_else(|| state.pin.clone()),
         agent: state.agent.clone(),
+        arch: None, // auto-detect from the target's PE headers
         port: 0, // auto-pick a free port per session (avoids zombie collisions)
         entry_bp: entry_bp.unwrap_or(true), // debugger default: break at entry
     };
@@ -511,6 +512,7 @@ fn main() {
         let options = launch::LaunchOptions {
             pin: config.pin.clone(),
             agent: config.agent.clone(),
+            arch: None, // auto-detect from the target's PE headers
             port: 0,
             entry_bp: true, // debugger default: stop at the entry point
         };

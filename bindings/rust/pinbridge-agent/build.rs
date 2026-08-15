@@ -2,31 +2,41 @@ use std::path::{Path, PathBuf};
 
 fn main() {
     pinbridge_tool::emit_link_flags();
+    stage_bridge_dll();
     // The embedded CPython import must be invisible to Pin's tool loader
     // (same proven trick as WS2_32): delay-load hides it from the loader's
     // import walk; the scripting thread preloads python310.dll with the real
     // OS loader before the first pyo3 call, so the delay-load then resolves
     // to the already-loaded module — no CRT delay-load hook needed.
-    println!("cargo:rustc-link-arg=/DELAYLOAD:python310.dll");
-    stage_bridge_dll();
-    stage_python_dll();
+    // Gated on the `scripting` feature: the x86 no-Python build must not
+    // link or stage Python at all.
+    if std::env::var("CARGO_FEATURE_SCRIPTING").is_ok() {
+        println!("cargo:rustc-link-arg=/DELAYLOAD:python310.dll");
+        stage_python_dll();
+    }
 }
 
 /// The agent cdylib imports pinbridge.dll (the C++ ABI bridge), and the
 /// Windows loader resolves it next to the agent DLL at Pin load time. Cargo
 /// never learns about that dependency, so a fresh/stale target dir misses it
 /// ("pinbridge.dll missing next to ...pinbridge_agent.dll"). Copy the MSVC
-/// output (build\pin\x64\<Config>\pinbridge.dll) next to the agent whenever
-/// it is newer; prefer the Release bridge, fall back to Debug.
+/// output for the Rust target architecture next to the agent whenever it is
+/// newer; prefer the Release bridge, fall back to Debug.
 fn stage_bridge_dll() {
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
     let root = match manifest.ancestors().nth(3) {
         Some(p) => p.to_path_buf(), // pinbridge-agent -> rust -> bindings -> repo root
         None => return,
     };
+    let pin_arch = if std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("x86") {
+        "ia32"
+    } else {
+        // Preserve the existing x64 behavior for x86_64 and unknown hosts.
+        "x64"
+    };
     let candidates = [
-        root.join(r"build\pin\x64\Release\pinbridge.dll"),
-        root.join(r"build\pin\x64\Debug\pinbridge.dll"),
+        root.join(format!(r"build\pin\{pin_arch}\Release\pinbridge.dll")),
+        root.join(format!(r"build\pin\{pin_arch}\Debug\pinbridge.dll")),
     ];
     let source = match candidates.iter().find(|p| p.exists()) {
         Some(p) => p,
@@ -64,6 +74,7 @@ fn newer(source: &Path, dest: &Path) -> bool {
 /// fallback). Stage a copy into the profile dir like the bridge DLL. The
 /// agent runs fine without it (scripting reports "python unavailable"), so
 /// every failure here is a warning, never a build error.
+#[allow(dead_code)] // unreachable in the no-`scripting` build
 fn stage_python_dll() {
     let source = match locate_python_dll() {
         Some(source) => source,
@@ -92,6 +103,7 @@ fn stage_python_dll() {
 ///   1. next to $PYTHON_SYS_EXECUTABLE when set,
 ///   2. next to the first `python` on PATH (`where python`),
 ///   3. the standard per-user install dir.
+#[allow(dead_code)] // only reachable from stage_python_dll
 fn locate_python_dll() -> Option<PathBuf> {
     let beside_exe = |exe: &str| -> Option<PathBuf> {
         let dll = PathBuf::from(exe).parent()?.join("python310.dll");

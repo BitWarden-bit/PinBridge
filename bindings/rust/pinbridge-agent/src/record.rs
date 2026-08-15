@@ -22,7 +22,9 @@
 //! Drainer (Pin internal thread, std io allowed there): polls tags in
 //! order, appends 88-byte wire-layout records (pinbridge-proto EventRecord)
 //! to the file, finishes after trace_stop once caught up. Kind-11 marker
-//! records bracket the tape (start/end annotations).
+//! records bracket the tape (start/end annotations). Consecutive identical
+//! events are written once followed by a kind-12 repeat marker; readers can
+//! expand that marker to recover the original logical event stream.
 //!
 //! Arming: trace_start publishes the runtime range atomics, sets ARMED (and
 //! the sticky instrumented flag), then flushes the JIT for [lo, hi) so the
@@ -37,16 +39,17 @@
 //!   8:  u32 meta_len
 //!   12: u32 reserved = 0
 //!   16: meta_len bytes UTF-8 JSON {"target","created","kinds","agent","note", ...}
-//!   then 88-byte EventRecord wire images. entry_context is omitted in v1:
-//!   snapshotting RUNNING threads is unsafe, so the replay reader must
-//!   tolerate its absence (see taint-roadmap).
+//!   then 88-byte EventRecord wire images. Register snapshots, when requested,
+//!   are emitted as kind-13 components from the instruction context callback;
+//!   no separate entry_context blob is required.
 
 use crate::event::{
-    Event, EVENT_BRANCH_EDGE, EVENT_EXEC, EVENT_EXEC_BYTES, EVENT_MARKER, EVENT_MEMORY,
-    EVENT_MEM_VALUE,
+    Event, EVENT_BRANCH_EDGE, EVENT_CONTEXT_CHANGE, EVENT_EXEC, EVENT_EXEC_BYTES,
+    EVENT_MARKER, EVENT_MEMORY, EVENT_MEM_VALUE, EVENT_REG_SNAPSHOT, EVENT_REPEAT,
+    EVENT_SYSCALL,
 };
 use core::ffi::c_void;
-use core::sync::atomic::{AtomicBool, AtomicU64, AtomicPtr, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicPtr, AtomicUsize, Ordering};
 use pinbridge_sys::*;
 use std::io::Write;
 
@@ -57,13 +60,115 @@ const SLOT_WORDS: usize = 11;
 /// Marker tags (kind 11, arg0).
 const MARKER_START: u64 = 1;
 const MARKER_STOP: u64 = 2;
-/// Kinds the record channel can capture (v1): memory, exec, branch,
-/// exec_bytes, mem_value. syscall/hook/module stay main-ring only.
+const MARKER_SCOPE_ADD: u64 = 3;
+/// Kinds the record channel can capture: memory, exec, branch, values,
+/// register snapshots, syscall and context-change events.
 pub const RECORDABLE_MASK: u32 = (1 << EVENT_MEMORY)
     | (1 << EVENT_EXEC)
     | (1 << EVENT_BRANCH_EDGE)
     | (1 << EVENT_EXEC_BYTES)
-    | (1 << EVENT_MEM_VALUE);
+    | (1 << EVENT_MEM_VALUE)
+    | (1 << EVENT_REG_SNAPSHOT)
+    | (1 << EVENT_SYSCALL)
+    | (1 << EVENT_CONTEXT_CHANGE);
+
+static CONTEXT_FRAME: AtomicU64 = AtomicU64::new(0);
+const CONTEXT_SLOTS: usize = 64;
+const NO_CONTEXT_OWNER: u32 = u32::MAX;
+const CONTEXT_REG_COUNT: usize = 114; // 18 GP/flags + 32 XMM + 32 YMM + 32 ZMM
+const CONTEXT_CHUNKS: usize = 8; // max 512-bit ZMM value
+
+struct ContextSlot {
+    owner: AtomicU32,
+    valid: AtomicBool,
+    values: [AtomicU64; CONTEXT_REG_COUNT * CONTEXT_CHUNKS],
+}
+
+impl ContextSlot {
+    const fn new() -> Self {
+        Self {
+            owner: AtomicU32::new(NO_CONTEXT_OWNER),
+            valid: AtomicBool::new(false),
+            values: [const { AtomicU64::new(0) }; CONTEXT_REG_COUNT * CONTEXT_CHUNKS],
+        }
+    }
+}
+
+static CONTEXT_STATE: [ContextSlot; CONTEXT_SLOTS] =
+    [const { ContextSlot::new() }; CONTEXT_SLOTS];
+
+/// Register id for a wire slot. The front GP slots follow
+/// `crate::arch::gp_registers()` so an ia32 build emits eax/.../eip/eflags
+/// instead of rax/.../rip; the x64-only trailing GP slots (r8-r15/rip/rflags
+/// positions) then report `PB_REG_INVALID_` and are never read, so no fake
+/// values are produced. XMM/YMM/ZMM slots are arch-independent.
+#[inline]
+fn context_reg(index: usize) -> PbRegId {
+    match index {
+        0..=17 => {
+            let gp = crate::arch::gp_registers();
+            if index < gp.len() {
+                gp[index].1
+            } else {
+                PB_REG_INVALID_
+            }
+        }
+        18..=49 => PB_REG_XMM0 + (index - 18) as PbRegId,
+        50..=81 => PB_REG_YMM0 + (index - 50) as PbRegId,
+        82..=113 => PB_REG_ZMM0 + (index - 82) as PbRegId,
+        _ => PB_REG_INVALID_,
+    }
+}
+
+#[inline]
+fn context_width(index: usize) -> usize {
+    match index {
+        // GP slots: 8 bytes on both arches (the agent reads every GP register
+        // as a scalar u64, matching context.rs CONTEXT_GET). x86 has only 10
+        // GP registers, so its trailing slots report 0 and are never read.
+        0..=17 => {
+            if index < crate::arch::gp_registers().len() {
+                8
+            } else {
+                0
+            }
+        }
+        18..=49 => 16,
+        50..=81 => 32,
+        82..=113 => 64,
+        _ => 0,
+    }
+}
+
+fn context_slot(thread_id: u32) -> Option<&'static ContextSlot> {
+    for slot in &CONTEXT_STATE {
+        let owner = slot.owner.load(Ordering::Acquire);
+        if owner == thread_id {
+            return Some(slot);
+        }
+        if owner == NO_CONTEXT_OWNER
+            && slot
+                .owner
+                .compare_exchange(
+                    NO_CONTEXT_OWNER,
+                    thread_id,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+        {
+            return Some(slot);
+        }
+    }
+    None
+}
+
+fn reset_context_state() {
+    for slot in &CONTEXT_STATE {
+        slot.valid.store(false, Ordering::Release);
+        slot.owner.store(NO_CONTEXT_OWNER, Ordering::Release);
+    }
+}
 
 struct Slab {
     /// Per-slot sequence tag (plain u64 storage, accessed as AtomicU64 —
@@ -82,7 +187,7 @@ static CLAIM: AtomicU64 = AtomicU64::new(0);
 static DRAINED: AtomicU64 = AtomicU64::new(0);
 /// Overflow drops + abandoned/hole-skipped slots this session.
 static DROPPED: AtomicU64 = AtomicU64::new(0);
-/// Records actually written to the file this session.
+/// Logical capture events drained this session (before kind-12 RLE).
 static WRITTEN: AtomicU64 = AtomicU64::new(0);
 /// Recording live: producers may claim. Cleared by trace_stop.
 static ARMED: AtomicBool = AtomicBool::new(false);
@@ -96,38 +201,94 @@ static STICKY: AtomicBool = AtomicBool::new(false);
 static RECORD_LO: AtomicU64 = AtomicU64::new(0);
 static RECORD_HI: AtomicU64 = AtomicU64::new(0);
 static RECORD_KINDS: AtomicU64 = AtomicU64::new(0);
+const MAX_RECORD_RANGES: usize = 16;
+const MAX_RECORD_THREADS: usize = 64;
+static RECORD_RANGE_COUNT: AtomicUsize = AtomicUsize::new(0);
+static RECORD_RANGE_LO: [AtomicU64; MAX_RECORD_RANGES] =
+    [const { AtomicU64::new(0) }; MAX_RECORD_RANGES];
+static RECORD_RANGE_HI: [AtomicU64; MAX_RECORD_RANGES] =
+    [const { AtomicU64::new(0) }; MAX_RECORD_RANGES];
+static RECORD_THREAD_COUNT: AtomicUsize = AtomicUsize::new(0);
+static RECORD_THREADS: [AtomicU32; MAX_RECORD_THREADS] =
+    [const { AtomicU32::new(0) }; MAX_RECORD_THREADS];
 
 // ---- producer side (analysis callbacks; hot-path discipline) ----
 
 /// Analysis-time gate: recording live + address inside the window + this
 /// kind requested. Already-JITted code with stale insertions dies here.
 #[inline]
-fn armed_in_range(address: u64, kind: u32) -> bool {
+fn in_record_ranges(address: u64) -> bool {
+    let count = RECORD_RANGE_COUNT.load(Ordering::Acquire);
+    if count == 0 {
+        return address >= RECORD_LO.load(Ordering::Relaxed)
+            && address < RECORD_HI.load(Ordering::Relaxed);
+    }
+    for index in 0..count.min(MAX_RECORD_RANGES) {
+        if address >= RECORD_RANGE_LO[index].load(Ordering::Relaxed)
+            && address < RECORD_RANGE_HI[index].load(Ordering::Relaxed)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+#[inline]
+fn thread_allowed(thread_id: u32) -> bool {
+    let count = RECORD_THREAD_COUNT.load(Ordering::Relaxed);
+    if count == 0 {
+        return true;
+    }
+    for index in 0..count.min(MAX_RECORD_THREADS) {
+        if RECORD_THREADS[index].load(Ordering::Relaxed) == thread_id {
+            return true;
+        }
+    }
+    false
+}
+
+#[inline]
+fn armed_in_range(address: u64, thread_id: u32, kind: u32) -> bool {
     ARMED.load(Ordering::Acquire)
         && (RECORD_KINDS.load(Ordering::Relaxed) & (1 << kind) as u64) != 0
-        && address >= RECORD_LO.load(Ordering::Relaxed)
-        && address < RECORD_HI.load(Ordering::Relaxed)
+        && in_record_ranges(address)
+        && thread_allowed(thread_id)
+}
+
+/// Submit a global syscall/context event to the trace channel. These events
+/// are already registered by the engine and therefore need no instruction
+/// re-JIT; the current context RIP supplies their range association.
+pub unsafe fn submit_global(context: PbConstContextHandle, mut event: Event) {
+    let mut rip = 0u64;
+    if context.is_null()
+        || pb_pin_get_context_reg(context, crate::arch::instr_ptr_reg(), &mut rip) != PB_OK
+        || !armed_in_range(rip, event.thread_id, event.kind)
+    {
+        return;
+    }
+    event.address = rip;
+    submit(event);
 }
 
 /// Hot-path entry point: record one event into the slab. Never blocks;
 /// overflow and post-stop claims drop (counted).
 #[inline]
-pub fn submit(mut event: Event) {
+pub fn submit(mut event: Event) -> bool {
     let slab = SLAB.load(Ordering::Acquire);
     if slab.is_null() {
-        return;
+        return false;
     }
     let cap = SLAB_CAP.load(Ordering::Relaxed);
     let claim = CLAIM.fetch_add(1, Ordering::Relaxed);
     if claim.wrapping_sub(DRAINED.load(Ordering::Acquire)) >= cap as u64 {
         // buffer lapped: the drainer is a full slab behind — drop.
         DROPPED.fetch_add(1, Ordering::Relaxed);
-        return;
+        return false;
     }
     if !ARMED.load(Ordering::Acquire) {
         // stop raced this claim: abandon the slot (hole-skipped by drainer).
         DROPPED.fetch_add(1, Ordering::Relaxed);
-        return;
+        return false;
     }
     event.sequence = claim + 1;
     let slot = (claim % cap as u64) as usize;
@@ -140,6 +301,7 @@ pub fn submit(mut event: Event) {
         let tag = &*(slab.tags.as_ptr().add(slot) as *const AtomicU64);
         tag.store(claim + 1, Ordering::Release);
     }
+    true
 }
 
 pub unsafe extern "C" fn on_rec_exec_bytes(
@@ -150,7 +312,7 @@ pub unsafe extern "C" fn on_rec_exec_bytes(
     bytes_hi: u64,
     _user_data: *mut c_void,
 ) {
-    if !armed_in_range(address, EVENT_EXEC_BYTES) {
+    if !armed_in_range(address, thread_id, EVENT_EXEC_BYTES) {
         return;
     }
     submit(Event {
@@ -173,7 +335,7 @@ pub unsafe extern "C" fn on_rec_mem_value(
     value: u64,
     _user_data: *mut c_void,
 ) {
-    if !armed_in_range(instruction_address, EVENT_MEM_VALUE) {
+    if !armed_in_range(instruction_address, thread_id, EVENT_MEM_VALUE) {
         return;
     }
     submit(Event {
@@ -194,7 +356,7 @@ pub unsafe extern "C" fn on_rec_exec(
     size: u32,
     _user_data: *mut c_void,
 ) {
-    if !armed_in_range(address, EVENT_EXEC) {
+    if !armed_in_range(address, thread_id, EVENT_EXEC) {
         return;
     }
     submit(Event {
@@ -206,6 +368,146 @@ pub unsafe extern "C" fn on_rec_exec(
     });
 }
 
+/// Capture the application register context before an instruction executes.
+/// Components share arg7 so readers can assemble them into one logical frame.
+/// This is deliberately opt-in: a full GP + vector-register snapshot is
+/// information rich but much more expensive than instruction/memory alone.
+pub unsafe extern "C" fn on_rec_registers(
+    context: PbContextHandle,
+    _user_data: *mut c_void,
+) {
+    if context.is_null() {
+        return;
+    }
+    let context = context as PbConstContextHandle;
+    let mut tid: PbThreadId = 0;
+    if pb_pin_thread_id(&mut tid) != PB_OK {
+        return;
+    }
+    let mut rip = 0u64;
+    if pb_pin_get_context_reg(context, crate::arch::instr_ptr_reg(), &mut rip) != PB_OK
+        || !armed_in_range(rip, tid as u32, EVENT_REG_SNAPSHOT)
+    {
+        return;
+    }
+    let frame = CONTEXT_FRAME.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+    let mut values = [[0u64; CONTEXT_CHUNKS]; CONTEXT_REG_COUNT];
+    let mut available = [false; CONTEXT_REG_COUNT];
+    for index in 0..CONTEXT_REG_COUNT {
+        let reg = context_reg(index);
+        let width = context_width(index);
+        if width == 0 {
+            // Arch-invalid slot (x86 has only 10 GP registers): skip entirely,
+            // so no RAX..R15/RIP read is attempted and no fake component is
+            // emitted on the wire.
+            continue;
+        }
+        if width == 8 {
+            available[index] = pb_pin_get_context_reg(context, reg, &mut values[index][0]) == PB_OK;
+        } else {
+            let mut bytes = [0u8; CONTEXT_CHUNKS * 8];
+            let mut needed = 0u64;
+            if pb_pin_get_context_regval(
+                context,
+                reg,
+                bytes.as_mut_ptr(),
+                width as u64,
+                &mut needed,
+            ) == PB_OK
+                && needed >= width as u64
+            {
+                for chunk in 0..(width / 8) {
+                    let start = chunk * 8;
+                    values[index][chunk] = u64::from_le_bytes(
+                        bytes[start..start + 8].try_into().unwrap(),
+                    );
+                }
+                available[index] = true;
+            }
+        }
+    }
+
+    let slot = context_slot(tid as u32);
+    let baseline = slot.map(|state| !state.valid.load(Ordering::Acquire)).unwrap_or(true);
+    let mut mask_lo = 0u64;
+    let mut mask_hi = 0u64;
+    for index in 0..CONTEXT_REG_COUNT {
+        if !available[index] {
+            continue;
+        }
+        let changed = baseline
+            || slot.is_none()
+            || (0..(context_width(index) / 8)).any(|chunk| {
+                slot.unwrap().values[index * CONTEXT_CHUNKS + chunk]
+                    .load(Ordering::Relaxed)
+                    != values[index][chunk]
+            });
+        if changed {
+            if index < 64 {
+                mask_lo |= 1u64 << index;
+            } else {
+                mask_hi |= 1u64 << (index - 64);
+            }
+        }
+    }
+
+    let mut complete = submit(Event {
+        kind: EVENT_REG_SNAPSHOT,
+        thread_id: tid as u32,
+        address: rip,
+        arg1: mask_lo,
+        arg2: mask_hi,
+        arg3: if baseline { 1 } else { 2 },
+        arg7: frame,
+        ..Event::EMPTY
+    });
+
+    for index in 0..CONTEXT_REG_COUNT {
+        let changed = if index < 64 {
+            mask_lo & (1u64 << index) != 0
+        } else {
+            mask_hi & (1u64 << (index - 64)) != 0
+        };
+        if !available[index] || !changed {
+            continue;
+        }
+        let width = context_width(index);
+        let parts = if width <= 8 { 1 } else { width / 16 };
+        for part in 0..parts {
+            let chunk = part * 2;
+            if !submit(Event {
+                kind: EVENT_REG_SNAPSHOT,
+                thread_id: tid as u32,
+                address: rip,
+                arg0: context_reg(index) as u64,
+                arg1: values[index][chunk],
+                arg2: values[index][chunk + 1],
+                arg3: width as u64,
+                arg4: part as u64,
+                arg7: frame,
+                ..Event::EMPTY
+            }) {
+                complete = false;
+            }
+        }
+    }
+
+    if complete {
+        if let Some(state) = slot {
+            for index in 0..CONTEXT_REG_COUNT {
+                if !available[index] {
+                    continue;
+                }
+                for chunk in 0..(context_width(index) / 8) {
+                    state.values[index * CONTEXT_CHUNKS + chunk]
+                        .store(values[index][chunk], Ordering::Relaxed);
+                }
+            }
+            state.valid.store(true, Ordering::Release);
+        }
+    }
+}
+
 pub unsafe extern "C" fn on_rec_memory(
     instruction_address: u64,
     thread_id: u32,
@@ -214,7 +516,7 @@ pub unsafe extern "C" fn on_rec_memory(
     access: u32,
     _user_data: *mut c_void,
 ) {
-    if !armed_in_range(instruction_address, EVENT_MEMORY) {
+    if !armed_in_range(instruction_address, thread_id, EVENT_MEMORY) {
         return;
     }
     submit(Event {
@@ -235,7 +537,7 @@ pub unsafe extern "C" fn on_rec_branch(
     taken: u64,
     _user_data: *mut c_void,
 ) {
-    if !armed_in_range(address, EVENT_BRANCH_EDGE) {
+    if !armed_in_range(address, thread_id, EVENT_BRANCH_EDGE) {
         return;
     }
     submit(Event {
@@ -265,11 +567,30 @@ pub fn range() -> (u64, u64) {
     )
 }
 
+/// Returns a conservative bounding range for instrumentation. Exact gaps in
+/// a multi-range spec are rejected by `in_record_ranges` on the hot path.
+pub fn instrumentation_range() -> (u64, u64) {
+    let count = RECORD_RANGE_COUNT.load(Ordering::Relaxed);
+    if count == 0 {
+        return range();
+    }
+    let mut lo = u64::MAX;
+    let mut hi = 0;
+    for index in 0..count.min(MAX_RECORD_RANGES) {
+        lo = lo.min(RECORD_RANGE_LO[index].load(Ordering::Relaxed));
+        hi = hi.max(RECORD_RANGE_HI[index].load(Ordering::Relaxed));
+    }
+    (lo, hi)
+}
+
 /// Inserts the record capture calls for one instruction. Runs at
 /// instrumentation time (allocation-friendly); `branchy` mirrors the main
 /// engines' branch/call/ret classification for the branch capture.
 pub unsafe fn instrument(ins: PbInsHandle, branchy: bool) {
     let mask = RECORD_KINDS.load(Ordering::Relaxed) as u32;
+    if mask & (1 << EVENT_REG_SNAPSHOT) != 0 {
+        pb_ins_insert_call_before_ctx(ins, Some(on_rec_registers), core::ptr::null_mut());
+    }
     if mask & (1 << EVENT_EXEC_BYTES) != 0 {
         pb_ins_insert_capture_exec_bytes(ins, Some(on_rec_exec_bytes), core::ptr::null_mut());
     }
@@ -336,12 +657,33 @@ struct DrainArgs {
     kinds_mask: u32,
     lo: u64,
     hi: u64,
+    ranges: Vec<(u64, u64)>,
+    threads: Vec<u32>,
+}
+
+#[derive(Clone)]
+struct ModuleScope {
+    base: u64,
+    end: u64,
+    is_main: bool,
+    name: String,
 }
 
 /// trace_start: arm the record path and flush the window's JIT.
 /// Runs on the query-server thread (allocation + spawn happen HERE, never
 /// in a callback).
 pub fn start(kinds_mask: u32, lo: u64, hi: u64, path: String) -> Result<(), String> {
+    start_spec(kinds_mask, vec![(lo, hi)], Vec::new(), path)
+}
+
+/// Starts a trace with an allowlist of non-overlapping address ranges and
+/// optional application thread ids. Empty `threads` means all threads.
+pub fn start_spec(
+    kinds_mask: u32,
+    ranges: Vec<(u64, u64)>,
+    threads: Vec<u32>,
+    path: String,
+) -> Result<(), String> {
     if ARMED.load(Ordering::Acquire) {
         return Err("already recording".to_string());
     }
@@ -350,8 +692,14 @@ pub fn start(kinds_mask: u32, lo: u64, hi: u64, path: String) -> Result<(), Stri
             "bad kinds mask 0x{kinds_mask:x} (recordable: 0x{RECORDABLE_MASK:x})"
         ));
     }
-    if lo >= hi {
+    if ranges.is_empty() || ranges.len() > MAX_RECORD_RANGES {
+        return Err(format!("bad range count (1..={MAX_RECORD_RANGES})"));
+    }
+    if ranges.iter().any(|(lo, hi)| lo >= hi) {
         return Err("bad range: lo >= hi".to_string());
+    }
+    if threads.len() > MAX_RECORD_THREADS {
+        return Err(format!("too many thread ids (max {MAX_RECORD_THREADS})"));
     }
     if path.is_empty() {
         return Err("empty path".to_string());
@@ -364,19 +712,36 @@ pub fn start(kinds_mask: u32, lo: u64, hi: u64, path: String) -> Result<(), Stri
     DROPPED.store(0, Ordering::Relaxed);
     WRITTEN.store(0, Ordering::Relaxed);
     DRAIN_DONE.store(false, Ordering::Relaxed);
+    reset_context_state();
     unsafe {
         let slab = &*SLAB.load(Ordering::Acquire);
         core::ptr::write_bytes(slab.tags.as_ptr() as *mut u8, 0, SLAB_CAP.load(Ordering::Relaxed) * 8);
     }
+    let (lo, hi) = ranges.iter().fold((u64::MAX, 0), |(lo0, hi0), (lo1, hi1)| {
+        (lo0.min(*lo1), hi0.max(*hi1))
+    });
     RECORD_KINDS.store(kinds_mask as u64, Ordering::Relaxed);
     RECORD_LO.store(lo, Ordering::Relaxed);
     RECORD_HI.store(hi, Ordering::Relaxed);
+    for index in 0..MAX_RECORD_RANGES {
+        let (range_lo, range_hi) = ranges.get(index).copied().unwrap_or((0, 0));
+        RECORD_RANGE_LO[index].store(range_lo, Ordering::Relaxed);
+        RECORD_RANGE_HI[index].store(range_hi, Ordering::Relaxed);
+    }
+    RECORD_RANGE_COUNT.store(ranges.len(), Ordering::Release);
+    for index in 0..MAX_RECORD_THREADS {
+        RECORD_THREADS[index].store(threads.get(index).copied().unwrap_or(0), Ordering::Relaxed);
+    }
+    RECORD_THREAD_COUNT.store(threads.len(), Ordering::Release);
 
+    let flush_ranges = ranges.clone();
     let args = Box::new(DrainArgs {
         path,
         kinds_mask,
         lo,
         hi,
+        ranges,
+        threads,
     });
     let mut thread_id: PbThreadId = 0;
     let mut thread_uid: PbPinThreadUid = 0;
@@ -397,10 +762,72 @@ pub fn start(kinds_mask: u32, lo: u64, hi: u64, path: String) -> Result<(), Stri
     ARMED.store(true, Ordering::Release);
     STICKY.store(true, Ordering::Relaxed);
     unsafe {
-        pb_pin_remove_instrumentation_in_range(lo, hi);
+        for (range_lo, range_hi) in &flush_ranges {
+            pb_pin_remove_instrumentation_in_range(*range_lo, *range_hi);
+        }
     }
     crate::log::line(&format!(
         "trace start kinds=0x{kinds_mask:x} range=0x{lo:x}-0x{hi:x}"
+    ));
+    Ok(())
+}
+
+/// Extends an armed session with temporary ranges. The range slots are
+/// populated before the published count, so producer callbacks either see
+/// the old complete allowlist or the new complete allowlist. A marker is
+/// submitted for each addition so replay can reconstruct the live scope.
+pub fn extend_ranges(ranges: Vec<(u64, u64)>) -> Result<(), String> {
+    if !ARMED.load(Ordering::Acquire) {
+        return Err("not recording".to_string());
+    }
+    if ranges.is_empty() || ranges.len() > MAX_RECORD_RANGES {
+        return Err(format!("bad extension count (1..={MAX_RECORD_RANGES})"));
+    }
+    if ranges.iter().any(|(lo, hi)| lo >= hi) {
+        return Err("bad extension range: lo >= hi".to_string());
+    }
+    let old_count = RECORD_RANGE_COUNT.load(Ordering::Acquire);
+    if old_count + ranges.len() > MAX_RECORD_RANGES {
+        return Err(format!(
+            "too many live ranges ({} + {} > {MAX_RECORD_RANGES})",
+            old_count,
+            ranges.len()
+        ));
+    }
+    let new_count = old_count + ranges.len();
+    let mut bound_lo = RECORD_LO.load(Ordering::Relaxed);
+    let mut bound_hi = RECORD_HI.load(Ordering::Relaxed);
+    for (offset, (lo, hi)) in ranges.iter().copied().enumerate() {
+        let index = old_count + offset;
+        RECORD_RANGE_LO[index].store(lo, Ordering::Relaxed);
+        RECORD_RANGE_HI[index].store(hi, Ordering::Relaxed);
+        bound_lo = bound_lo.min(lo);
+        bound_hi = bound_hi.max(hi);
+    }
+    RECORD_LO.store(bound_lo, Ordering::Relaxed);
+    RECORD_HI.store(bound_hi, Ordering::Relaxed);
+    RECORD_RANGE_COUNT.store(new_count, Ordering::Release);
+    unsafe {
+        for (lo, hi) in &ranges {
+            // Re-JIT code already present in the new region. Future code is
+            // covered by the sticky instrumentation gate and exact filter.
+            pb_pin_remove_instrumentation_in_range(*lo, *hi);
+        }
+    }
+    for (lo, hi) in ranges {
+        submit(Event {
+            kind: EVENT_MARKER,
+            address: 0,
+            arg0: MARKER_SCOPE_ADD,
+            arg1: lo,
+            arg2: hi,
+            ..Event::EMPTY
+        });
+    }
+    crate::log::line(&format!(
+        "trace extend ranges={} live_ranges={}",
+        new_count,
+        new_count
     ));
     Ok(())
 }
@@ -474,6 +901,54 @@ fn main_module_name() -> String {
     String::new()
 }
 
+/// Snapshot modules intersecting the requested address ranges. The recorder
+/// accepts absolute ranges, so this metadata makes the module selection
+/// auditable even when the target has several loaded images.
+fn scoped_modules(ranges: &[(u64, u64)]) -> Vec<ModuleScope> {
+    let mut modules = Vec::new();
+    unsafe {
+        let mut img = PbImgHandle { opaque: 0 };
+        if pb_app_img_head(&mut img) != PB_OK {
+            return modules;
+        }
+        let mut valid: u8 = 0;
+        pb_img_valid(img, &mut valid);
+        while valid != 0 && modules.len() < 512 {
+            let mut base = 0u64;
+            let mut end = 0u64;
+            pb_img_low_address(img, &mut base);
+            pb_img_high_address(img, &mut end);
+            if ranges.iter().any(|(lo, hi)| *lo < end && *hi > base) {
+                let mut is_main = 0u8;
+                pb_img_is_main_executable(img, &mut is_main);
+                let mut buf = [0 as std::os::raw::c_char; 512];
+                let mut needed = 0u64;
+                let name = if pb_img_name(img, buf.as_mut_ptr(), 512, &mut needed) == PB_OK {
+                    std::ffi::CStr::from_ptr(buf.as_ptr())
+                        .to_string_lossy()
+                        .into_owned()
+                } else {
+                    String::new()
+                };
+                modules.push(ModuleScope {
+                    base,
+                    end,
+                    is_main: is_main != 0,
+                    name,
+                });
+            }
+            let mut next = PbImgHandle { opaque: 0 };
+            if pb_img_next(img, &mut next) != PB_OK {
+                break;
+            }
+            img = next;
+            valid = 0;
+            pb_img_valid(img, &mut valid);
+        }
+    }
+    modules
+}
+
 /// Seconds-since-epoch -> "YYYY-MM-DDTHH:MM:SSZ" (civil-from-days, no deps).
 fn iso8601_now() -> String {
     let secs = std::time::SystemTime::now()
@@ -538,6 +1013,48 @@ fn write_record(out: &mut Vec<u8>, event: &Event) {
     to_record(event).encode(out);
 }
 
+fn same_payload(left: &Event, right: &Event) -> bool {
+    left.kind == right.kind
+        && left.thread_id == right.thread_id
+        && left.address == right.address
+        && left.arg0 == right.arg0
+        && left.arg1 == right.arg1
+        && left.arg2 == right.arg2
+        && left.arg3 == right.arg3
+        && left.arg4 == right.arg4
+        && left.arg5 == right.arg5
+        && left.arg6 == right.arg6
+        && left.arg7 == right.arg7
+}
+
+/// Flush one run. The first event is emitted verbatim; a repeat marker then
+/// says how many additional logical events have the same payload. Its
+/// sequence is the final logical sequence number in the run, so a reader can
+/// reconstruct exact sequence positions without storing every copy.
+fn flush_run<W: Write>(
+    writer: &mut W,
+    scratch: &mut Vec<u8>,
+    event: &Event,
+    repeat_count: u64,
+) -> std::io::Result<()> {
+    write_record(scratch, event);
+    writer.write_all(scratch)?;
+    if repeat_count > 0 {
+        let repeat = Event {
+            sequence: event.sequence.saturating_add(repeat_count),
+            kind: EVENT_REPEAT,
+            thread_id: event.thread_id,
+            address: event.address,
+            arg0: repeat_count,
+            arg1: event.kind as u64,
+            ..Event::EMPTY
+        };
+        write_record(scratch, &repeat);
+        writer.write_all(scratch)?;
+    }
+    Ok(())
+}
+
 unsafe extern "C" fn drain_main(argument: *mut c_void) {
     let args = Box::from_raw(argument as *mut DrainArgs);
     let slab = &*SLAB.load(Ordering::Acquire);
@@ -563,11 +1080,33 @@ unsafe extern "C" fn drain_main(argument: *mut c_void) {
         .map(|k| k.to_string())
         .collect::<Vec<_>>()
         .join(",");
+    let modules_json = scoped_modules(&args.ranges)
+        .iter()
+        .map(|module| {
+            format!(
+                "{{\"base\":{},\"end\":{},\"is_main\":{},\"name\":\"{}\"}}",
+                module.base,
+                module.end,
+                if module.is_main { "true" } else { "false" },
+                json_escape(&module.name)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
     let meta = format!(
-        "{{\"target\":\"{}\",\"created\":\"{}\",\"kinds\":[{}],\"agent\":\"pinbridge-agent\",\"note\":\"window [0x{:x},0x{:x}); entry_context omitted (unsafe to snapshot running threads); skip unknown kinds, tolerate truncated tail\"}}",
+        "{{\"target\":\"{}\",\"created\":\"{}\",\"kinds\":[{}],\"agent\":\"pinbridge-agent\",\"arch\":\"{}\",\"pointer_width\":{},\"format\":{{\"version\":1,\"repeat_kind\":12,\"repeat_encoding\":\"rle\",\"reg_snapshot_kind\":13}},\"modules\":[{}],\"ranges\":[{}],\"threads\":[{}],\"note\":\"window [0x{:x},0x{:x}); exact multi-range/thread filtering is applied before ring claim; skip unknown kinds, tolerate truncated tail\"}}",
         json_escape(&main_module_name()),
         iso8601_now(),
         kinds_json,
+        crate::arch::name(),
+        crate::arch::pointer_width(),
+        modules_json,
+        args.ranges
+            .iter()
+            .map(|(lo, hi)| format!("[{lo},{hi}]"))
+            .collect::<Vec<_>>()
+            .join(","),
+        args.threads.iter().map(|tid| tid.to_string()).collect::<Vec<_>>().join(","),
         args.lo,
         args.hi
     );
@@ -586,6 +1125,8 @@ unsafe extern "C" fn drain_main(argument: *mut c_void) {
 
     let mut next: u64 = 0;
     let mut hole_naps: u32 = 0;
+    let mut pending: Option<Event> = None;
+    let mut pending_repeats: u64 = 0;
     loop {
         let claim = CLAIM.load(Ordering::Acquire);
         if next < claim {
@@ -595,11 +1136,30 @@ unsafe extern "C" fn drain_main(argument: *mut c_void) {
                 let event = core::ptr::read(
                     slab.payloads.as_ptr().add(slot * SLOT_WORDS) as *const Event
                 );
-                write_record(&mut scratch, &event);
-                if writer.write_all(&scratch).is_err() {
-                    crate::log::line("trace record: file write failed, stopping drain");
-                    break;
+                match pending.take() {
+                    Some(previous) => {
+                        let expected = previous
+                            .sequence
+                            .saturating_add(pending_repeats)
+                            .saturating_add(1);
+                        if expected == event.sequence && same_payload(&previous, &event) {
+                            pending = Some(previous);
+                            pending_repeats = pending_repeats.saturating_add(1);
+                        } else {
+                            if flush_run(&mut writer, &mut scratch, &previous, pending_repeats).is_err() {
+                                crate::log::line("trace record: file write failed, stopping drain");
+                                break;
+                            }
+                            pending = Some(event);
+                            pending_repeats = 0;
+                        }
+                    }
+                    None => {
+                        pending = Some(event);
+                    }
                 }
+                // WRITTEN is the number of logical capture events, not the
+                // number of physical records after run-length encoding.
                 WRITTEN.fetch_add(1, Ordering::Relaxed);
                 next += 1;
                 DRAINED.store(next, Ordering::Release);
@@ -621,6 +1181,14 @@ unsafe extern "C" fn drain_main(argument: *mut c_void) {
         }
     }
 
+    if let Some(previous) = pending.as_ref() {
+        if flush_run(&mut writer, &mut scratch, previous, pending_repeats).is_ok() {
+            // The logical events were counted as they were drained above;
+            // this final flush only emits their compact physical form.
+        } else {
+            crate::log::line("trace record: final run write failed");
+        }
+    }
     let recorded = WRITTEN.load(Ordering::Relaxed);
     write_record(&mut scratch, &marker(next + 1, MARKER_STOP, recorded));
     let _ = writer.write_all(&scratch);

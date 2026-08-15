@@ -99,14 +99,15 @@ fn flow_target(insn: &PbDisasmInsn, bytes: &[u8], base: u64) -> u64 {
     if flow.has_target != 0 {
         return flow.target;
     }
-    if flow.ind_mem != 0 && flow.base_reg == PB_REG_RIP as i32 {
+    if flow.ind_mem != 0 && flow.base_reg == crate::arch::instr_ptr_reg() as i32 {
         let ea = (insn.address + insn.size as u64).wrapping_add(flow.disp as u64);
+        let width = crate::arch::pointer_width() as u64;
         let mut buf = [0u8; 8];
         let mut copied: u64 = 0;
         unsafe {
-            pb_pin_safe_copy(buf.as_mut_ptr() as *mut core::ffi::c_void, ea, 8, &mut copied);
+            pb_pin_safe_copy(buf.as_mut_ptr() as *mut core::ffi::c_void, ea, width, &mut copied);
         }
-        if copied == 8 {
+        if copied == width {
             return u64::from_le_bytes(buf);
         }
     }

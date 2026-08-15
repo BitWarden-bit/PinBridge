@@ -3,28 +3,65 @@
   <ItemGroup Label="ProjectConfigurations">
     <ProjectConfiguration Include="Release|x64"><Configuration>Release</Configuration><Platform>x64</Platform></ProjectConfiguration>
     <ProjectConfiguration Include="Debug|x64"><Configuration>Debug</Configuration><Platform>x64</Platform></ProjectConfiguration>
+    <ProjectConfiguration Include="Release|Win32"><Configuration>Release</Configuration><Platform>Win32</Platform></ProjectConfiguration>
+    <ProjectConfiguration Include="Debug|Win32"><Configuration>Debug</Configuration><Platform>Win32</Platform></ProjectConfiguration>
   </ItemGroup>
   <PropertyGroup Label="Globals"><ProjectGuid>{E95E531D-1F07-4935-89BD-7DC43775F1D2}</ProjectGuid><RootNamespace>PinBridge</RootNamespace><Keyword>Win32Proj</Keyword></PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration"><ConfigurationType>DynamicLibrary</ConfigurationType><PlatformToolset>v145</PlatformToolset><WholeProgramOptimization>false</WholeProgramOptimization></PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration"><ConfigurationType>DynamicLibrary</ConfigurationType><PlatformToolset>v145</PlatformToolset></PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'" Label="Configuration"><ConfigurationType>DynamicLibrary</ConfigurationType><PlatformToolset>v145</PlatformToolset><WholeProgramOptimization>false</WholeProgramOptimization></PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'" Label="Configuration"><ConfigurationType>DynamicLibrary</ConfigurationType><PlatformToolset>v145</PlatformToolset></PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <PropertyGroup Condition="'$(Platform)'=='x64'">
+    <OutDir>$(MSBuildProjectDirectory)\..\build\pin\x64\$(Configuration)\</OutDir>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Platform)'=='Win32'">
+    <OutDir>$(MSBuildProjectDirectory)\..\build\pin\ia32\$(Configuration)\</OutDir>
+  </PropertyGroup>
   <PropertyGroup>
-    <PinRoot Condition="'$(PinRoot)'==''">$(PIN_ROOT)</PinRoot><OutDir>$(MSBuildProjectDirectory)\..\build\pin\x64\$(Configuration)\</OutDir><IntDir>$(OutDir)obj\</IntDir><TargetName>pinbridge</TargetName><GenerateManifest>false</GenerateManifest><LinkIncremental>false</LinkIncremental>
+    <PinRoot Condition="'$(PinRoot)'==''">$(PIN_ROOT)</PinRoot>
+    <IntDir>$(OutDir)obj\</IntDir>
+    <TargetName>pinbridge</TargetName>
+    <GenerateManifest>false</GenerateManifest>
+    <LinkIncremental>false</LinkIncremental>
   </PropertyGroup>
   <ItemDefinitionGroup>
     <ClCompile>
       <AdditionalOptions>/GR- /GS- /EHs- /EHa- /FP:strict /Oi- /FIinclude/msvc_compat.h %(AdditionalOptions)</AdditionalOptions>
-      <AdditionalIncludeDirectories>$(MSBuildProjectDirectory)\..\include;$(MSBuildProjectDirectory)\..\src;$(PinRoot)\source\include\pin;$(PinRoot)\source\include\pin\gen;$(PinRoot)\extras\xed-intel64\include\xed;$(PinRoot)\extras\components\include;$(PinRoot)\extras\stlport\include;$(PinRoot)\extras;$(PinRoot)\extras\libstdc++\include;$(PinRoot)\extras\crt\include;$(PinRoot)\extras\crt;$(PinRoot)\extras\crt\include\arch-x86_64;$(PinRoot)\extras\crt\include\kernel\uapi;$(PinRoot)\extras\crt\include\kernel\uapi\asm-x86;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
-      <PreprocessorDefinitions>TARGET_IA32E;HOST_IA32E;TARGET_WINDOWS;PIN_CRT=1;__LP64__;PB_BUILDING_DLL;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <RuntimeLibrary>MultiThreadedDLL</RuntimeLibrary><BufferSecurityCheck>false</BufferSecurityCheck><FunctionLevelLinking>true</FunctionLevelLinking><RuntimeTypeInfo>false</RuntimeTypeInfo><WarningLevel>Level3</WarningLevel><DisableSpecificWarnings>4530;%(DisableSpecificWarnings)</DisableSpecificWarnings>
     </ClCompile>
     <Link>
-      <AdditionalOptions>/export:main %(AdditionalOptions)</AdditionalOptions><AdditionalDependencies>pin.lib;pinipc.lib;xed.lib;pincrt.lib;kernel32.lib;crtbeginS.obj;%(AdditionalDependencies)</AdditionalDependencies><AdditionalLibraryDirectories>$(PinRoot)\intel64\lib;$(PinRoot)\intel64\lib-ext;$(PinRoot)\extras\xed-intel64\lib;$(PinRoot)\intel64\runtime\pincrt;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories><IgnoreAllDefaultLibraries>true</IgnoreAllDefaultLibraries><GenerateDebugInformation>true</GenerateDebugInformation><SubSystem>NotSet</SubSystem><EntryPointSymbol>Ptrace_DllMainCRTStartup</EntryPointSymbol><BaseAddress>0xC5000000</BaseAddress><TargetMachine>MachineX64</TargetMachine><AllowIsolation>true</AllowIsolation>
+      <AdditionalOptions>/export:main %(AdditionalOptions)</AdditionalOptions><AdditionalDependencies>pin.lib;pinipc.lib;xed.lib;pincrt.lib;kernel32.lib;crtbeginS.obj;%(AdditionalDependencies)</AdditionalDependencies><IgnoreAllDefaultLibraries>true</IgnoreAllDefaultLibraries><GenerateDebugInformation>true</GenerateDebugInformation><SubSystem>NotSet</SubSystem><EntryPointSymbol>Ptrace_DllMainCRTStartup</EntryPointSymbol><BaseAddress>0xC5000000</BaseAddress><AllowIsolation>true</AllowIsolation>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Platform)'=='x64'">
+    <ClCompile>
+      <AdditionalIncludeDirectories>$(MSBuildProjectDirectory)\..\include;$(MSBuildProjectDirectory)\..\src;$(PinRoot)\source\include\pin;$(PinRoot)\source\include\pin\gen;$(PinRoot)\extras\xed-intel64\include\xed;$(PinRoot)\extras\components\include;$(PinRoot)\extras\stlport\include;$(PinRoot)\extras;$(PinRoot)\extras\libstdc++\include;$(PinRoot)\extras\crt\include;$(PinRoot)\extras\crt;$(PinRoot)\extras\crt\include\arch-x86_64;$(PinRoot)\extras\crt\include\kernel\uapi;$(PinRoot)\extras\crt\include\kernel\uapi\asm-x86;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <PreprocessorDefinitions>TARGET_IA32E;HOST_IA32E;TARGET_WINDOWS;PIN_CRT=1;__LP64__;PB_BUILDING_DLL;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+    <Link>
+      <AdditionalLibraryDirectories>$(PinRoot)\intel64\lib;$(PinRoot)\intel64\lib-ext;$(PinRoot)\extras\xed-intel64\lib;$(PinRoot)\intel64\runtime\pincrt;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <TargetMachine>MachineX64</TargetMachine>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Platform)'=='Win32'">
+    <ClCompile>
+      <AdditionalIncludeDirectories>$(MSBuildProjectDirectory)\..\include;$(MSBuildProjectDirectory)\..\src;$(PinRoot)\source\include\pin;$(PinRoot)\source\include\pin\gen;$(PinRoot)\extras\xed-ia32\include\xed;$(PinRoot)\extras\components\include;$(PinRoot)\extras\stlport\include;$(PinRoot)\extras;$(PinRoot)\extras\libstdc++\include;$(PinRoot)\extras\crt\include;$(PinRoot)\extras\crt;$(PinRoot)\extras\crt\include\arch-x86;$(PinRoot)\extras\crt\include\kernel\uapi;$(PinRoot)\extras\crt\include\kernel\uapi\asm-x86;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <PreprocessorDefinitions>TARGET_IA32;HOST_IA32;TARGET_WINDOWS;PIN_CRT=1;PB_BUILDING_DLL;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+    <Link>
+      <AdditionalLibraryDirectories>$(PinRoot)\ia32\lib;$(PinRoot)\ia32\lib-ext;$(PinRoot)\extras\xed-ia32\lib;$(PinRoot)\ia32\runtime\pincrt;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <TargetMachine>MachineX86</TargetMachine>
+      <AdditionalOptions>/SAFESEH:NO %(AdditionalOptions)</AdditionalOptions>
+      <EntryPointSymbol>Ptrace_DllMainCRTStartup@12</EntryPointSymbol>
+      <BaseAddress>0x50000000</BaseAddress>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'"><ClCompile><Optimization>MaxSpeed</Optimization><IntrinsicFunctions>false</IntrinsicFunctions><WholeProgramOptimization>false</WholeProgramOptimization></ClCompile><Link><OptimizeReferences>true</OptimizeReferences></Link></ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'"><ClCompile><Optimization>Disabled</Optimization></ClCompile><Link><OptimizeReferences>false</OptimizeReferences></Link></ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'"><ClCompile><Optimization>MaxSpeed</Optimization><IntrinsicFunctions>false</IntrinsicFunctions><WholeProgramOptimization>false</WholeProgramOptimization></ClCompile><Link><OptimizeReferences>true</OptimizeReferences></Link></ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'"><ClCompile><Optimization>Disabled</Optimization></ClCompile><Link><OptimizeReferences>false</OptimizeReferences></Link></ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="..\src\tool_main.cpp" />
     <ClCompile Include="..\src\pin_client_glue.cpp" />

@@ -4,27 +4,9 @@
 use pinbridge_proto as proto;
 use pinbridge_sys::*;
 
-/// Canonical GP register order for CONTEXT_GET payloads.
-pub const GP_REGISTERS: [(&str, PbRegId); 18] = [
-    ("rax", PB_REG_RAX),
-    ("rbx", PB_REG_RBX),
-    ("rcx", PB_REG_RCX),
-    ("rdx", PB_REG_RDX),
-    ("rsi", PB_REG_RSI),
-    ("rdi", PB_REG_RDI),
-    ("rbp", PB_REG_RBP),
-    ("rsp", PB_REG_RSP),
-    ("r8", PB_REG_R8),
-    ("r9", PB_REG_R9),
-    ("r10", PB_REG_R10),
-    ("r11", PB_REG_R11),
-    ("r12", PB_REG_R12),
-    ("r13", PB_REG_R13),
-    ("r14", PB_REG_R14),
-    ("r15", PB_REG_R15),
-    ("rip", PB_REG_RIP),
-    ("rflags", PB_REG_RFLAGS),
-];
+/// Canonical GP register order for CONTEXT_GET payloads, selected by the
+/// running architecture (see `crate::arch::gp_registers`): ia32 reports
+/// eax/ebx/.../eip/eflags, intel64 reports rax/.../r15/rip/rflags.
 
 pub fn handle_threads() -> Vec<u8> {
     let mut count: u32 = 0;
@@ -60,12 +42,13 @@ pub fn handle_context_get(payload: &[u8]) -> Result<Vec<u8>, u8> {
             ));
             return Err(proto::STATUS_BAD_REQUEST);
         }
-        let mut out = Vec::with_capacity(4 + GP_REGISTERS.len() * 12);
-        proto::put_u32(&mut out, GP_REGISTERS.len() as u32);
-        for (_name, reg) in GP_REGISTERS {
+        let registers = crate::arch::gp_registers();
+        let mut out = Vec::with_capacity(4 + registers.len() * 12);
+        proto::put_u32(&mut out, registers.len() as u32);
+        for (_name, reg) in registers {
             let mut value: u64 = 0;
-            pb_pin_get_context_reg(context, reg, &mut value);
-            proto::put_u32(&mut out, reg);
+            pb_pin_get_context_reg(context, *reg, &mut value);
+            proto::put_u32(&mut out, *reg);
             proto::put_u64(&mut out, value);
         }
         Ok(out)

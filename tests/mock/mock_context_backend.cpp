@@ -12,6 +12,8 @@ const uint32_t kContextSize = 2048;
 const uint32_t kFpStateOffset = 1024;
 const uint64_t kFpStateSize = 64;
 const uint32_t kFxSaveOffset = 1088;
+const uint32_t kStackArgsOffset = 1600;
+const uint32_t kStackArgCount = 32;
 
 uint64_t RegSize(PbRegId reg)
 {
@@ -122,6 +124,26 @@ PbStatus PbBackendSetContextRegval(
     if (size == 0 || value_size != size)
         return PB_ERR_INVALID_ARGUMENT;
     std::memcpy(Slot(context, reg), value, static_cast<size_t>(size));
+    return PB_OK;
+}
+
+PbStatus PbBackendGetContextStackArg(
+    const void* context, uint32_t index, uint64_t* out_value)
+{
+    if (index >= kStackArgCount)
+        return PB_ERR_INVALID_ARGUMENT;
+    std::memcpy(out_value,
+                static_cast<const uint8_t*>(context) + kStackArgsOffset + index * sizeof(uint64_t),
+                sizeof(*out_value));
+    return PB_OK;
+}
+
+PbStatus PbBackendSetContextStackArg(void* context, uint32_t index, uint64_t value)
+{
+    if (index >= kStackArgCount)
+        return PB_ERR_INVALID_ARGUMENT;
+    std::memcpy(static_cast<uint8_t*>(context) + kStackArgsOffset + index * sizeof(uint64_t),
+                &value, sizeof(value));
     return PB_OK;
 }
 

@@ -23,7 +23,7 @@ struct ExceptionPointers {
     context: *mut c_void,
 }
 
-extern "C" {
+extern "system" {
     fn AddVectoredExceptionHandler(first: u32, handler: *mut c_void) -> *mut c_void;
     fn RtlCaptureStackBackTrace(
         frames_to_skip: u32,
@@ -92,7 +92,7 @@ pub fn os_tid() -> u32 {
     unsafe { GetCurrentThreadId() }
 }
 
-extern "C" {
+extern "system" {
     fn GetProcessHeap() -> *mut c_void;
     fn HeapValidate(heap: *mut c_void, flags: u32, entry: *const c_void) -> i32;
     fn GetProcessHeaps(count: u32, out: *mut *mut c_void) -> u32;
@@ -351,74 +351,33 @@ unsafe extern "C" fn on_pin_fault(
             "PIN_CRASH code={code} fault_addr=0x{address:x} pin_tid={thread_id} os_tid={os_tid}\n"
         ),
     );
-    // exact register state at the fault, from the physical context
-    let mut rip: u64 = 0;
-    let mut rsp: u64 = 0;
-    let mut rbp: u64 = 0;
-    pinbridge_sys::pb_pin_get_physical_context_reg(
-        physical_context,
-        pinbridge_sys::PB_REG_RIP,
-        &mut rip,
-    );
-    pinbridge_sys::pb_pin_get_physical_context_reg(
-        physical_context,
-        pinbridge_sys::PB_REG_RSP,
-        &mut rsp,
-    );
-    pinbridge_sys::pb_pin_get_physical_context_reg(
-        physical_context,
-        pinbridge_sys::PB_REG_RBP,
-        &mut rbp,
-    );
-    let (rip_base, rip_mod) = module_of(rip as *mut c_void);
+    // exact register state at the fault, from the physical context. Use the
+    // per-arch instruction/stack pointers (eip/esp on ia32) rather than the
+    // x64 rip/rsp names.
+    let instr_ptr = crate::arch::instr_ptr_reg();
+    let stack_ptr = crate::arch::stack_ptr_reg();
+    let mut ip: u64 = 0;
+    let mut sp: u64 = 0;
+    pinbridge_sys::pb_pin_get_physical_context_reg(physical_context, instr_ptr, &mut ip);
+    pinbridge_sys::pb_pin_get_physical_context_reg(physical_context, stack_ptr, &mut sp);
+    let ip_name = crate::arch::gp_name(instr_ptr).unwrap_or("ip");
+    let sp_name = crate::arch::gp_name(stack_ptr).unwrap_or("sp");
+    let (ip_base, ip_mod) = module_of(ip as *mut c_void);
     write_all(
         file,
         &format!(
-            "  rip=0x{rip:x} ({}+0x{:x}) rsp=0x{rsp:x} rbp=0x{rbp:x}\n",
-            rip_mod,
-            rip.wrapping_sub(rip_base as u64)
+            "  {ip_name}=0x{ip:x} ({}+0x{:x}) {sp_name}=0x{sp:x}\n",
+            ip_mod,
+            ip.wrapping_sub(ip_base as u64)
         ),
     );
-    // TEMP heap-corruption hunt: full GP regs + the memory the faulting heap
-    // code was chasing (its content names the corrupted object's owner).
-    let dump_reg = |id: pinbridge_sys::PbRegId, name: &str| -> u64 {
+    // Full GP regs with arch-correct names (eax/eip/esp/ebp on ia32).
+    for (name, reg) in crate::arch::gp_registers() {
         let mut value: u64 = 0;
-        pinbridge_sys::pb_pin_get_physical_context_reg(physical_context, id, &mut value);
-        write_all(file, &format!("  {name}=0x{value:x}\n"));
-        value
-    };
-    let rax = dump_reg(pinbridge_sys::PB_REG_RAX, "rax");
-    let rbx = dump_reg(pinbridge_sys::PB_REG_RBX, "rbx");
-    let rcx = dump_reg(pinbridge_sys::PB_REG_RCX, "rcx");
-    let rdx = dump_reg(pinbridge_sys::PB_REG_RDX, "rdx");
-    let rsi = dump_reg(pinbridge_sys::PB_REG_RSI, "rsi");
-    let rdi = dump_reg(pinbridge_sys::PB_REG_RDI, "rdi");
-    let r8 = dump_reg(pinbridge_sys::PB_REG_R8, "r8");
-    let r9 = dump_reg(pinbridge_sys::PB_REG_R9, "r9");
-    let _ = (rbx, rcx, rdx, rsi, rdi, r9);
-    let dump_mem = |label: &str, base: u64| {
-        let mut buffer = [0u8; 0x60];
-        let mut copied: u64 = 0;
-        pinbridge_sys::pb_pin_safe_copy(
-            buffer.as_mut_ptr() as *mut c_void,
-            base,
-            0x60,
-            &mut copied,
-        );
-        write_all(file, &format!("  mem {label} @0x{base:x} ({copied}B):"));
-        for chunk in buffer[..copied as usize].chunks(8) {
-            write_all(file, " ");
-            for byte in chunk {
-                write_all(file, &format!("{byte:02x}"));
-            }
-        }
-        write_all(file, "\n");
-    };
-    dump_mem("r8-0x10", r8.wrapping_sub(0x10));
-    dump_mem("rax", rax);
-    dump_mem("rsp", rsp);
-    // TEMP: real backtrace of the faulting thread — the rbp walk below comes
-    // up empty on Pin internal threads (no frame pointers there).
+        pinbridge_sys::pb_pin_get_physical_context_reg(physical_context, *reg, &mut value);
+        write_all(file, &format!("  {}=0x{value:x}\n", *name));
+    }
+    // TEMP: real backtrace of the faulting thread (arch-independent).
     let mut frames: [*mut c_void; 48] = [core::ptr::null_mut(); 48];
     let captured = RtlCaptureStackBackTrace(0, 48, frames.as_mut_ptr(), core::ptr::null_mut());
     write_all(file, "  backtrace:\n");
@@ -434,26 +393,61 @@ unsafe extern "C" fn on_pin_fault(
             ),
         );
     }
-    // rbp frame-chain walk (process memory, direct reads, sanity-bounded)
-    let mut frame = rbp;
-    for _ in 0..32 {
-        if frame == 0 || frame % 8 != 0 {
-            break;
+    // TEMP heap-corruption hunt: 64-bit pointer walks (register->memory dumps
+    // and an rbp frame chain) are meaningless on ia32, where the 32-bit
+    // register halves would fabricate truncated pointers — skip rather than
+    // lie.
+    if crate::arch::is_64() {
+        let read_reg = |id: pinbridge_sys::PbRegId| -> u64 {
+            let mut value: u64 = 0;
+            pinbridge_sys::pb_pin_get_physical_context_reg(physical_context, id, &mut value);
+            value
+        };
+        let rax = read_reg(pinbridge_sys::PB_REG_RAX);
+        let r8 = read_reg(pinbridge_sys::PB_REG_R8);
+        let rbp = read_reg(pinbridge_sys::PB_REG_RBP);
+        let dump_mem = |label: &str, base: u64| {
+            let mut buffer = [0u8; 0x60];
+            let mut copied: u64 = 0;
+            pinbridge_sys::pb_pin_safe_copy(
+                buffer.as_mut_ptr() as *mut c_void,
+                base,
+                0x60,
+                &mut copied,
+            );
+            write_all(file, &format!("  mem {label} @0x{base:x} ({copied}B):"));
+            for chunk in buffer[..copied as usize].chunks(8) {
+                write_all(file, " ");
+                for byte in chunk {
+                    write_all(file, &format!("{byte:02x}"));
+                }
+            }
+            write_all(file, "\n");
+        };
+        dump_mem("r8-0x10", r8.wrapping_sub(0x10));
+        dump_mem("rax", rax);
+        dump_mem("rsp", sp);
+        // rbp frame-chain walk (process memory, direct reads, sanity-bounded)
+        let mut frame = rbp;
+        for _ in 0..32 {
+            if frame == 0 || frame % 8 != 0 {
+                break;
+            }
+            let prev = unsafe { *(frame as *const u64) };
+            let ret = unsafe { *((frame + 8) as *const u64) };
+            if ret == 0 {
+                break;
+            }
+            let (base, name) = module_of(ret as *mut c_void);
+            write_all(
+                file,
+                &format!("  ret 0x{ret:x} {}+0x{:x}\n", name, ret.wrapping_sub(base as u64)),
+            );
+            if prev <= frame {
+                break;
+            }
+            frame = prev;
         }
-        let prev = unsafe { *(frame as *const u64) };
-        let ret = unsafe { *((frame + 8) as *const u64) };
-        if ret == 0 {
-            break;
-        }
-        let (base, name) = module_of(ret as *mut c_void);
-        write_all(
-            file,
-            &format!("  ret 0x{ret:x} {}+0x{:x}\n", name, ret.wrapping_sub(base as u64)),
-        );
-        if prev <= frame {
-            break;
-        }
-        frame = prev;
     }
     CloseHandle(file);
     pinbridge_sys::PB_EHR_UNHANDLED // let Pin's default reporter kill us

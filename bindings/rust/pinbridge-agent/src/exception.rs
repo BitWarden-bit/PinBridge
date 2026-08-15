@@ -30,20 +30,31 @@ unsafe extern "C" fn on_context_change(
     thread_id: PbThreadId,
     reason: PbContextChangeReason,
     from: PbConstContextHandle,
-    to: PbContextHandle,
+    _to: PbContextHandle,
     info: i32,
     _user_data: *mut c_void,
 ) {
     let mut rip: u64 = 0;
-    pb_pin_get_context_reg(from, PB_REG_RIP, &mut rip);
+    pb_pin_get_context_reg(from, crate::arch::instr_ptr_reg(), &mut rip);
     submit(Event {
         kind: EVENT_CONTEXT_CHANGE,
         thread_id,
+        address: rip,
         arg0: reason as u64,
         arg1: info as i64 as u64,
         arg2: rip,
         ..Event::EMPTY
     });
+    let trace_event = Event {
+        kind: EVENT_CONTEXT_CHANGE,
+        thread_id,
+        address: rip,
+        arg0: reason as u64,
+        arg1: info as i64 as u64,
+        arg2: rip,
+        ..Event::EMPTY
+    };
+    crate::record::submit_global(from, trace_event);
 
     if reason == PB_CONTEXT_CHANGE_REASON_EXCEPTION
         && POLICY_ENABLED.load(Ordering::Relaxed)

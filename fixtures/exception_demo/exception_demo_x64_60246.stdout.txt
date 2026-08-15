@@ -1,0 +1,2 @@
+exception_demo start av=1 bp=1 div0=1 veh=3
+exception_demo handled=1 total=4 veh=4

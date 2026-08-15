@@ -112,7 +112,7 @@ static STUB_CODE: [u8; 15] = [
 const STUB_FLAG_OFF: usize = 15;
 const STUB_TARGET_OFF: usize = 16;
 
-extern "C" {
+extern "system" {
     fn VirtualAlloc(addr: *mut c_void, size: usize, ty: u32, protect: u32) -> *mut c_void;
 }
 
@@ -121,6 +121,14 @@ static REDIRECT_TID: AtomicU32 = AtomicU32::new(0);
 static REDIRECT_ADDR: AtomicU64 = AtomicU64::new(0);
 
 fn init_stub() {
+    if !crate::arch::is_64() {
+        // The park stub is x86-64 machine code (rip-relative spin + indirect
+        // jmp). An ia32 agent must not plant it: exact stops are unavailable
+        // and breakpoint hits fall back to the inexact-but-safe request_stop
+        // path (redirect_arm sees STUB_BASE == 0 and returns false).
+        crate::log::line("ia32: park stub disabled (x86-64 code); stops fall back to request_stop");
+        return;
+    }
     // MEM_COMMIT|MEM_RESERVE, PAGE_EXECUTE_READWRITE
     let page = unsafe { VirtualAlloc(core::ptr::null_mut(), 4096, 0x3000, 0x40) };
     if page.is_null() {
@@ -170,7 +178,7 @@ unsafe fn rewind_redirected() {
     if pb_pin_get_stopped_thread_writeable_context(tid, &mut context) == PB_OK
         && !context.is_null()
     {
-        pb_pin_set_context_reg(context, PB_REG_RIP, address);
+        pb_pin_set_context_reg(context, crate::arch::instr_ptr_reg(), address);
     }
 }
 
@@ -239,7 +247,7 @@ fn stopped_thread_rip(tid: u32) -> Option<u64> {
             return None;
         }
         let mut rip: u64 = 0;
-        pb_pin_get_context_reg(context, PB_REG_RIP, &mut rip);
+        pb_pin_get_context_reg(context, crate::arch::instr_ptr_reg(), &mut rip);
         Some(rip)
     }
 }
@@ -364,8 +372,11 @@ unsafe extern "C" fn on_hit_ctx(context: PbContextHandle, user_data: *mut c_void
     let armed = have_tid && !context.is_null() && redirect_arm(tid as u32, slot.address);
     if armed {
         request_stop();
-        let status =
-            pb_pin_set_context_reg(context, PB_REG_RIP, STUB_BASE.load(Ordering::Acquire) as u64);
+        let status = pb_pin_set_context_reg(
+            context,
+            crate::arch::instr_ptr_reg(),
+            STUB_BASE.load(Ordering::Acquire) as u64,
+        );
         if status == PB_OK {
             pb_pin_execute_at(context as PbConstContextHandle); // noreturn
         } else {

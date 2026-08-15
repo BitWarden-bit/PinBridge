@@ -255,8 +255,10 @@ def main(argv):
             "duration_s": args.seconds,
             "ring_missed": missed_total,
             "post_filtered": post_filtered,
+            "format": {"version": 1, "repeat_kind": pbtrace.KIND_REPEAT,
+                       "repeat_encoding": "rle"},
         }
-        with pbtrace.TraceWriter(args.out, meta) as writer:
+        with pbtrace.TraceWriter(args.out, meta, compress_repeats=True) as writer:
             # window markers (kind 11): tag 1 = start, 2 = end
             if captured:
                 writer.emit(captured[0].sequence, pbtrace.KIND_MARKER, 0, 0,
@@ -267,8 +269,11 @@ def main(argv):
                 writer.emit(captured[-1].sequence + 1, pbtrace.KIND_MARKER, 0, 0,
                             2, missed_total)
             recorded = writer.count
-        print("[recorder] wrote %d records to %s (missed=%d%s)"
-              % (recorded, args.out, missed_total,
+        print("[recorder] wrote %d logical / %d physical records to %s "
+              "(%.2fx, missed=%d%s)"
+              % (recorded, writer.physical_count, args.out,
+                 (float(recorded) / writer.physical_count
+                  if writer.physical_count else 1.0), missed_total,
                  "" if missed_total == 0 and local_gaps == 0
                  else " — LOSSY WINDOW, do not replay"))
         return 0 if missed_total == 0 and local_gaps == 0 else 1

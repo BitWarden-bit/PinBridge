@@ -125,6 +125,26 @@ PbStatus PB_CALL pb_pin_set_context_regval(
     });
 }
 
+PbStatus PB_CALL pb_pin_get_context_stack_arg(
+    PbConstContextHandle context, uint32_t index, uint64_t* out_value)
+{
+    if (!context || !out_value)
+        return PB_ERR_INVALID_ARGUMENT;
+    return Invoke([=]() {
+        return PbBackendGetContextStackArg(context, index, out_value);
+    });
+}
+
+PbStatus PB_CALL pb_pin_set_context_stack_arg(
+    PbContextHandle context, uint32_t index, uint64_t value)
+{
+    if (!context)
+        return PB_ERR_INVALID_ARGUMENT;
+    return Invoke([=]() {
+        return PbBackendSetContextStackArg(context, index, value);
+    });
+}
+
 PbStatus PB_CALL pb_pin_execute_at(PbConstContextHandle context)
 {
     if (!context)

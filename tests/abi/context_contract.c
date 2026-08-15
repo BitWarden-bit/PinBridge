@@ -12,6 +12,7 @@ int main(void)
     uint8_t output[16] = {0};
     uint64_t required = 0;
     uint64_t scalar = UINT64_C(0x1122334455667788);
+    uint64_t stack_arg = 0;
     uint8_t supported = 0;
     uint64_t context_constant = 0;
     uint8_t fpstate[64];
@@ -136,6 +137,17 @@ int main(void)
         pb_pin_get_context_regval(const_copy, 2, output, sizeof(output), 0) !=
             PB_ERR_INVALID_ARGUMENT)
         return 6;
+
+    if (pb_pin_set_context_stack_arg(copy, 3, UINT64_C(0xaabbccddeeff0011)) != PB_OK ||
+        pb_pin_get_context_stack_arg(const_copy, 3, &stack_arg) != PB_OK ||
+        stack_arg != UINT64_C(0xaabbccddeeff0011))
+        return 40;
+    if (pb_pin_get_context_stack_arg(0, 3, &stack_arg) != PB_ERR_INVALID_ARGUMENT ||
+        pb_pin_get_context_stack_arg(const_copy, 3, 0) != PB_ERR_INVALID_ARGUMENT ||
+        pb_pin_set_context_stack_arg(0, 3, 1) != PB_ERR_INVALID_ARGUMENT ||
+        pb_pin_get_context_stack_arg(const_copy, 32, &stack_arg) != PB_ERR_INVALID_ARGUMENT ||
+        pb_pin_set_context_stack_arg(copy, 32, 1) != PB_ERR_INVALID_ARGUMENT)
+        return 41;
 
     return 0;
 }

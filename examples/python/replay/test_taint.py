@@ -74,6 +74,16 @@ def forward(trace, source_specs):
 
 
 class TraceReaderTests(unittest.TestCase):
+    def test_scope_add_marker_projects_into_metadata(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "scope.pbtr")
+            with pbtrace.TraceWriter(p, {"target": "scope", "kinds": []}) as w:
+                w.emit(1, pbtrace.KIND_MARKER, 0, 0,
+                       pbtrace.MARKER_SCOPE_ADD, 0x500000, 0x502000)
+            trace = pbtrace.load(p)
+            self.assertEqual(trace.meta["scope_additions"],
+                             [[0x500000, 0x502000]])
+
     def test_roundtrip_stats_and_meta(self):
         with tempfile.TemporaryDirectory() as d:
             p = os.path.join(d, "t.pbtr")
@@ -99,6 +109,165 @@ class TraceReaderTests(unittest.TestCase):
             self.assertEqual(trace.stats.unknown_kinds, 1)
             self.assertEqual(trace.stats.gap_records, 2)
             self.assertEqual(len(trace.records), 2)   # unknown kind skipped
+
+    def test_repeat_marker_expands_without_sequence_gaps(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "repeat.pbtr")
+            with pbtrace.TraceWriter(p, {"target": "repeat", "kinds": [pbtrace.KIND_EXEC]}) as w:
+                w.emit(1, pbtrace.KIND_EXEC, TID, BASE_IP, 3)
+                w.emit(4, pbtrace.KIND_REPEAT, TID, BASE_IP, 3,
+                       pbtrace.KIND_EXEC)
+                w.emit(5, pbtrace.KIND_EXEC, TID, BASE_IP + 3, 2)
+
+            trace = pbtrace.load(p)
+            self.assertEqual([r.sequence for r in trace.records], [1, 2, 3, 4, 5])
+            self.assertEqual([r.kind for r in trace.records],
+                             [pbtrace.KIND_EXEC] * 5)
+            self.assertEqual(trace.stats.physical_records, 3)
+            self.assertEqual(trace.stats.logical_records, 5)
+            self.assertEqual(trace.stats.repeat_markers, 1)
+            self.assertEqual(trace.stats.repeated_records, 3)
+            self.assertEqual(trace.stats.gap_records, 0)
+            self.assertAlmostEqual(trace.stats.compression_ratio, 5.0 / 3.0)
+
+            compact = pbtrace.load(p, expand_repeats=False)
+            self.assertEqual([r.kind for r in compact.records],
+                             [pbtrace.KIND_EXEC, pbtrace.KIND_REPEAT,
+                              pbtrace.KIND_EXEC])
+
+    def test_repeat_marker_must_match_previous_payload(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "bad-repeat.pbtr")
+            with pbtrace.TraceWriter(p, {"target": "repeat", "kinds": []}) as w:
+                w.emit(1, pbtrace.KIND_EXEC, TID, BASE_IP, 3)
+                # sequence and payload deliberately disagree with the base
+                w.emit(9, pbtrace.KIND_REPEAT, TID, BASE_IP, 3,
+                       pbtrace.KIND_MEMORY)
+            trace = pbtrace.load(p)
+            self.assertEqual(trace.stats.invalid_repeats, 1)
+            self.assertEqual(trace.stats.logical_records, 2)
+            self.assertEqual(len(trace.records), 2)
+
+    def test_typed_json_projection(self):
+        rec = pbtrace.Record(4, pbtrace.KIND_MEM_VALUE, TID, BASE_IP,
+                             (EA_SRC, 4, pbtrace.ACCESS_READ, 0x1234, 0, 0, 0, 0))
+        view = rec.as_dict()
+        self.assertEqual(view["kind"], "mem_value")
+        self.assertEqual(view["ip"], "0x%x" % BASE_IP)
+        self.assertEqual(view["memory"], "0x%x" % EA_SRC)
+        self.assertEqual(view["value"], "0x1234")
+
+    def test_trace_writer_rle_roundtrip(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "writer-rle.pbtr")
+            with pbtrace.TraceWriter(p, {"target": "rle"},
+                                     compress_repeats=True) as w:
+                for seq in range(1, 6):
+                    w.emit(seq, pbtrace.KIND_EXEC, TID, BASE_IP, 1)
+                self.assertEqual(w.count, 5)
+            self.assertEqual(w.physical_count, 2)
+            trace = pbtrace.load(p)
+            self.assertEqual(len(trace.records), 5)
+            self.assertEqual(trace.stats.repeated_records, 4)
+
+    def test_register_snapshot_projection(self):
+        rec = pbtrace.Record(8, pbtrace.KIND_REG_SNAPSHOT, TID, BASE_IP,
+                             (10, 0x1234, 0, 8, 0, 0, 0, 9))
+        view = rec.as_dict()
+        self.assertEqual(view["reg"], "rax")
+        self.assertEqual(view["value"], "0x0000000000001234")
+        self.assertEqual(view["frame"], 9)
+
+    def test_trace_frames_restore_register_delta_and_attach_events(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "frames.pbtr")
+            code = B_XOR_RAX_RAX
+            a1, a2 = struct.unpack("<QQ", (code + b"\x00" * 13)[:16])
+            with pbtrace.TraceWriter(p, {"target": "frames"}) as w:
+                mask = (1 << 0) | (1 << 17)  # rax + rflags
+                w.emit(1, pbtrace.KIND_REG_SNAPSHOT, TID, BASE_IP,
+                       0, mask, 0, 1, 0, 0, 0, 1)
+                w.emit(2, pbtrace.KIND_REG_SNAPSHOT, TID, BASE_IP,
+                       10, 0x1111, 0, 8, 0, 0, 0, 1)
+                w.emit(3, pbtrace.KIND_REG_SNAPSHOT, TID, BASE_IP,
+                       25, 0x202, 0, 8, 0, 0, 0, 1)
+                w.emit(4, pbtrace.KIND_EXEC_BYTES, TID, BASE_IP,
+                       len(code), a1, a2)
+                w.emit(5, pbtrace.KIND_MEM_VALUE, TID, BASE_IP,
+                       EA_SRC, 8, pbtrace.ACCESS_READ, 0x55)
+                w.emit(6, pbtrace.KIND_REG_SNAPSHOT, TID, BASE_IP + 3,
+                       0, 1, 0, 2, 0, 0, 0, 2)
+                w.emit(7, pbtrace.KIND_REG_SNAPSHOT, TID, BASE_IP + 3,
+                       10, 0x2222, 0, 8, 0, 0, 0, 2)
+                w.emit(8, pbtrace.KIND_EXEC_BYTES, TID, BASE_IP + 3,
+                       len(code), a1, a2)
+
+            frames = pbtrace.load(p).frames()
+            self.assertEqual(len(frames), 2)
+            self.assertEqual(frames[0].registers["rax"], "0x1111")
+            self.assertEqual(frames[0].registers["rflags"], "0x202")
+            self.assertEqual(frames[0].memory[0]["value"], "0x55")
+            self.assertEqual(frames[1].registers["rax"], "0x2222")
+            self.assertEqual(frames[1].registers["rflags"], "0x202")
+
+    def test_exec_bytes_and_exec_share_one_instruction_frame(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "dual-exec.pbtr")
+            code = B_XOR_RAX_RAX
+            a1, a2 = struct.unpack("<QQ", (code + b"\x00" * 13)[:16])
+            with pbtrace.TraceWriter(p, {"target": "dual", "arch": "x64"}) as w:
+                w.emit(1, pbtrace.KIND_EXEC_BYTES, TID, BASE_IP,
+                       len(code), a1, a2)
+                w.emit(2, pbtrace.KIND_EXEC, TID, BASE_IP, len(code))
+            frames = pbtrace.load(p).frames()
+            self.assertEqual(len(frames), 1)
+            self.assertEqual([r.kind for r in frames[0].records],
+                             [pbtrace.KIND_EXEC_BYTES, pbtrace.KIND_EXEC])
+            self.assertEqual(frames[0].machine_code, code)
+
+    def test_incomplete_register_snapshot_does_not_advance_state(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "incomplete-reg.pbtr")
+            with pbtrace.TraceWriter(p, {"target": "regs", "arch": "x64"}) as w:
+                # Header promises two registers, but only RAX arrives.
+                w.emit(1, pbtrace.KIND_REG_SNAPSHOT, TID, BASE_IP,
+                       0, 0b11, 0, 1, 0, 0, 0, 1)
+                w.emit(2, pbtrace.KIND_REG_SNAPSHOT, TID, BASE_IP,
+                       10, 0x1111, 0, 8, 0, 0, 0, 1)
+                w.emit(3, pbtrace.KIND_EXEC, TID, BASE_IP, 1)
+            frames = pbtrace.load(p).frames()
+            self.assertEqual(len(frames), 1)
+            self.assertFalse(frames[0].context_complete)
+            self.assertEqual(frames[0].registers, {})
+
+    def test_x86_register_snapshot_uses_x86_name(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "x86-reg.pbtr")
+            with pbtrace.TraceWriter(p, {"target": "x86", "arch": "x86"}) as w:
+                w.emit(1, pbtrace.KIND_REG_SNAPSHOT, TID, 0x401000,
+                       0, 1, 0, 1, 0, 0, 0, 1)
+                w.emit(2, pbtrace.KIND_REG_SNAPSHOT, TID, 0x401000,
+                       56, 0x1234, 0, 8, 0, 0, 0, 1)
+                w.emit(3, pbtrace.KIND_EXEC, TID, 0x401000, 1)
+            frame = pbtrace.load(p).frames()[0]
+            self.assertEqual(frame.registers["eax"], "0x1234")
+
+    def test_trace_frame_attaches_syscall_and_exception_events(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "os-events.pbtr")
+            with pbtrace.TraceWriter(p, {"target": "events"}) as w:
+                w.emit(1, pbtrace.KIND_SYSCALL, TID, BASE_IP,
+                       0x55, 0, 1, 2, 3, 4, 5, 6)
+                w.emit(2, pbtrace.KIND_EXEC, TID, BASE_IP, 2)
+                w.emit(3, pbtrace.KIND_CONTEXT_CHANGE, TID, BASE_IP,
+                       1, 0xC0000005, BASE_IP)
+            frames = pbtrace.load(p).frames()
+            self.assertEqual(len(frames), 1)
+            self.assertEqual(frames[0].syscalls[0]["number"], 0x55)
+            self.assertEqual(frames[0].syscalls[0]["args"],
+                             ["0x1", "0x2", "0x3", "0x4", "0x5", "0x6"])
+            self.assertEqual(frames[0].exceptions[0]["context_ip"],
+                             "0x%x" % BASE_IP)
 
 
 class ForwardTaintTests(unittest.TestCase):

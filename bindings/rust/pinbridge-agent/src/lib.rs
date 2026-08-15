@@ -4,6 +4,7 @@
 //! event ring through the ABI v1.1 fixed capture entries. On process fini a
 //! summary (per-kind counters + newest events) lands in pinbridge-agent.log.
 
+mod arch;
 mod bp;
 mod context;
 mod control;
@@ -19,13 +20,24 @@ mod query_server;
 mod record;
 mod resolve;
 mod ring;
+#[cfg(feature = "scripting")]
+mod scripting;
+#[cfg(not(feature = "scripting"))]
+#[path = "scripting_stub.rs"]
 mod scripting;
 mod stepper;
 mod syscall_engine;
 
 use core::ffi::{c_char, c_int, c_void};
+use core::sync::atomic::{AtomicU64, Ordering};
 use event::{EVENT_BRANCH_EDGE, EVENT_EXEC, EVENT_HOOK_REGS, EVENT_MEMORY};
 use pinbridge_sys::*;
+
+static ENTRY_BP_ADDRESS: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn entry_bp_address() -> u64 {
+    ENTRY_BP_ADDRESS.load(Ordering::Acquire)
+}
 
 /// TLS-free map/set aliases. std's default `RandomState` caches its hash
 /// keys in a `thread_local!` (std::hash::random), and this module's TLS
@@ -58,6 +70,11 @@ fn agent_main(argc: c_int, argv: *mut *mut c_char) -> c_int {
             return 1;
         }
         log::line("pb_pin_init ok");
+        log::line(&format!(
+            "arch={} pointer_width={}",
+            arch::name(),
+            arch::pointer_width()
+        ));
         diag::install(); // Pin APIs inside: must run after pb_pin_init
         if ring::init() != PB_OK {
             log::line("ring init failed");
@@ -67,6 +84,11 @@ fn agent_main(argc: c_int, argv: *mut *mut c_char) -> c_int {
         log::line(&format!("breakpoint engine init -> {bp_status}"));
         if bp_status != PB_OK {
             return 5;
+        }
+        let hook_status = hooks::init();
+        log::line(&format!("hook action engine init -> {hook_status}"));
+        if hook_status != PB_OK {
+            return 9;
         }
         if engines::meta_init() != PB_OK {
             log::line("meta init failed");
@@ -147,7 +169,10 @@ unsafe extern "C" fn on_img_load(img: PbImgHandle, _user_data: *mut c_void) {
         return;
     }
     match bp::set_oneshot(entry) {
-        Ok(id) => log::line(&format!("entry bp #{id} at 0x{entry:x}")),
+        Ok(id) => {
+            ENTRY_BP_ADDRESS.store(entry, Ordering::Release);
+            log::line(&format!("entry bp #{id} at 0x{entry:x}"));
+        }
         Err(status) => log::line(&format!("entry bp failed -> {status}")),
     }
 }

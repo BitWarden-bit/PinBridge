@@ -6,7 +6,11 @@ namespace
 {
 
 static_assert(sizeof(IMG) == sizeof(int32_t), "Pin 3.31 IMG layout changed");
+#if defined(TARGET_IA32E)
 static_assert(sizeof(USIZE) == sizeof(uint64_t), "Pin 3.31 USIZE width changed");
+#else
+static_assert(sizeof(USIZE) == sizeof(uint32_t), "Pin 3.31 USIZE width changed");
+#endif
 
 IMG ToPinImg(PbImgHandle image)
 {

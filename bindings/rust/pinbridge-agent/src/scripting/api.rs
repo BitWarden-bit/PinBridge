@@ -15,23 +15,14 @@ use super::output;
 use super::{current_plugin_name, with_current_plugin_mut, Watch, RPC_PORT};
 use core::sync::atomic::Ordering;
 use pinbridge_client::client::Client;
-use pinbridge_sys::pb_pin_sleep;
+use pinbridge_proto::ARCH_X64;
+use pinbridge_sys::{pb_pin_sleep, PbRegId, PB_INVALID_THREAD_ID, PB_REG_INVALID_};
 use pyo3::prelude::*;
 
-/// Canonical GP register table (id values mirror the ABI's PB_REG_*).
-const GP_REGS: [(&str, u32); 18] = [
-    ("rax", 10), ("rbx", 7), ("rcx", 9), ("rdx", 8),
-    ("rsi", 4), ("rdi", 3), ("rbp", 5), ("rsp", 6),
-    ("r8", 11), ("r9", 12), ("r10", 13), ("r11", 14),
-    ("r12", 15), ("r13", 16), ("r14", 17), ("r15", 18),
-    ("rip", 26), ("rflags", 25),
-];
-
-fn reg_id(name: &str) -> Option<u32> {
-    GP_REGS
-        .iter()
-        .find(|(n, _)| n.eq_ignore_ascii_case(name))
-        .map(|(_, id)| *id)
+/// Runtime architecture id from a PING reply (x64 fallback against an agent
+/// that predates the arch extension).
+fn ping_arch(client: &mut Client) -> std::io::Result<u32> {
+    Ok(client.ping_full()?.arch.unwrap_or(ARCH_X64))
 }
 
 fn rpc<R>(f: impl FnOnce(&mut Client) -> std::io::Result<R>) -> Option<R> {
@@ -95,17 +86,26 @@ fn pb_write_mem(addr: u64, data: &[u8]) -> u64 {
 
 #[pyfunction(name = "get_reg")]
 fn pb_get_reg(tid: u32, name: &str) -> Option<u64> {
-    let reg = reg_id(name)?;
-    let pairs = rpc(|c| c.context_get(tid))?;
-    pairs.into_iter().find(|(r, _)| *r == reg).map(|(_, v)| v)
+    rpc(|c| {
+        let arch = ping_arch(c)?;
+        let pairs = c.context_get(tid)?;
+        Ok(pinbridge_client::registers::reg_id(arch, name)
+            .and_then(|reg| pairs.into_iter().find(|(r, _)| *r == reg).map(|(_, v)| v)))
+    })
+    .flatten()
 }
 
 #[pyfunction(name = "set_reg")]
 fn pb_set_reg(tid: u32, name: &str, value: u64) -> bool {
-    let Some(reg) = reg_id(name) else {
-        return false;
-    };
-    rpc(|c| c.context_set(tid, reg, value)).is_some()
+    rpc(|c| {
+        let arch = ping_arch(c)?;
+        let Some(reg) = pinbridge_client::registers::reg_id(arch, name) else {
+            return Ok(false);
+        };
+        c.context_set(tid, reg, value)?;
+        Ok(true)
+    })
+    .unwrap_or(false)
 }
 
 #[pyfunction(name = "bp_set")]
@@ -224,6 +224,58 @@ fn pb_hook_set(addr: u64) -> bool {
     rpc(|c| c.hook_set(addr)).unwrap_or(false)
 }
 
+/// Installs a synchronous register action for an already armed hook point.
+/// The action runs on the application thread before the hooked instruction:
+/// set `set_reg` to `set_value` when the optional match register satisfies
+/// `(value & match_mask) == (match_value & match_mask)`. `thread_id=None`
+/// applies to every thread. `stack0`, `stack1`, ... select ABI-aware stack
+/// arguments (x86 `[ESP+4]` onward; x64 `[RSP+0x28]` onward). This is a
+/// native rule, not a Python callback, so it is safe to use on hot hooks and
+/// the write reaches the live context.
+#[pyfunction(
+    name = "hook_rule",
+    signature = (addr, set_reg, set_value, match_reg=None, match_mask=0, match_value=0, thread_id=None)
+)]
+fn pb_hook_rule(
+    addr: u64,
+    set_reg: &str,
+    set_value: u64,
+    match_reg: Option<&str>,
+    match_mask: u64,
+    match_value: u64,
+    thread_id: Option<u32>,
+) -> PyResult<bool> {
+    let arch = crate::arch::wire_id();
+    let Some(set_reg) = pinbridge_client::registers::reg_id(arch, set_reg) else {
+        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+            "hook_rule: unknown set_reg for target architecture",
+        ));
+    };
+    let match_reg = match match_reg {
+        Some(name) => pinbridge_client::registers::reg_id(arch, name).ok_or_else(|| {
+            PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "hook_rule: unknown match_reg for target architecture",
+            )
+        })?,
+        None => PB_REG_INVALID_,
+    };
+    Ok(crate::hooks::set_rule(crate::hooks::HookRule {
+        address: addr,
+        thread_id: thread_id.unwrap_or(PB_INVALID_THREAD_ID),
+        match_reg: match_reg as PbRegId,
+        match_mask,
+        match_value,
+        set_reg: set_reg as PbRegId,
+        set_value,
+    }))
+}
+
+/// Removes all synchronous hook action rules without disarming hook points.
+#[pyfunction(name = "hook_rules_clear")]
+fn pb_hook_rules_clear() {
+    crate::hooks::clear_rules();
+}
+
 #[pyfunction(name = "hook_remove")]
 fn pb_hook_remove(addr: u64) -> bool {
     rpc(|c| c.hook_remove(addr)).is_some()
@@ -250,6 +302,9 @@ fn record_kind(name: &str) -> Option<u32> {
         "exec" | "exec_bytes" => 9,
         "memory" | "mem" | "mem_value" => 10,
         "branch" | "branch_edge" => 4,
+        "syscall" | "syscalls" => 5,
+        "exception" | "exceptions" | "context_change" => 6,
+        "registers" | "regs" | "context" | "reg_snapshot" => 13,
         "exec_plain" => 3,
         "mem_plain" => 2,
         _ => return None,
@@ -273,6 +328,41 @@ fn pb_trace_start(path: &str, kinds: Option<Vec<String>>, range: Option<(u64, u6
     }
     let (lo, hi) = range.unwrap_or((0, u64::MAX));
     rpc(|c| c.trace_start(&kind_ids, lo, hi, path)).is_some()
+}
+
+/// Structured recorder start: ranges are `(lo, hi)` pairs and `threads` is
+/// an optional list of Pin thread ids. Empty threads means all threads.
+#[pyfunction(name = "trace_start_spec", signature = (path, kinds=None, ranges=None, threads=None))]
+fn pb_trace_start_spec(
+    path: &str,
+    kinds: Option<Vec<String>>,
+    ranges: Option<Vec<(u64, u64)>>,
+    threads: Option<Vec<u32>>,
+) -> bool {
+    let names = kinds.unwrap_or_else(|| vec!["exec".to_string(), "memory".to_string()]);
+    let mut kind_ids = Vec::with_capacity(names.len());
+    for name in &names {
+        let Some(kind) = record_kind(name) else { return false; };
+        kind_ids.push(kind);
+    }
+    let Some(ranges) = ranges else { return false; };
+    rpc(|c| c.trace_start_spec(&kind_ids, &ranges, threads.as_deref().unwrap_or(&[]), path)).is_some()
+}
+
+/// Extends the active native trace with additional address ranges. Existing
+/// kind/thread filters remain in force; range additions are marker-tagged in
+/// the PBTR stream.
+#[pyfunction(name = "trace_extend")]
+fn pb_trace_extend(ranges: Vec<(u64, u64)>) -> bool {
+    rpc(|c| c.trace_extend(&ranges)).is_some()
+}
+
+/// Returns `(base, size, allocation_base, protect, state, type)` for the
+/// virtual region containing an address, or None when it is unmapped.
+#[pyfunction(name = "memory_region")]
+fn pb_memory_region(address: u64) -> Option<(u64, u64, u64, u32, u32, u32)> {
+    rpc(|c| c.memory_region(address))
+        .and_then(|region| region.map(|r| (r.base, r.size, r.allocation_base, r.protect, r.state, r.kind)))
 }
 
 /// Stops the recording session and returns (recorded, dropped).
@@ -384,7 +474,9 @@ fn pb_subscribe(
 
 fn kind_bit(name: &str) -> Option<u32> {
     Some(match name {
-        "hook" | "hook_regs" => 1 << 1,
+        "hook" => (1 << 1) | (1 << crate::event::EVENT_HOOK_RETURN),
+        "hook_regs" => 1 << 1,
+        "hook_return" => 1 << crate::event::EVENT_HOOK_RETURN,
         "mem" | "memory" => 1 << 2,
         "exec" => 1 << 3,
         "branch" | "branch_edge" => 1 << 4,
@@ -421,10 +513,15 @@ fn pb(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(pb_counters, m)?)?;
     m.add_function(wrap_pyfunction!(pb_exports, m)?)?;
     m.add_function(wrap_pyfunction!(pb_hook_set, m)?)?;
+    m.add_function(wrap_pyfunction!(pb_hook_rule, m)?)?;
+    m.add_function(wrap_pyfunction!(pb_hook_rules_clear, m)?)?;
     m.add_function(wrap_pyfunction!(pb_hook_remove, m)?)?;
     m.add_function(wrap_pyfunction!(pb_hook_clear, m)?)?;
     m.add_function(wrap_pyfunction!(pb_exc_policy, m)?)?;
     m.add_function(wrap_pyfunction!(pb_trace_start, m)?)?;
+    m.add_function(wrap_pyfunction!(pb_trace_start_spec, m)?)?;
+    m.add_function(wrap_pyfunction!(pb_trace_extend, m)?)?;
+    m.add_function(wrap_pyfunction!(pb_memory_region, m)?)?;
     m.add_function(wrap_pyfunction!(pb_trace_stop, m)?)?;
     m.add_function(wrap_pyfunction!(pb_trace_status, m)?)?;
     m.add_function(wrap_pyfunction!(pb_on_exception, m)?)?;

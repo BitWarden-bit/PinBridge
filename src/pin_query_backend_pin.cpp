@@ -1,6 +1,7 @@
 #include "pin.H"
 
 #include "pin_query_backend.h"
+#include "reg_mapping_pin.h"
 
 namespace
 {
@@ -22,6 +23,18 @@ template< typename T > uint64_t ToQueryBits(T value)
 
 uint64_t ToQueryBits(INS value) { return static_cast<uint64_t>(value.q()); }
 uint64_t ToQueryBits(RTN value) { return static_cast<uint64_t>(value.q()); }
+uint64_t ToQueryBits(REG value)
+{
+    PbRegId public_reg = PB_REG_NONE;
+    return PbRegIdFromPinReg(value, &public_reg) ?
+        static_cast<uint64_t>(public_reg) : static_cast<uint64_t>(PB_REG_NONE);
+}
+REG PbPinRegArg(PbRegId value)
+{
+    REG native = REG_INVALID();
+    PbPinRegFromId(value, &native);
+    return native;
+}
 
 } // namespace
 
@@ -31,7 +44,7 @@ uint64_t PbBackendInsQuery(uint32_t query_id, int32_t ins_value, uint64_t argume
     switch (query_id)
     {
 #define PB_PIN_ARG_UINT32(value) static_cast<UINT32>(value)
-#define PB_PIN_ARG_REG(value) static_cast<REG>(value)
+#define PB_PIN_ARG_REG(value) PbPinRegArg(static_cast<PbRegId>(value))
 #define PB_PIN_ARG_IARG_TYPE(value) static_cast<IARG_TYPE>(value)
 #define PB_INS_QUERY0(return_kind, c_symbol, pin_symbol, api_id) \
     case PB_INS_QUERY_ID_##c_symbol: return ToQueryBits(pin_symbol(ins));

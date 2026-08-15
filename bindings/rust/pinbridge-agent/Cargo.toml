@@ -7,6 +7,14 @@ description = "Rust debugger agent base on the PinBridge C ABI: event engines, b
 [lib]
 crate-type = ["cdylib"]
 
+[features]
+default = ["scripting"]
+# In-agent CPython scripting host. Disable for the x86 (i686) build: pyo3
+# requires the CPython architecture to match the target, and there is no
+# 32-bit CPython in this tree. Everything else (control plane, trace,
+# breakpoints) keeps working through the scripting_stub module.
+scripting = ["dep:pyo3"]
+
 [dependencies]
 pinbridge-sys = { path = "../pinbridge-sys" }
 pinbridge-tool = { path = "../pinbridge-tool" }
@@ -15,7 +23,7 @@ pinbridge-client = { path = "../pinbridge-client" }
 # Embedded CPython for the in-agent scripting host. No auto-initialize: the
 # interpreter is started manually on the scripting thread (PyConfig path) so
 # agent_main never touches the OS loader during Pin's tool-load sequence.
-pyo3 = { version = "0.22" }
+pyo3 = { version = "0.22", optional = true }
 
 [build-dependencies]
 pinbridge-tool = { path = "../pinbridge-tool" }

@@ -2,6 +2,8 @@
 param(
     [ValidateSet("Debug", "Release")]
     [string]$Configuration = "Release",
+    [ValidateSet("x64", "x86")]
+    [string]$Arch = "x64",
     [string]$PinRoot = $env:PIN_ROOT
 )
 
@@ -14,13 +16,21 @@ if (-not $vs) { throw "Visual Studio MSBuild was not found." }
 $msbuild = Join-Path $vs "MSBuild\Current\Bin\MSBuild.exe"
 $project = Join-Path $PSScriptRoot "msvc\pinbridge_pin.vcxproj"
 
+if ($Arch -eq "x86") {
+    $platform = "Win32"
+    $outSubdir = "ia32"
+} else {
+    $platform = "x64"
+    $outSubdir = "x64"
+}
+
 # The managed sandbox exposes both Path and PATH. MSBuild treats them as duplicate
 # dictionary keys when spawning cl.exe, so remove one spelling in the child shell.
 $command = 'set Path=&& "' + $msbuild + '" "' + $project + '" /m /t:Build ' +
-    '/p:Configuration=' + $Configuration + ' /p:Platform=x64 /p:PinRoot="' + $PinRoot + '"'
+    '/p:Configuration=' + $Configuration + ' /p:Platform=' + $platform + ' /p:PinRoot="' + $PinRoot + '"'
 & cmd.exe /d /s /c $command
 if ($LASTEXITCODE -ne 0) { throw "PinBridge PinTool build failed." }
 
-$dll = Join-Path $PSScriptRoot "build\pin\x64\$Configuration\pinbridge.dll"
+$dll = Join-Path $PSScriptRoot "build\pin\$outSubdir\$Configuration\pinbridge.dll"
 if (-not (Test-Path -LiteralPath $dll)) { throw "Build completed without pinbridge.dll." }
 Get-Item -LiteralPath $dll | Select-Object FullName, Length, LastWriteTime

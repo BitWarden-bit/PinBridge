@@ -13,6 +13,12 @@ struct CaptureRegsState
     void* user_data;
 };
 
+struct ContextCaptureRegsState
+{
+    PbInsContextCaptureRegsCallback callback;
+    void* user_data;
+};
+
 struct MemoryOperandState
 {
     PbInsMemoryOperandCallback callback;
@@ -57,6 +63,20 @@ VOID OnCaptureRegs(
     CaptureRegsState* state = static_cast<CaptureRegsState*>(raw_state);
     state->callback(
         static_cast<uint64_t>(address), static_cast<uint32_t>(thread_id),
+        static_cast<uint64_t>(rcx), static_cast<uint64_t>(rdx),
+        static_cast<uint64_t>(r8), static_cast<uint64_t>(r9),
+        state->user_data);
+}
+
+VOID OnContextCaptureRegs(
+    ADDRINT address, THREADID thread_id, CONTEXT* context,
+    ADDRINT rcx, ADDRINT rdx, ADDRINT r8, ADDRINT r9, VOID* raw_state)
+{
+    ContextCaptureRegsState* state =
+        static_cast<ContextCaptureRegsState*>(raw_state);
+    state->callback(
+        static_cast<uint64_t>(address), static_cast<uint32_t>(thread_id),
+        reinterpret_cast<PbContextHandle>(context),
         static_cast<uint64_t>(rcx), static_cast<uint64_t>(rdx),
         static_cast<uint64_t>(r8), static_cast<uint64_t>(r9),
         state->user_data);
@@ -212,8 +232,40 @@ PbStatus PbBackendInsInsertCaptureRegs(
     INS_InsertPredicatedCall(
         ToIns(ins), IPOINT_BEFORE, AFUNPTR(OnCaptureRegs),
         IARG_INST_PTR, IARG_THREAD_ID,
+#if defined(TARGET_IA32E)
         IARG_REG_VALUE, REG_RCX, IARG_REG_VALUE, REG_RDX,
         IARG_REG_VALUE, REG_R8, IARG_REG_VALUE, REG_R9,
+#else
+        // ia32 has no r8/r9. Keep the four slots useful by exposing the
+        // remaining general-purpose registers as ECX, EDX, EAX, EBX.
+        IARG_REG_VALUE, REG_ECX, IARG_REG_VALUE, REG_EDX,
+        IARG_REG_VALUE, REG_EAX, IARG_REG_VALUE, REG_EBX,
+#endif
+        IARG_PTR, state, IARG_END);
+    return PB_OK;
+}
+
+PbStatus PbBackendInsInsertCaptureRegsCtx(
+    PbInsHandle ins, PbInsContextCaptureRegsCallback callback, void* user_data)
+{
+    if (PIN_IsProbeMode())
+        return PB_ERR_INVALID_STATE;
+    ContextCaptureRegsState* state = static_cast<ContextCaptureRegsState*>(
+        std::malloc(sizeof(ContextCaptureRegsState)));
+    if (!state)
+        return PB_ERR_OUT_OF_MEMORY;
+    state->callback = callback;
+    state->user_data = user_data;
+    INS_InsertPredicatedCall(
+        ToIns(ins), IPOINT_BEFORE, AFUNPTR(OnContextCaptureRegs),
+        IARG_INST_PTR, IARG_THREAD_ID, IARG_CONTEXT,
+#if defined(TARGET_IA32E)
+        IARG_REG_VALUE, REG_RCX, IARG_REG_VALUE, REG_RDX,
+        IARG_REG_VALUE, REG_R8, IARG_REG_VALUE, REG_R9,
+#else
+        IARG_REG_VALUE, REG_ECX, IARG_REG_VALUE, REG_EDX,
+        IARG_REG_VALUE, REG_EAX, IARG_REG_VALUE, REG_EBX,
+#endif
         IARG_PTR, state, IARG_END);
     return PB_OK;
 }

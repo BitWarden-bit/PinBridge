@@ -36,7 +36,7 @@ fn to_record(event: &Event) -> proto::EventRecord {
 }
 
 fn handle_ping() -> Vec<u8> {
-    let mut out = Vec::with_capacity(16);
+    let mut out = Vec::with_capacity(24);
     proto::put_u32(&mut out, PB_ABI_VERSION_MAJOR);
     proto::put_u32(&mut out, PB_ABI_VERSION_MINOR);
     let mut pid: i32 = 0;
@@ -45,6 +45,11 @@ fn handle_ping() -> Vec<u8> {
     }
     proto::put_u32(&mut out, pid as u32);
     proto::put_u64(&mut out, ring::ring_total()); // lock-free content edge: never parks the accept loop
+    // Additive tail: arch + pointer width. Pre-extension readers parse only
+    // the first four fields and ignore these trailing bytes, so the extension
+    // is wire-backward-compatible.
+    proto::put_u32(&mut out, crate::arch::wire_id());
+    proto::put_u32(&mut out, crate::arch::pointer_width());
     out
 }
 
@@ -120,7 +125,9 @@ fn handle_bp_set(payload: &[u8]) -> Result<Vec<u8>, u8> {
 fn handle_bp_list() -> Vec<u8> {
     let entries = bp::list();
     let (hit_tid, hit_addr) = bp::last_hit();
-    let mut out = Vec::with_capacity(21 + entries.len() * 20);
+    // The final u64 is an additive tail: older clients stop after the rows,
+    // while new launchers use it to distinguish the entry BP from any stop.
+    let mut out = Vec::with_capacity(29 + entries.len() * 20);
     out.push(control::is_stopped() as u8);
     proto::put_u32(&mut out, hit_tid);
     proto::put_u64(&mut out, hit_addr);
@@ -131,6 +138,7 @@ fn handle_bp_list() -> Vec<u8> {
         proto::put_u64(&mut out, address);
         proto::put_u64(&mut out, hits);
     }
+    proto::put_u64(&mut out, crate::entry_bp_address());
     out
 }
 
@@ -228,6 +236,34 @@ fn handle_hook_list() -> Vec<u8> {
     out
 }
 
+/// HOOK_RULE_SET: [addr u64][thread u32][match_reg u32][mask u64]
+/// [match_value u64][set_reg u32][set_value u64] -> [u32 ok].
+fn handle_hook_rule_set(payload: &[u8]) -> Result<Vec<u8>, u8> {
+    let mut reader = proto::Reader::new(payload);
+    let address = reader.u64().ok_or(proto::STATUS_BAD_REQUEST)?;
+    let thread_id = reader.u32().ok_or(proto::STATUS_BAD_REQUEST)?;
+    let match_reg = reader.u32().ok_or(proto::STATUS_BAD_REQUEST)?;
+    let match_mask = reader.u64().ok_or(proto::STATUS_BAD_REQUEST)?;
+    let match_value = reader.u64().ok_or(proto::STATUS_BAD_REQUEST)?;
+    let set_reg = reader.u32().ok_or(proto::STATUS_BAD_REQUEST)?;
+    let set_value = reader.u64().ok_or(proto::STATUS_BAD_REQUEST)?;
+    if match_reg == PB_REG_INVALID_ && match_mask != 0 {
+        return Err(proto::STATUS_BAD_REQUEST);
+    }
+    let ok = hooks::set_rule(hooks::HookRule {
+        address,
+        thread_id,
+        match_reg,
+        match_mask,
+        match_value,
+        set_reg,
+        set_value,
+    });
+    let mut out = Vec::with_capacity(4);
+    proto::put_u32(&mut out, ok as u32);
+    Ok(out)
+}
+
 /// TRACE_START: [u32 kinds_mask][u64 lo][u64 hi][u16 path_len][path]
 /// -> [u32 ok] on success; STATUS_INTERNAL carries the reason text
 /// ("already recording", bad mask/range, alloc failure, ...). Arms the
@@ -256,6 +292,60 @@ fn handle_trace_start(payload: &[u8]) -> (u8, Vec<u8>) {
             proto::put_u32(&mut out, 1);
             (proto::STATUS_OK, out)
         }
+        Err(message) => (proto::STATUS_INTERNAL, message.into_bytes()),
+    }
+}
+
+/// TRACE_START_SPEC: [u32 kinds_mask][u16 range_count][ranges × u64 lo/hi]
+/// [u16 thread_count][thread ids × u32][u16 path_len][path]. Empty thread
+/// list means all application threads. This is the structured successor to
+/// TRACE_START and keeps the old payload/API wire-compatible.
+fn handle_trace_start_spec(payload: &[u8]) -> (u8, Vec<u8>) {
+    let mut reader = proto::Reader::new(payload);
+    let bad = || (proto::STATUS_BAD_REQUEST, b"bad trace_start_spec payload".to_vec());
+    let Some(kinds_mask) = reader.u32() else { return bad(); };
+    let Some(range_count) = reader.u16() else { return bad(); };
+    if range_count == 0 || range_count > 16 { return bad(); }
+    let mut ranges = Vec::with_capacity(range_count as usize);
+    for _ in 0..range_count {
+        let Some(lo) = reader.u64() else { return bad(); };
+        let Some(hi) = reader.u64() else { return bad(); };
+        ranges.push((lo, hi));
+    }
+    let Some(thread_count) = reader.u16() else { return bad(); };
+    if thread_count > 64 { return bad(); }
+    let mut threads = Vec::with_capacity(thread_count as usize);
+    for _ in 0..thread_count {
+        let Some(tid) = reader.u32() else { return bad(); };
+        threads.push(tid);
+    }
+    let Some(path_len) = reader.u16() else { return bad(); };
+    let Some(path) = take_str(&mut reader, path_len as usize) else { return bad(); };
+    match crate::record::start_spec(kinds_mask, ranges, threads, path) {
+        Ok(()) => {
+            let mut out = Vec::with_capacity(4);
+            proto::put_u32(&mut out, 1);
+            (proto::STATUS_OK, out)
+        }
+        Err(message) => (proto::STATUS_INTERNAL, message.into_bytes()),
+    }
+}
+
+/// TRACE_EXTEND: [u16 range_count][ranges x u64 lo/hi]. Adds ranges to the
+/// active recorder without changing its kind or thread filters.
+fn handle_trace_extend(payload: &[u8]) -> (u8, Vec<u8>) {
+    let mut reader = proto::Reader::new(payload);
+    let bad = || (proto::STATUS_BAD_REQUEST, b"bad trace_extend payload".to_vec());
+    let Some(count) = reader.u16() else { return bad(); };
+    if count == 0 || count > 16 { return bad(); }
+    let mut ranges = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        let Some(lo) = reader.u64() else { return bad(); };
+        let Some(hi) = reader.u64() else { return bad(); };
+        ranges.push((lo, hi));
+    }
+    match crate::record::extend_ranges(ranges) {
+        Ok(()) => (proto::STATUS_OK, Vec::new()),
         Err(message) => (proto::STATUS_INTERNAL, message.into_bytes()),
     }
 }
@@ -411,19 +501,22 @@ pub fn handle_step(payload: &[u8]) -> Result<Vec<u8>, u8> {
         }
         Some(value)
     };
-    let read_mem_u64 = |address: u64| -> Option<u64> {
+    // Pointer-sized memory read: 4 bytes on ia32, 8 on intel64. Used for
+    // indirect-memory and ret targets, which hold a pointer on both.
+    let read_mem_ptr = |address: u64| -> Option<u64> {
+        let width = crate::arch::pointer_width() as usize;
         let mut buffer = [0u8; 8];
         let mut copied: u64 = 0;
         unsafe {
-            pb_pin_safe_copy(buffer.as_mut_ptr() as *mut c_void, address, 8, &mut copied);
+            pb_pin_safe_copy(buffer.as_mut_ptr() as *mut c_void, address, width as u64, &mut copied);
         }
-        if copied == 8 {
+        if copied as usize == width {
             Some(u64::from_le_bytes(buffer))
         } else {
             None
         }
     };
-    let rip = read_reg(PB_REG_RIP as i32).ok_or(proto::STATUS_BAD_REQUEST)?;
+    let rip = read_reg(crate::arch::instr_ptr_reg() as i32).ok_or(proto::STATUS_BAD_REQUEST)?;
 
     let mut flow: PbFlowInsn = unsafe { core::mem::zeroed() };
     let decoded = unsafe {
@@ -465,7 +558,7 @@ pub fn handle_step(payload: &[u8]) -> Result<Vec<u8>, u8> {
             }
         }
         if flow.ind_mem != 0 {
-            let base = if flow.base_reg == PB_REG_RIP as i32 {
+            let base = if flow.base_reg == crate::arch::instr_ptr_reg() as i32 {
                 Some(fallthrough) // RIP-relative: base is the next instruction
             } else {
                 read_reg(flow.base_reg)
@@ -474,14 +567,14 @@ pub fn handle_step(payload: &[u8]) -> Result<Vec<u8>, u8> {
                 let ea = base
                     .wrapping_add(read_reg(flow.index_reg).unwrap_or(0).wrapping_mul(flow.scale))
                     .wrapping_add(flow.disp as u64);
-                if let Some(value) = read_mem_u64(ea) {
+                if let Some(value) = read_mem_ptr(ea) {
                     candidates.push(value);
                 }
             }
         }
         if flow.kind == 3 {
-            // ret: successor is the qword at [rsp]
-            if let Some(value) = read_reg(PB_REG_RSP as i32).and_then(read_mem_u64) {
+            // ret: successor is the pointer at [rsp]/[esp]
+            if let Some(value) = read_reg(crate::arch::stack_ptr_reg() as i32).and_then(read_mem_ptr) {
                 candidates.push(value);
             }
         }
@@ -577,6 +670,10 @@ fn serve_client(stream: &mut TcpStream) {
                 Ok(body) => (proto::STATUS_OK, body),
                 Err(code) => (code, Vec::new()),
             },
+            proto::op::MEMORY_REGION => match control::handle_memory_region(&payload) {
+                Ok(body) => (proto::STATUS_OK, body),
+                Err(code) => (code, Vec::new()),
+            },
             proto::op::WRITE_MEM => match control::handle_write_mem(&payload) {
                 Ok(body) => (proto::STATUS_OK, body),
                 Err(code) => (code, Vec::new()),
@@ -634,6 +731,8 @@ fn serve_client(stream: &mut TcpStream) {
                 Err(code) => (code, Vec::new()),
             },
             proto::op::TRACE_START => handle_trace_start(&payload),
+            proto::op::TRACE_START_SPEC => handle_trace_start_spec(&payload),
+            proto::op::TRACE_EXTEND => handle_trace_extend(&payload),
             proto::op::TRACE_STOP => (proto::STATUS_OK, handle_trace_stop()),
             proto::op::TRACE_STATUS => (proto::STATUS_OK, handle_trace_status()),
             proto::op::HOOK_SET => match handle_hook_set(&payload) {
@@ -649,6 +748,14 @@ fn serve_client(stream: &mut TcpStream) {
                 (proto::STATUS_OK, Vec::new())
             }
             proto::op::HOOK_LIST => (proto::STATUS_OK, handle_hook_list()),
+            proto::op::HOOK_RULE_SET => match handle_hook_rule_set(&payload) {
+                Ok(body) => (proto::STATUS_OK, body),
+                Err(code) => (code, Vec::new()),
+            },
+            proto::op::HOOK_RULE_CLEAR => {
+                hooks::clear_rules();
+                (proto::STATUS_OK, Vec::new())
+            }
             proto::op::SCRIPT_LOAD => {
                 let reply = handle_script_load(&payload);
                 crate::diag::heap_check("qs script_load");

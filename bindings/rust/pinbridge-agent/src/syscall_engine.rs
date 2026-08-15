@@ -13,10 +13,11 @@
 use crate::event::{Event, EVENT_SYSCALL};
 use crate::ring::submit;
 use core::ffi::c_void;
-use core::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, Ordering};
 use pinbridge_sys::*;
 
 static ENABLED: AtomicBool = AtomicBool::new(true);
+static SYSCALL_TLS_KEY: AtomicI32 = AtomicI32::new(PB_INVALID_TLS_KEY);
 
 pub fn set_enabled(on: bool) {
     ENABLED.store(on, Ordering::Relaxed);
@@ -28,6 +29,18 @@ pub fn enabled() -> bool {
 
 /// Windows syscall numbers are < 0x1000: one bit each, 512 bytes total.
 const SYSCALL_NUMBER_LIMIT: usize = 4096;
+
+/// Pin's IA-32 Windows syscall value includes the service-class bits (for
+/// example `0x3000f`); the low 12 bits are the native syscall ordinal. Keep
+/// the public event/filter number in the same 0..0xfff space as x64.
+#[inline]
+fn canonical_number(number: u64) -> u64 {
+    if crate::arch::is_32() {
+        number & (SYSCALL_NUMBER_LIMIT as u64 - 1)
+    } else {
+        number
+    }
+}
 
 struct FilterSnapshot {
     mode: u8, // 0 = all, 1 = only listed numbers
@@ -54,6 +67,54 @@ fn number_allowed(number: u64) -> bool {
         return false; // not representable in the bitmap: treat as unlisted
     }
     snapshot.bitmap[number as usize / 64] & (1u64 << (number % 64)) != 0
+}
+
+/// Pin does not guarantee that the syscall-number register still contains the
+/// number in the exit context (on Windows it commonly contains the return
+/// value). Store `number + 1` as an opaque, non-null Pin TLS value at entry;
+/// syscall numbers are small integers, so this needs no allocation.
+#[inline]
+fn encode_syscall_number(number: u64) -> Option<*const c_void> {
+    let encoded = number.checked_add(1)?;
+    let encoded = usize::try_from(encoded).ok()?;
+    Some(encoded as *const c_void)
+}
+
+#[inline]
+fn decode_syscall_number(data: *mut c_void) -> Option<u64> {
+    let encoded = data as usize;
+    (encoded != 0).then_some((encoded - 1) as u64)
+}
+
+#[inline]
+unsafe fn remember_syscall_number(thread_id: PbThreadId, number: u64) -> bool {
+    let key = SYSCALL_TLS_KEY.load(Ordering::Acquire);
+    let Some(data) = encode_syscall_number(number) else {
+        return false;
+    };
+    if key == PB_INVALID_TLS_KEY {
+        return false;
+    }
+    let mut set = 0u8;
+    pb_pin_set_thread_data(key, data, thread_id, &mut set) == PB_OK && set != 0
+}
+
+#[inline]
+unsafe fn take_syscall_number(thread_id: PbThreadId) -> Option<u64> {
+    let key = SYSCALL_TLS_KEY.load(Ordering::Acquire);
+    if key == PB_INVALID_TLS_KEY {
+        return None;
+    }
+    let mut data = core::ptr::null_mut();
+    if pb_pin_get_thread_data(key, thread_id, &mut data) != PB_OK || data.is_null() {
+        return None;
+    }
+
+    // Clear the slot before emitting the exit event so a malformed callback
+    // sequence cannot reuse a stale syscall number.
+    let mut cleared = 0u8;
+    let _ = pb_pin_set_thread_data(key, core::ptr::null(), thread_id, &mut cleared);
+    decode_syscall_number(data)
 }
 
 /// Installs a new filter (query-server thread). mode 0 = record all,
@@ -93,13 +154,19 @@ unsafe extern "C" fn on_entry(
     standard: PbSyscallStandard,
     _user_data: *mut c_void,
 ) {
+    // Clear any unpaired value before beginning a new entry/exit pair.
+    let _ = take_syscall_number(thread_id);
     if !enabled() {
         return;
     }
     let mut number: u64 = 0;
     let mut args = [0u64; 6];
     pb_pin_get_syscall_number(context, standard, &mut number);
+    number = canonical_number(number);
     if !number_allowed(number) {
+        return;
+    }
+    if !remember_syscall_number(thread_id, number) {
         return;
     }
     for (index, slot) in args.iter_mut().enumerate() {
@@ -118,6 +185,20 @@ unsafe extern "C" fn on_entry(
         arg7: args[5],
         ..Event::EMPTY
     });
+    let trace_event = Event {
+        kind: EVENT_SYSCALL,
+        thread_id,
+        arg0: number,
+        arg1: 0,
+        arg2: args[0],
+        arg3: args[1],
+        arg4: args[2],
+        arg5: args[3],
+        arg6: args[4],
+        arg7: args[5],
+        ..Event::EMPTY
+    };
+    crate::record::submit_global(context as PbConstContextHandle, trace_event);
 }
 
 unsafe extern "C" fn on_exit(
@@ -126,16 +207,17 @@ unsafe extern "C" fn on_exit(
     standard: PbSyscallStandard,
     _user_data: *mut c_void,
 ) {
+    // Always consume the entry decision, even if capture was disabled between
+    // entry and exit, so a later syscall can never reuse stale TLS state.
+    let number = take_syscall_number(thread_id);
     if !enabled() {
         return;
     }
-    let mut number: u64 = 0;
     let mut return_value: u64 = 0;
     let mut errno: u64 = 0;
-    pb_pin_get_syscall_number(context, standard, &mut number);
-    if !number_allowed(number) {
+    let Some(number) = number else {
         return;
-    }
+    };
     pb_pin_get_syscall_return(context, standard, &mut return_value);
     pb_pin_get_syscall_errno(context, standard, &mut errno);
     submit(Event {
@@ -147,9 +229,29 @@ unsafe extern "C" fn on_exit(
         arg4: errno,
         ..Event::EMPTY
     });
+    let trace_event = Event {
+        kind: EVENT_SYSCALL,
+        thread_id,
+        arg0: number,
+        arg1: 1,
+        arg3: return_value,
+        arg4: errno,
+        ..Event::EMPTY
+    };
+    crate::record::submit_global(context as PbConstContextHandle, trace_event);
 }
 
 pub fn register() -> PbStatus {
+    let mut tls_key = PB_INVALID_TLS_KEY;
+    let tls_status = unsafe { pb_pin_create_thread_data_key(None, &mut tls_key) };
+    if tls_status != PB_OK {
+        return tls_status;
+    }
+    if tls_key == PB_INVALID_TLS_KEY {
+        return PB_ERR_INTERNAL;
+    }
+    SYSCALL_TLS_KEY.store(tls_key, Ordering::Release);
+
     let mut handle_entry = PbCallbackHandle { opaque: 0 };
     let mut handle_exit = PbCallbackHandle { opaque: 0 };
     unsafe {
@@ -166,5 +268,25 @@ pub fn register() -> PbStatus {
             core::ptr::null_mut(),
             &mut handle_exit,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{decode_syscall_number, encode_syscall_number};
+
+    #[test]
+    fn syscall_number_tls_encoding_round_trips() {
+        for number in [0, 0x46, 0xfff] {
+            let encoded = encode_syscall_number(number).unwrap();
+            assert!(!encoded.is_null());
+            assert_eq!(decode_syscall_number(encoded.cast_mut()), Some(number));
+        }
+    }
+
+    #[test]
+    fn syscall_number_tls_encoding_rejects_invalid_values() {
+        assert_eq!(decode_syscall_number(core::ptr::null_mut()), None);
+        assert!(encode_syscall_number(u64::MAX).is_none());
     }
 }

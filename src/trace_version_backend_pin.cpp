@@ -1,6 +1,7 @@
 #include "pin.H"
 
 #include "trace_version_backend.h"
+#include "reg_mapping_pin.h"
 
 namespace
 {
@@ -47,8 +48,9 @@ PbStatus PbBackendInsInsertVersionCase(
 {
     if (PIN_IsProbeMode())
         return PB_ERR_INVALID_STATE;
+    REG native; if (!PbPinRegFromId(reg, &native)) return PB_ERR_INVALID_ARGUMENT;
     INS_InsertVersionCase(
-        ToIns(ins), static_cast<REG>(reg), static_cast<INT32>(case_value),
+        ToIns(ins), native, static_cast<INT32>(case_value),
         static_cast<ADDRINT>(version), IARG_END);
     return PB_OK;
 }
@@ -59,8 +61,9 @@ PbStatus PbBackendInsInsertVersionCaseWithCallOrder(
 {
     if (PIN_IsProbeMode())
         return PB_ERR_INVALID_STATE;
+    REG native; if (!PbPinRegFromId(reg, &native)) return PB_ERR_INVALID_ARGUMENT;
     INS_InsertVersionCase(
-        ToIns(ins), static_cast<REG>(reg), static_cast<INT32>(case_value),
+        ToIns(ins), native, static_cast<INT32>(case_value),
         static_cast<ADDRINT>(version), IARG_CALL_ORDER,
         static_cast<CALL_ORDER>(call_order), IARG_END);
     return PB_OK;

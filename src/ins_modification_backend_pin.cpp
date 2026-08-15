@@ -1,6 +1,7 @@
 #include "pin.H"
 
 #include "ins_modification_backend.h"
+#include "reg_mapping_pin.h"
 
 namespace
 {
@@ -46,8 +47,9 @@ PbStatus PbBackendInsInsertIndirectJump(
 {
     if (PIN_IsProbeMode())
         return PB_ERR_INVALID_STATE;
-    INS_InsertIndirectJump(
-        ToIns(ins), ToIpoint(ipoint), static_cast<REG>(reg));
+    REG native;
+    if (!PbPinRegFromId(reg, &native)) return PB_ERR_INVALID_ARGUMENT;
+    INS_InsertIndirectJump(ToIns(ins), ToIpoint(ipoint), native);
     return PB_OK;
 }
 
@@ -61,7 +63,9 @@ PbStatus PbBackendInsRewriteMemoryOperand(
         return PB_ERR_INVALID_ARGUMENT;
     if (INS_HasScatteredMemoryAccess(direct))
         return PB_ERR_UNSUPPORTED;
-    INS_RewriteMemoryOperand(direct, memindex, static_cast<REG>(reg));
+    REG native;
+    if (!PbPinRegFromId(reg, &native)) return PB_ERR_INVALID_ARGUMENT;
+    INS_RewriteMemoryOperand(direct, memindex, native);
     return PB_OK;
 }
 

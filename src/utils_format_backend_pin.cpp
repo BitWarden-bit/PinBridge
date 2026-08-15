@@ -22,7 +22,11 @@ PbStatus CopyString(
 
 } // namespace
 
+#if defined(TARGET_IA32E)
 static_assert(sizeof(ADDRINT) == sizeof(uint64_t), "ADDRINT is not 64-bit");
+#else
+static_assert(sizeof(ADDRINT) == sizeof(uint32_t), "ADDRINT is not 32-bit");
+#endif
 static_assert(sizeof(FLT64) == sizeof(double), "FLT64 is not a C double");
 static_assert(sizeof(INT16) == sizeof(int16_t), "INT16 width changed");
 static_assert(sizeof(INT32) == sizeof(int32_t), "INT32 width changed");

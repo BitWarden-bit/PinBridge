@@ -2,6 +2,7 @@
 
 #include "inst_args_backend.h"
 #include "regset_conversion_pin.h"
+#include "reg_mapping_pin.h"
 
 #include <cstdlib>
 
@@ -23,7 +24,11 @@ void CopyRegSet(const PbRegSet* source, REGSET* destination)
     {
         const uint64_t mask = static_cast<uint64_t>(1) << (reg % 64u);
         if ((source->words[reg / 64u] & mask) != 0)
-            REGSET_Insert(*destination, static_cast<REG>(reg));
+        {
+            REG native;
+            if (PbPinRegFromId(static_cast<PbRegId>(reg), &native))
+                REGSET_Insert(*destination, native);
+        }
     }
 }
 
@@ -66,8 +71,12 @@ PbStatus AddDescriptor(
         IARGLIST_AddArguments(state->native, type,
             static_cast<UINT64>(descriptor.value), IARG_END);
     else if (IsRegType(descriptor.type))
-        IARGLIST_AddArguments(state->native, type,
-            static_cast<REG>(descriptor.value), IARG_END);
+    {
+        REG native;
+        if (!PbPinRegFromId(static_cast<PbRegId>(descriptor.value), &native))
+            return PB_ERR_INVALID_ARGUMENT;
+        IARGLIST_AddArguments(state->native, type, native, IARG_END);
+    }
     else if (descriptor.type == PB_IARG_CALL_ORDER)
         IARGLIST_AddArguments(state->native, type,
             static_cast<CALL_ORDER>(descriptor.value), IARG_END);

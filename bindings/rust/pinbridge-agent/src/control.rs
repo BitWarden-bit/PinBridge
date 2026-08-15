@@ -8,8 +8,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 pub static STOPPED: AtomicBool = AtomicBool::new(false);
 
-extern "C" {
+extern "system" {
     fn GetCurrentProcess() -> *mut c_void;
+    fn VirtualQuery(
+        address: *const c_void,
+        buffer: *mut MemoryBasicInformation,
+        length: usize,
+    ) -> usize;
     fn WriteProcessMemory(
         process: *mut c_void,
         base_address: *mut c_void,
@@ -18,6 +23,19 @@ extern "C" {
         written: *mut usize,
     ) -> i32;
     fn FlushInstructionCache(process: *mut c_void, base: *const c_void, size: usize) -> i32;
+}
+
+#[repr(C)]
+struct MemoryBasicInformation {
+    base_address: *mut c_void,
+    allocation_base: *mut c_void,
+    allocation_protect: u32,
+    #[cfg(target_pointer_width = "64")]
+    partition_id: u16,
+    region_size: usize,
+    state: u32,
+    protect: u32,
+    kind: u32,
 }
 
 pub fn is_stopped() -> bool {
@@ -70,6 +88,42 @@ pub fn handle_read_mem(payload: &[u8]) -> Result<Vec<u8>, u8> {
     proto::put_u64(&mut out, address);
     proto::put_u64(&mut out, copied);
     out.extend_from_slice(&buffer);
+    Ok(out)
+}
+
+/// MEMORY_REGION: [u64 address] -> [u8 found][u64 base][u64 size]
+/// [u64 allocation_base][u32 protect][u32 state][u32 type].
+pub fn handle_memory_region(payload: &[u8]) -> Result<Vec<u8>, u8> {
+    let mut reader = proto::Reader::new(payload);
+    let address = reader.u64().ok_or(proto::STATUS_BAD_REQUEST)?;
+    let mut info = MemoryBasicInformation {
+        base_address: core::ptr::null_mut(),
+        allocation_base: core::ptr::null_mut(),
+        allocation_protect: 0,
+        #[cfg(target_pointer_width = "64")]
+        partition_id: 0,
+        region_size: 0,
+        state: 0,
+        protect: 0,
+        kind: 0,
+    };
+    let found = unsafe {
+        VirtualQuery(
+            address as *const c_void,
+            &mut info,
+            core::mem::size_of::<MemoryBasicInformation>(),
+        ) == core::mem::size_of::<MemoryBasicInformation>()
+    };
+    let mut out = Vec::with_capacity(1 + 8 * 3 + 4 * 3);
+    out.push(found as u8);
+    if found {
+        proto::put_u64(&mut out, info.base_address as u64);
+        proto::put_u64(&mut out, info.region_size as u64);
+        proto::put_u64(&mut out, info.allocation_base as u64);
+        proto::put_u32(&mut out, info.protect);
+        proto::put_u32(&mut out, info.state);
+        proto::put_u32(&mut out, info.kind);
+    }
     Ok(out)
 }
 

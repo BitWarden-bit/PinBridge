@@ -1,0 +1,1 @@
+hook_syscall: pid=44976 yield=0x40000024 query=0x00000000 close=0xc0000008 peb=009F3000

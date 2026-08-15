@@ -27,6 +27,10 @@ Python 插件在运行时通过控制协议热加载/热卸载（哪怕目标正
   Python 回调**（回调里自己拨 RPC)。洪流下 tick 自适应退到 40ms，丢弃是设计行为。
 - 加载顺序：`script run` 只做到**编译**（语法错误立刻回传）；顶层代码和 `pb_init()` 在
   随后的第一个 tick 执行——这样顶层的 `pb.*` 调用面对的是一个空闲的查询服务。
+- 调试启动（`PINBRIDGE_ENTRY_BP=1`，CLI/TUI 默认开启）会把这个执行 tick 闸住到主 PE
+  正常入口断下为止；入口停住后才执行启动目录插件或此前提交的脚本。首次入口停点后闸门
+  永久打开，目标恢复运行时仍可热加载/替换/卸载脚本。`--no-entry-bp` 原始运行模式不启用
+  此闸门。
 - agent 目录定位走 `GetMappedFileName` + `QueryDosDevice`（私有映射没有 PEB 模块项，
   `GetModuleHandleEx(FROM_ADDRESS)` 找不到）。
 
@@ -96,14 +100,17 @@ kinds 合法值:`hook`/`hook_regs`、`mem`/`memory`、`exec`、`branch`/`branch_
 
 | kind | kind_name | addr | a0 | a1 | a2 | a3 | a4..a7 |
 |---|---|---|---|---|---|---|---|
-| 1 | hook_regs | 抓取点 IP | rcx | rdx | r8 | r9 | — |
+| 1 | hook_regs | 抓取点 IP | rcx/ecx | rdx/edx | r8/eax | r9/ebx | a4..a7 为 ABI 栈参数快照 |
 | 2 | memory | 指令地址 | EA | size | access(0=读,1=写,2=第二读操作数) | — | — |
 | 3 | exec | 指令地址 | — | — | — | — | — |
 | 4 | branch_edge | 指令地址 | target | taken | — | — | — |
 | 5 | syscall | — | number | phase(0=entry,1=exit) | entry:arg0 | entry:arg1 / exit:retval | entry:arg2..arg5 / exit:a4=errno |
-| 6 | context_change | — | reason(4=异常) | info(异常码) | ip | — | — |
+| 6 | context_change | 异常 IP | reason(4=异常) | info(异常码) | ip | — | — |
 | 7 | module_load | base | base | end | is_main | — | — |
 | 8 | module_unload | base | base | — | — | — | — |
+
+syscall 的 `number` 在 x86/x64 都是 0..0xfff 的本机序号；IA-32 Pin 原始值携带的
+service-class 高位会在进入事件和过滤器前移除。entry/exit 通过线程 TLS 保持同一编号。
 
 ### 动作函数（每次调用一次 loopback RPC)
 
@@ -115,6 +122,8 @@ kinds 合法值:`hook`/`hook_regs`、`mem`/`memory`、`exec`、`branch`/`branch_
 断点（64 槽）与 hook 点（4096 槽，命中产 kind-1 hook_regs 事件）:
 - `pb.bp_set(addr) -> id | None`;`pb.bp_remove(id) -> bool`
 - `pb.hook_set(addr) -> bool`(False = 满了);`pb.hook_remove(addr) -> bool`;`pb.hook_clear() -> bool`
+- `pb.hook_rule(addr, set_reg, set_value, match_reg=None, match_mask=0, match_value=0, thread_id=None)`：在 Hook 命中时由原生回调同步修改上下文寄存器；可选条件按寄存器掩码匹配。`stack0`/`stack1` 等虚拟寄存器表示 ABI 栈参数（x86 从 `[ESP+4]` 起，x64 从 `[RSP+0x28]` 起）。
+- `pb.hook_rules_clear()`：清除修改规则但保留 Hook 点。规则执行在 Pin 应用线程，不调用 Python 热路径。
 
 内存（写要求目标处于停止状态）:
 - `pb.read_mem(addr, len) -> bytes | None`（单次 ≤1MB)
@@ -126,7 +135,7 @@ kinds 合法值:`hook`/`hook_regs`、`mem`/`memory`、`exec`、`branch`/`branch_
 符号、导出与反汇编：
 - `pb.resolve(addr) -> "mod!sym+0x.." | None`（含 IAT thunk 一层追踪）
 - `pb.resolve_name("module!Export") -> int | None`
-- `pb.exports(module) -> [(addr, name), ...]`（命名 PE32+ 导出，上限 8192)
+- `pb.exports(module) -> [(addr, name), ...]`（命名 PE32/PE32+ 导出，上限 8192)
 - `pb.disasm(addr, count≤128) -> [(addr, size, kind, target, text), ...]`
 
 枚举与策略：
@@ -139,8 +148,19 @@ kinds 合法值:`hook`/`hook_regs`、`mem`/`memory`、`exec`、`branch`/`branch_
   `exec`→exec_bytes(9)、`memory`→mem_value(10)、`branch`→4（显式 `exec_bytes`/
   `mem_value` 亦可；`exec_plain`/`mem_plain` = 只抓地址的 3/2);range=(lo,hi) 缺省
   为全地址（洪流自戕，务必圈窗）；已在录制 = False("already recording")
+- `pb.trace_start_spec(path, kinds=None, ranges=None, threads=None) -> bool`；`ranges` 为
+  `(lo, hi)` 列表，`threads` 为 Pin thread id 列表。过滤在 native recorder 的 ring claim
+  前执行；空线程列表表示全部线程。用它替代事后 `main-module-only` 清洗。
+- `pb.trace_extend(ranges) -> bool`：录制进行中原子追加临时地址范围，现有 kind/thread
+  过滤保持不变，并在 PBTR 中写入 scope marker。
+- `pb.memory_region(address) -> (base, size, allocation_base, protect, state, type) | None`：
+  查询 VirtualQuery 区域，脚本可据此识别私有可执行堆代码。
 - `pb.trace_stop() -> (recorded, dropped)`（等 drain 追平，~5s 上限）
 - `pb.trace_status() -> (active, recorded, dropped)`
+
+`examples/python/trace_scope.py` 提供模块名/RVA/线程/断点触发的采集模板。
+设置 `TRACE_MAX_EVENTS` 时，脚本会在主事件窗口达到阈值后停止 recorder 并暂停目标；
+生产分析仍应检查 PBTR 的 `dropped` 和序列缺口。
 
 输出：
 - `pb.print(msg)`(= `pb.log`)→ 输出环，见下文"输出到 UI 的路径"。
@@ -158,6 +178,7 @@ pinbridge-cli --port 9011 script output --follow     # 持续跟随(500ms 轮询
 
 pinbridge-cli --port 9011 exports ntdll.dll          # 模块导出枚举
 pinbridge-cli --port 9011 hook 0x7ff..               # 下 hook 点
+pinbridge-cli --port 9011 hookall ntdll.dll          # 按唯一地址批量 hook 全部导出
 pinbridge-cli --port 9011 hooks                      # 列出 hook 点
 pinbridge-cli --port 9011 hookdel 0x7ff..            # 删 hook 点
 pinbridge-cli --port 9011 hookclear                  # 清空 hook 点

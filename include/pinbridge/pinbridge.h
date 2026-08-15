@@ -955,8 +955,9 @@ PB_API PbStatus PB_CALL pb_ins_insert_fill_buffer_then(
 /* JIT-only fixed capture instrumentation (ABI v1.1). These entries let C ABI
    consumers (Rust, ...) build event engines without variadic INS_InsertCall.
    Each expands to IPOINT_BEFORE with a fixed IARG capture list:
-   - pb_ins_insert_capture_regs: IARG_INST_PTR, IARG_THREAD_ID and the four
-     Win64 integer argument registers (IARG_REG_VALUE RCX/RDX/R8/R9).
+   - pb_ins_insert_capture_regs: IARG_INST_PTR, IARG_THREAD_ID and four
+     architecture-specific general-purpose register slots (RCX/RDX/R8/R9
+     on Win64; ECX/EDX/EAX/EBX on ia32).
    - pb_ins_insert_memory_operands: one predicated call per memory operand
      carrying IARG_MEMORYOP_EA/SIZE and a PB_MEMORY_TYPE_* access tag.
    - pb_ins_insert_exec: IARG_INST_PTR, IARG_THREAD_ID and the static
@@ -965,6 +966,13 @@ PB_API PbStatus PB_CALL pb_ins_insert_fill_buffer_then(
      IARG_BRANCH_TARGET_ADDR and IARG_BRANCH_TAKEN. */
 typedef void (PB_CALL* PbInsCaptureRegsCallback)(
     uint64_t address, uint32_t thread_id,
+    uint64_t rcx, uint64_t rdx, uint64_t r8, uint64_t r9, void* user_data);
+/* Context-bearing variant for synchronous Hook actions. The register values
+   are captured without querying Pin from the application thread; the borrowed
+   context may be changed with pb_pin_set_context_reg or the ABI-aware stack
+   argument helpers and committed with pb_pin_execute_at. */
+typedef void (PB_CALL* PbInsContextCaptureRegsCallback)(
+    uint64_t address, uint32_t thread_id, PbContextHandle context,
     uint64_t rcx, uint64_t rdx, uint64_t r8, uint64_t r9, void* user_data);
 typedef void (PB_CALL* PbInsMemoryOperandCallback)(
     uint64_t instruction_address, uint32_t thread_id,
@@ -977,6 +985,8 @@ typedef void (PB_CALL* PbInsBranchEdgeCallback)(
 
 PB_API PbStatus PB_CALL pb_ins_insert_capture_regs(
     PbInsHandle ins, PbInsCaptureRegsCallback callback, void* user_data);
+PB_API PbStatus PB_CALL pb_ins_insert_capture_regs_ctx(
+    PbInsHandle ins, PbInsContextCaptureRegsCallback callback, void* user_data);
 PB_API PbStatus PB_CALL pb_ins_insert_memory_operands(
     PbInsHandle ins, PbInsMemoryOperandCallback callback, void* user_data);
 PB_API PbStatus PB_CALL pb_ins_insert_exec(
@@ -1614,6 +1624,13 @@ PB_API PbStatus PB_CALL pb_pin_set_context_reg(
     PbContextHandle context, PbRegId reg, uint64_t value);
 PB_API PbStatus PB_CALL pb_pin_set_context_regval(
     PbContextHandle context, PbRegId reg, const uint8_t* value, uint64_t value_size);
+/* ABI-aware integer stack arguments at a function entry. `index` is the
+ * logical stack argument number: x86 index 0 is [ESP+4], while x64 index 0
+ * is the first argument beyond RCX/RDX/R8/R9 at [RSP+0x28]. */
+PB_API PbStatus PB_CALL pb_pin_get_context_stack_arg(
+    PbConstContextHandle context, uint32_t index, uint64_t* out_value);
+PB_API PbStatus PB_CALL pb_pin_set_context_stack_arg(
+    PbContextHandle context, uint32_t index, uint64_t value);
 
 /* PB-PIN-CONTEXT-0017 / PIN_ExecuteAt.
  * NULL returns PB_ERR_INVALID_ARGUMENT. A valid call is only permitted from a

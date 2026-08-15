@@ -1,13 +1,26 @@
 #include "pin.H"
 
 #include "reg_query_backend.h"
+#include "reg_mapping_pin.h"
 
 namespace
 {
 
 template< typename T > uint64_t ToBits(T value) { return static_cast<uint64_t>(value); }
+uint64_t ToBits(REG value)
+{
+    PbRegId public_reg = PB_REG_NONE;
+    return PbRegIdFromPinReg(value, &public_reg) ?
+        static_cast<uint64_t>(public_reg) : static_cast<uint64_t>(PB_REG_NONE);
+}
+REG PbPinRegArg(PbRegId value)
+{
+    REG native = REG_INVALID();
+    PbPinRegFromId(value, &native);
+    return native;
+}
 
-#define PB_PIN_REG_ARG_REG(value) static_cast<REG>(value)
+#define PB_PIN_REG_ARG_REG(value) PbPinRegArg(static_cast<PbRegId>(value))
 #define PB_PIN_REG_ARG_UINT16(value) static_cast<UINT16>(value)
 
 } // namespace

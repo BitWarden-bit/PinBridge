@@ -2,6 +2,7 @@
 
 #include "regset_backend.h"
 #include "regset_conversion_pin.h"
+#include "reg_mapping_pin.h"
 
 using namespace PbPinRegSetConversion;
 
@@ -17,7 +18,9 @@ bool ToPin(const PbRegSet& source, REGSET* destination)
             continue;
         if (!IsPinReg(reg))
             return false;
-        REGSET_Insert(*destination, static_cast<REG>(reg));
+        REG native_reg;
+        if (!PbPinRegFromId(reg, &native_reg)) return false;
+        REGSET_Insert(*destination, native_reg);
     }
     return true;
 }
@@ -45,7 +48,9 @@ PbStatus PbBackendRegSetContains(const PbRegSet* set, PbRegId reg, uint8_t* out_
     REGSET direct;
     if (!IsPinReg(reg) || !ToPin(*set, &direct))
         return PB_ERR_INVALID_ARGUMENT;
-    *out_contains = REGSET_Contains(direct, static_cast<REG>(reg)) != 0 ? 1u : 0u;
+    REG native_reg;
+    if (!PbPinRegFromId(reg, &native_reg)) return PB_ERR_INVALID_ARGUMENT;
+    *out_contains = REGSET_Contains(direct, native_reg) != 0 ? 1u : 0u;
     return PB_OK;
 }
 
@@ -54,7 +59,9 @@ PbStatus PbBackendRegSetInsert(PbRegSet* set, PbRegId reg)
     REGSET direct;
     if (!IsPinReg(reg) || !ToPin(*set, &direct))
         return PB_ERR_INVALID_ARGUMENT;
-    REGSET_Insert(direct, static_cast<REG>(reg));
+    REG native_reg;
+    if (!PbPinRegFromId(reg, &native_reg)) return PB_ERR_INVALID_ARGUMENT;
+    REGSET_Insert(direct, native_reg);
     FromPin(direct, set);
     return PB_OK;
 }
@@ -82,7 +89,8 @@ PbStatus PbBackendRegSetPopNext(PbRegSet* set, PbRegId* out_reg)
     REGSET direct;
     if (!ToPin(*set, &direct))
         return PB_ERR_INVALID_ARGUMENT;
-    *out_reg = static_cast<PbRegId>(REGSET_PopNext(direct));
+    if (!PbRegIdFromPinReg(REGSET_PopNext(direct), out_reg))
+        return PB_ERR_INVALID_ARGUMENT;
     FromPin(direct, set);
     return PB_OK;
 }
@@ -92,20 +100,22 @@ PbStatus PbBackendRegSetRemove(PbRegSet* set, PbRegId reg)
     REGSET direct;
     if (!IsPinReg(reg) || !ToPin(*set, &direct))
         return PB_ERR_INVALID_ARGUMENT;
-    REGSET_Remove(direct, static_cast<REG>(reg));
+    REG native_reg;
+    if (!PbPinRegFromId(reg, &native_reg)) return PB_ERR_INVALID_ARGUMENT;
+    REGSET_Remove(direct, native_reg);
     FromPin(direct, set);
     return PB_OK;
 }
 
 PbStatus PbBackendRegSetFirst(PbRegId* out_reg)
 {
-    *out_reg = static_cast<PbRegId>(REG_FirstInRegset);
+    if (!PbRegIdFromPinReg(REG_FirstInRegset, out_reg)) return PB_ERR_INVALID_ARGUMENT;
     return PB_OK;
 }
 
 PbStatus PbBackendRegSetLast(PbRegId* out_reg)
 {
-    *out_reg = static_cast<PbRegId>(REG_LastInRegset);
+    if (!PbRegIdFromPinReg(REG_LastInRegset, out_reg)) return PB_ERR_INVALID_ARGUMENT;
     return PB_OK;
 }
 

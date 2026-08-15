@@ -20,6 +20,17 @@ PbStatus PbBackendInsInsertCaptureRegs(
     return PB_OK;
 }
 
+PbStatus PbBackendInsInsertCaptureRegsCtx(
+    PbInsHandle ins, PbInsContextCaptureRegsCallback callback, void* user_data)
+{
+    if (ins.opaque == 0 || !callback)
+        return PB_ERR_INVALID_ARGUMENT;
+    ++g_capture_regs_calls;
+    callback(0x1000, 1, reinterpret_cast<PbContextHandle>(0x1234),
+             0x11, 0x22, 0x33, 0x44, user_data);
+    return PB_OK;
+}
+
 PbStatus PbBackendInsInsertMemoryOperands(
     PbInsHandle ins, PbInsMemoryOperandCallback callback, void* user_data)
 {

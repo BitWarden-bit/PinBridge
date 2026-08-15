@@ -6,6 +6,7 @@
 //!   pinbridge-tui --probe [-- target ...]               one-shot counters check
 //!
 //! Options: --port N (default 9001)  --pin <pin.exe>  --agent <pinbridge_agent.dll>
+//!          --entry-bp (default) | --no-entry-bp
 
 mod ui;
 
@@ -39,6 +40,7 @@ struct Config {
     pin: Option<String>,
     agent: Option<String>,
     target: Vec<String>,
+    entry_bp: bool,
 }
 
 fn parse_args() -> Config {
@@ -48,6 +50,7 @@ fn parse_args() -> Config {
         pin: None,
         agent: None,
         target: Vec::new(),
+        entry_bp: true,
     };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -60,6 +63,8 @@ fn parse_args() -> Config {
             }
             "--pin" => config.pin = args.next(),
             "--agent" => config.agent = args.next(),
+            "--entry-bp" => config.entry_bp = true,
+            "--no-entry-bp" => config.entry_bp = false,
             "--" => config.target.extend(args.by_ref()),
             other if other.starts_with("--") => {
                 eprintln!("unknown option: {other}");
@@ -114,8 +119,9 @@ fn maybe_spawn_backend(config: &Config) -> Option<Child> {
     let options = launch::LaunchOptions {
         pin: config.pin.clone(),
         agent: config.agent.clone(),
+        arch: None, // auto-detect from the target's PE headers
         port: config.port,
-        entry_bp: false,
+        entry_bp: config.entry_bp,
     };
     match launch::launch_for_target(&options, &config.target, STARTUP_TIMEOUT) {
         Ok((child, _port)) => Some(child),

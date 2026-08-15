@@ -1,6 +1,7 @@
 #include "pin.H"
 
 #include "pin_backend.h"
+#include "reg_mapping_pin.h"
 
 #include <cstdlib>
 #include <cstring>
@@ -63,8 +64,11 @@ uint64_t InsSize(int32_t ins) { return static_cast<uint64_t>(INS_Size(ToPinIns(i
 
 uint64_t GetContextReg(const void* context, uint32_t reg)
 {
+    REG native_reg;
+    if (!PbPinRegFromId(reg, &native_reg))
+        return 0;
     return static_cast<uint64_t>(
-        PIN_GetContextReg(static_cast<const CONTEXT*>(context), static_cast<REG>(reg)));
+        PIN_GetContextReg(static_cast<const CONTEXT*>(context), native_reg));
 }
 
 uint64_t SafeCopy(void* destination, uint64_t source_address, uint64_t size)

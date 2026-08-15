@@ -42,6 +42,30 @@ const DEFAULT_WATCH_BATCH: u64 = 512;
 const RING_PAGE_CAP: u64 = 2048;
 pub const BATCH_MAX: u64 = 4096;
 
+// Debugger launches request an entry stop before plugin code is allowed to
+// run.  Compilation may happen earlier so SCRIPT_LOAD remains responsive;
+// execution opens permanently after the first real stop.  Raw runs without
+// PINBRIDGE_ENTRY_BP retain the historical immediate-script behavior.
+static STARTUP_GATE_OPEN: AtomicBool = AtomicBool::new(false);
+
+fn startup_gate_open() -> bool {
+    if std::env::var("PINBRIDGE_ENTRY_BP").ok().as_deref() != Some("1") {
+        return true;
+    }
+    if STARTUP_GATE_OPEN.load(Ordering::Acquire) {
+        return true;
+    }
+    let entry = crate::entry_bp_address();
+    let (_tid, hit) = crate::bp::last_hit();
+    if crate::control::is_stopped() && entry != 0 && hit == entry {
+        STARTUP_GATE_OPEN.store(true, Ordering::Release);
+        crate::log::line("scripting startup gate opened at entry stop");
+        true
+    } else {
+        false
+    }
+}
+
 /// Adaptive ceiling for the tick's ring pull (single writer: the host
 /// thread; atomic for plain visibility). The throttle tracks ACTUAL Python
 /// cost — events routed to callbacks last tick — not page fullness: sparse
@@ -385,7 +409,7 @@ fn host_loop(
 
 // ---- python310.dll preload + interpreter init (scripting thread only) ----
 
-extern "C" {
+extern "system" {
     fn LoadLibraryExW(name: *const u16, file: *mut c_void, flags: u32) -> *mut c_void;
     fn LoadLibraryW(name: *const u16) -> *mut c_void;
     fn GetCurrentThreadId() -> u32;
@@ -781,7 +805,9 @@ fn tick(pending: &mut Vec<(String, Py<PyAny>)>, port: u16) {
         // to the mailbox immediately.
         return;
     }
-    exec_pending(pending, port);
+    if startup_gate_open() {
+        exec_pending(pending, port);
+    }
     if !python_ready() {
         return;
     }
@@ -1260,6 +1286,7 @@ fn kind_name(kind: u32) -> &'static str {
         EVENT_CONTEXT_CHANGE => "context_change",
         EVENT_MODULE_LOAD => "module_load",
         EVENT_MODULE_UNLOAD => "module_unload",
+        crate::event::EVENT_HOOK_RETURN => "hook_return",
         _ => "unknown",
     }
 }

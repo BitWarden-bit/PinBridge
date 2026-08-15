@@ -1507,6 +1507,7 @@ pub type PbTraceBufferCallback = Option<unsafe extern "C" fn(id: PbBufferId, thr
 pub type PbSyscallEntryCallback = Option<unsafe extern "C" fn(thread_id: PbThreadId, context: PbContextHandle, standard: PbSyscallStandard, user_data: *mut c_void)>;
 pub type PbSyscallExitCallback = Option<unsafe extern "C" fn(thread_id: PbThreadId, context: PbContextHandle, standard: PbSyscallStandard, user_data: *mut c_void)>;
 pub type PbInsCaptureRegsCallback = Option<unsafe extern "C" fn(address: u64, thread_id: u32, rcx: u64, rdx: u64, r8: u64, r9: u64, user_data: *mut c_void)>;
+pub type PbInsContextCaptureRegsCallback = Option<unsafe extern "C" fn(address: u64, thread_id: u32, context: PbContextHandle, rcx: u64, rdx: u64, r8: u64, r9: u64, user_data: *mut c_void)>;
 pub type PbInsMemoryOperandCallback = Option<unsafe extern "C" fn(instruction_address: u64, thread_id: u32, memory_address: u64, size: u32, access: u32, user_data: *mut c_void)>;
 pub type PbInsExecCallback = Option<unsafe extern "C" fn(address: u64, thread_id: u32, size: u32, user_data: *mut c_void)>;
 pub type PbInsBranchEdgeCallback = Option<unsafe extern "C" fn(address: u64, thread_id: u32, target_address: u64, taken: u64, user_data: *mut c_void)>;
@@ -1688,6 +1689,7 @@ unsafe extern "C" {
     pub fn pb_ins_insert_fill_buffer_predicated(ins: PbInsHandle, ipoint: PbIpoint, id: PbBufferId, field_offset: u32) -> PbStatus;
     pub fn pb_ins_insert_fill_buffer_then(ins: PbInsHandle, ipoint: PbIpoint, id: PbBufferId, field_offset: u32) -> PbStatus;
     pub fn pb_ins_insert_capture_regs(ins: PbInsHandle, callback: PbInsCaptureRegsCallback, user_data: *mut c_void) -> PbStatus;
+    pub fn pb_ins_insert_capture_regs_ctx(ins: PbInsHandle, callback: PbInsContextCaptureRegsCallback, user_data: *mut c_void) -> PbStatus;
     pub fn pb_ins_insert_memory_operands(ins: PbInsHandle, callback: PbInsMemoryOperandCallback, user_data: *mut c_void) -> PbStatus;
     pub fn pb_ins_insert_exec(ins: PbInsHandle, callback: PbInsExecCallback, user_data: *mut c_void) -> PbStatus;
     pub fn pb_ins_insert_branch_edge(ins: PbInsHandle, callback: PbInsBranchEdgeCallback, user_data: *mut c_void) -> PbStatus;
@@ -2193,6 +2195,8 @@ unsafe extern "C" {
     pub fn pb_pin_save_context(source: PbConstContextHandle, destination: PbContextHandle) -> PbStatus;
     pub fn pb_pin_set_context_reg(context: PbContextHandle, reg: PbRegId, value: u64) -> PbStatus;
     pub fn pb_pin_set_context_regval(context: PbContextHandle, reg: PbRegId, value: *const u8, value_size: u64) -> PbStatus;
+    pub fn pb_pin_get_context_stack_arg(context: PbConstContextHandle, index: u32, out_value: *mut u64) -> PbStatus;
+    pub fn pb_pin_set_context_stack_arg(context: PbContextHandle, index: u32, value: u64) -> PbStatus;
     pub fn pb_pin_execute_at(context: PbConstContextHandle) -> PbStatus;
     pub fn pb_pin_check_read_access(address: u64, out_accessible: *mut u8) -> PbStatus;
     pub fn pb_pin_check_write_access(address: u64, out_accessible: *mut u8) -> PbStatus;

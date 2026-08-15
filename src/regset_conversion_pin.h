@@ -4,6 +4,7 @@
 #include "pin.H"
 
 #include "pinbridge/pinbridge.h"
+#include "reg_mapping_pin.h"
 
 #include <cstring>
 
@@ -22,8 +23,8 @@ inline uint32_t Word(UINT32 reg) { return reg / 64u; }
 
 inline bool IsPinReg(PbRegId reg)
 {
-    return reg >= static_cast<PbRegId>(REG_FirstInRegset) &&
-           reg <= static_cast<PbRegId>(REG_LastInRegset);
+    REG native_reg;
+    return PbPinRegFromId(reg, &native_reg) && REG_is_reg(native_reg);
 }
 
 inline void FromPin(const REGSET& source, PbRegSet* destination)
@@ -32,8 +33,10 @@ inline void FromPin(const REGSET& source, PbRegSet* destination)
     for (UINT32 reg = static_cast<UINT32>(REG_FirstInRegset);
          reg <= static_cast<UINT32>(REG_LastInRegset); ++reg)
     {
-        if (REGSET_Contains(source, static_cast<REG>(reg)))
-            destination->words[Word(reg)] |= Mask(reg);
+        PbRegId public_reg;
+        if (PbRegIdFromPinReg(static_cast<REG>(reg), &public_reg) &&
+            REGSET_Contains(source, static_cast<REG>(reg)))
+            destination->words[Word(public_reg)] |= Mask(public_reg);
     }
 }
 

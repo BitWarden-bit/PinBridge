@@ -385,7 +385,7 @@ unsafe extern "C" fn scripting_entry(_argument: *mut c_void) {
 
 // ---- agent directory resolution (GetMappedFileName + QueryDosDevice) ----
 
-extern "C" {
+extern "system" {
     fn GetCurrentProcess() -> *mut c_void;
     fn K32GetMappedFileNameW(
         process: *mut c_void,

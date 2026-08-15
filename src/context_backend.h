@@ -20,6 +20,10 @@ PbStatus PbBackendSaveContext(const void* source, void* destination);
 PbStatus PbBackendSetContextReg(void* context, PbRegId reg, uint64_t value);
 PbStatus PbBackendSetContextRegval(
     void* context, PbRegId reg, const uint8_t* value, uint64_t value_size);
+PbStatus PbBackendGetContextStackArg(
+    const void* context, uint32_t index, uint64_t* out_value);
+PbStatus PbBackendSetContextStackArg(
+    void* context, uint32_t index, uint64_t value);
 PB_NORETURN void PbBackendExecuteAt(const void* context);
 
 #endif

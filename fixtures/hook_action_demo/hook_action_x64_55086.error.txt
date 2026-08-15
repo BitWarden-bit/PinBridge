@@ -1,0 +1,1 @@
+System.Management.Automation.RuntimeException: pinbridge-cli exports D:\vmp_trace_toolkit_bundle_20260801_clean\pinbridge-next\fixtures\hook_action_demo\hook_action_demo_x64.exe failed: error: server status 2

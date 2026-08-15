@@ -3,7 +3,8 @@
 //! Rules of the hot path: no allocation, no panics, no I/O. A callback only
 //! fills a POD record and pushes it into the bounded ring.
 
-/// Win64 integer argument registers captured at an instruction hook.
+/// Architecture-specific integer argument registers plus ABI stack snapshots
+/// captured at a runtime instruction hook.
 pub const EVENT_HOOK_REGS: u32 = 1;
 /// One memory operand access (EA + size + access tag).
 pub const EVENT_MEMORY: u32 = 2;
@@ -29,6 +30,16 @@ pub const EVENT_EXEC_BYTES: u32 = 9;
 pub const EVENT_MEM_VALUE: u32 = 10;
 /// recorder annotation marker: address=0, arg0=tag, arg1=value.
 pub const EVENT_MARKER: u32 = 11;
+/// Lossless run-length marker. The previous logical record is repeated
+/// `arg0` additional times; `sequence` is the final logical sequence number.
+pub const EVENT_REPEAT: u32 = 12;
+/// Per-instruction register snapshot component. arg0=register id, arg1/arg2
+/// contain the value (low/high), arg3=value width, arg7=frame id.
+pub const EVENT_REG_SNAPSHOT: u32 = 13;
+/// Runtime hook placed on a function's `ret` instruction. `arg0` is the
+/// pre-action return register (RAX/EAX), `arg1..arg4` are the captured integer
+/// register slots, and `arg5..arg7` are the first three ABI stack arguments.
+pub const EVENT_HOOK_RETURN: u32 = 14;
 
 pub const EVENT_KIND_COUNT: usize = 9;
 
@@ -38,25 +49,26 @@ pub struct Event {
     pub sequence: u64,
     pub kind: u32,
     pub thread_id: u32,
-    /// Instruction address of the capture point.
+    /// Instruction address of the capture point (exception IP for
+    /// `context_change`).
     pub address: u64,
-    /// hook_regs: rcx | memory: EA | branch_edge: target | syscall: number
+    /// hook_regs: rcx/ecx | memory: EA | branch_edge: target | syscall: number
     /// | context_change: reason
     pub arg0: u64,
-    /// hook_regs: rdx | memory: size | branch_edge: taken | syscall: phase
+    /// hook_regs: rdx/edx | memory: size | branch_edge: taken | syscall: phase
     /// (0=entry, 1=exit) | context_change: info (exception code)
     pub arg1: u64,
-    /// hook_regs: r8 | memory: access | syscall: arg0 | context_change: ip
+    /// hook_regs: r8/eax | memory: access | syscall: arg0 | context_change: ip
     pub arg2: u64,
-    /// hook_regs: r9 | syscall: arg1 (entry) / return value (exit)
+    /// hook_regs: r9/ebx | syscall: arg1 (entry) / return value (exit)
     pub arg3: u64,
-    /// syscall: arg2 (entry) / errno (exit)
+    /// hook_regs: ABI stack arg0 | syscall: arg2 (entry) / errno (exit)
     pub arg4: u64,
-    /// syscall: arg3
+    /// hook_regs: ABI stack arg1 | syscall: arg3
     pub arg5: u64,
-    /// syscall: arg4
+    /// hook_regs: ABI stack arg2 | syscall: arg4
     pub arg6: u64,
-    /// syscall: arg5
+    /// hook_regs: ABI stack arg3 | syscall: arg5
     pub arg7: u64,
 }
 
@@ -86,6 +98,9 @@ impl Event {
             EVENT_CONTEXT_CHANGE => "context_change",
             EVENT_MODULE_LOAD => "module_load",
             EVENT_MODULE_UNLOAD => "module_unload",
+            EVENT_REPEAT => "repeat",
+            EVENT_REG_SNAPSHOT => "reg_snapshot",
+            EVENT_HOOK_RETURN => "hook_return",
             _ => "unknown",
         }
     }

@@ -1,6 +1,7 @@
 #include "pin.H"
 
 #include "ins_inspection_extras_backend.h"
+#include "reg_mapping_pin.h"
 
 #include <cstring>
 #include <string>
@@ -30,6 +31,13 @@ uint64_t CopyString(const std::string& value, char* buffer, uint64_t capacity)
     if (buffer && capacity >= required)
         std::memcpy(buffer, value.c_str(), static_cast<size_t>(required));
     return required;
+}
+
+PbRegId PublicReg(REG value)
+{
+    PbRegId out = PB_REG_NONE;
+    PbRegIdFromPinReg(value, &out);
+    return out;
 }
 
 } // namespace
@@ -82,8 +90,10 @@ void PbBackendInsGetNumberAndSizeOfMemAccesses(
 uint8_t PbBackendInsChangeReg(
     PbInsHandle ins, PbRegId old_reg, PbRegId new_reg, uint8_t as_read)
 {
-    return INS_ChangeReg(ToIns(ins), static_cast<REG>(old_reg),
-        static_cast<REG>(new_reg), as_read != 0) ? 1u : 0u;
+    REG old_native, new_native;
+    if (!PbPinRegFromId(old_reg, &old_native) ||
+        !PbPinRegFromId(new_reg, &new_native)) return 0;
+    return INS_ChangeReg(ToIns(ins), old_native, new_native, as_read != 0) ? 1u : 0u;
 }
 
 void PbBackendInsGetFarPointer(
@@ -101,20 +111,19 @@ PbXedDecodedInstHandle PbBackendInsXedDec(PbInsHandle ins)
 
 PbXedRegId PbBackendInsXedExactMapFromPinReg(PbRegId pin_reg)
 {
-    return static_cast<PbXedRegId>(
-        INS_XedExactMapFromPinReg(static_cast<REG>(pin_reg)));
+    REG native;
+    if (!PbPinRegFromId(pin_reg, &native)) return static_cast<PbXedRegId>(0);
+    return static_cast<PbXedRegId>(INS_XedExactMapFromPinReg(native));
 }
 
 PbRegId PbBackendInsXedExactMapToPinReg(PbXedRegId xed_reg)
 {
-    return static_cast<PbRegId>(
-        INS_XedExactMapToPinReg(static_cast<xed_reg_enum_t>(xed_reg)));
+    return PublicReg(INS_XedExactMapToPinReg(static_cast<xed_reg_enum_t>(xed_reg)));
 }
 
 PbRegId PbBackendInsXedExactMapToPinRegLegacy(uint32_t xed_reg)
 {
-    return static_cast<PbRegId>(INS_XedExactMapToPinReg(
-        static_cast<unsigned int>(xed_reg)));
+    return PublicReg(INS_XedExactMapToPinReg(static_cast<unsigned int>(xed_reg)));
 }
 
 void PbBackendPinSetSyntaxAtt(void) { PIN_SetSyntaxATT(); }

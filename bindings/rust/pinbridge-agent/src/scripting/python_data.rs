@@ -18,7 +18,7 @@
 
 use core::ffi::{c_char, c_void};
 
-extern "C" {
+extern "system" {
     fn GetProcAddress(module: *mut c_void, name: *const c_char) -> *mut c_void;
 }
 

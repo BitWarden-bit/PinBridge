@@ -1,7 +1,7 @@
 # ntdll_trace.py: hook every ntdll export and watch what the app calls.
 #
-# Resolves all exports of ntdll.dll, plants a hook point on each (capped at
-# MAX_HOOKS), then prints the first DETAIL_PER_NAME hits per function with
+# Resolves all exports of ntdll.dll, plants one hook point per unique export
+# address (capped at MAX_HOOKS), then prints the first DETAIL_PER_NAME hits with
 # its Win64 argument registers, plus a totals line every SUMMARY_EVERY hits.
 #
 # Load:  pinbridge-cli --port 9012 script run ntdll_trace.py
@@ -16,25 +16,30 @@
 import pb
 
 MODULE = "ntdll.dll"
-MAX_HOOKS = 2000        # agent-side hook point cap is 4096; keep headroom
+MAX_HOOKS = 4096        # agent-side hook point cap
 DETAIL_PER_NAME = 3     # full lines per function before going quiet
 SUMMARY_EVERY = 1000    # totals line cadence
 
 names = {}              # hooked addr -> export name (per-hit dict lookup is
                         # MUCH cheaper than pb.resolve on every event)
 armed = 0
+exports_seen = 0
 total = 0
 per_name = {}           # name -> hit count
 
 def pb_init():
-    global armed
+    global armed, exports_seen
     for addr, name in pb.exports(MODULE):
+        exports_seen += 1
+        if addr in names:
+            continue  # Nt*/Zw* and other aliases commonly share an entry
         if armed >= MAX_HOOKS:
             break
         if pb.hook_set(addr):
             names[addr] = name
             armed += 1
-    pb.print("ntdll_trace: %d hooks armed on %s" % (armed, MODULE))
+    pb.print("ntdll_trace: %d unique hooks armed from %d exports on %s"
+             % (armed, exports_seen, MODULE))
 
 pb.watch(kinds=["hook"], batch=1024)
 

@@ -28,6 +28,19 @@ pub struct Snapshot {
     pub newest: Vec<proto::EventRecord>,
 }
 
+/// Full PING snapshot. `arch` and `pointer_width` are the additive tail
+/// fields (`pinbridge_proto::ARCH_*`); they are `None` against an agent that
+/// predates the extension.
+#[derive(Debug, Clone, Copy)]
+pub struct PingInfo {
+    pub abi_major: u32,
+    pub abi_minor: u32,
+    pub pid: u32,
+    pub total: u64,
+    pub arch: Option<u32>,
+    pub pointer_width: Option<u32>,
+}
+
 pub struct Client {
     stream: TcpStream,
 }
@@ -62,9 +75,30 @@ impl Client {
     }
 
     pub fn ping(&mut self) -> Result<(u32, u32, u32, u64)> {
+        let info = self.ping_full()?;
+        Ok((info.abi_major, info.abi_minor, info.pid, info.total))
+    }
+
+    /// Full PING snapshot. `arch` and `pointer_width` are the additive tail
+    /// fields (pinbridge_proto::ARCH_*); they are `None` against an agent that
+    /// predates the extension.
+    pub fn ping_full(&mut self) -> Result<PingInfo> {
         let body = self.request(proto::op::PING, &[])?;
         let mut r = proto::Reader::new(&body);
-        Ok((r.u32_or_err()?, r.u32_or_err()?, r.u32_or_err()?, r.u64_or_err()?))
+        let abi_major = r.u32_or_err()?;
+        let abi_minor = r.u32_or_err()?;
+        let pid = r.u32_or_err()?;
+        let total = r.u64_or_err()?;
+        let arch = r.u32();
+        let pointer_width = r.u32();
+        Ok(PingInfo {
+            abi_major,
+            abi_minor,
+            pid,
+            total,
+            arch,
+            pointer_width,
+        })
     }
 
     pub fn counters(&mut self) -> Result<(u64, u64, u64, [u64; 8])> {
@@ -173,6 +207,27 @@ impl Client {
             entries.push((id, address, hits));
         }
         Ok((stopped, hit_tid, hit_addr, stop_gen, entries))
+    }
+
+    /// Minimal entry-breakpoint status. New agents append the planted entry
+    /// address to BP_LIST; `None` preserves compatibility with older agents.
+    pub fn entry_stop_status(&mut self) -> Result<(bool, u32, u64, Option<u64>)> {
+        let body = self.request(proto::op::BP_LIST, &[])?;
+        if body.len() < 21 {
+            return Err(Error::new(ErrorKind::InvalidData, "short bp list"));
+        }
+        let stopped = body[0] != 0;
+        let mut r = proto::Reader::new(&body[1..]);
+        let hit_tid = r.u32_or_err()?;
+        let hit_addr = r.u64_or_err()?;
+        let _stop_gen = r.u64_or_err()?;
+        let count = r.u32_or_err()? as usize;
+        let rows_len = count
+            .checked_mul(20)
+            .ok_or_else(|| Error::new(ErrorKind::InvalidData, "bp list count overflow"))?;
+        r.skip(rows_len)
+            .ok_or_else(|| Error::new(ErrorKind::InvalidData, "short bp list entries"))?;
+        Ok((stopped, hit_tid, hit_addr, r.u64()))
     }
 
     pub fn bp_remove(&mut self, id: u32) -> Result<u32> {
@@ -501,6 +556,36 @@ impl Client {
         Ok(out)
     }
 
+    /// Adds or replaces a synchronous native Hook action rule. Register ids
+    /// are Pin `PbRegId` values for the target architecture; `match_reg=0`
+    /// means unconditional and `thread_id=u32::MAX` means all threads.
+    pub fn hook_rule_set(
+        &mut self,
+        address: u64,
+        thread_id: u32,
+        match_reg: u32,
+        match_mask: u64,
+        match_value: u64,
+        set_reg: u32,
+        set_value: u64,
+    ) -> Result<bool> {
+        let mut request = Vec::with_capacity(44);
+        proto::put_u64(&mut request, address);
+        proto::put_u32(&mut request, thread_id);
+        proto::put_u32(&mut request, match_reg);
+        proto::put_u64(&mut request, match_mask);
+        proto::put_u64(&mut request, match_value);
+        proto::put_u32(&mut request, set_reg);
+        proto::put_u64(&mut request, set_value);
+        let body = self.request(proto::op::HOOK_RULE_SET, &request)?;
+        Ok(proto::Reader::new(&body).u32_or_err()? != 0)
+    }
+
+    pub fn hook_rule_clear(&mut self) -> Result<()> {
+        self.request(proto::op::HOOK_RULE_CLEAR, &[])?;
+        Ok(())
+    }
+
     /// Arms the trace recording channel: records the given event kinds for
     /// instructions in [lo, hi) into a .pbtr file at `path`. kinds are event
     /// kind numbers (2 memory, 3 exec, 4 branch, 9 exec_bytes, 10
@@ -524,6 +609,84 @@ impl Client {
         Ok(())
     }
 
+    /// Arms recording for multiple address ranges and an optional thread
+    /// allowlist. Empty `threads` means all threads.
+    pub fn trace_start_spec(
+        &mut self,
+        kinds: &[u32],
+        ranges: &[(u64, u64)],
+        threads: &[u32],
+        path: &str,
+    ) -> Result<()> {
+        if ranges.is_empty() || ranges.len() > 16 || threads.len() > 64 {
+            return Err(Error::new(ErrorKind::InvalidInput, "invalid trace spec size"));
+        }
+        let mut kinds_mask: u32 = 0;
+        for kind in kinds {
+            if *kind >= 32 {
+                return Err(Error::new(ErrorKind::InvalidInput, "invalid trace kind"));
+            }
+            kinds_mask |= 1 << kind;
+        }
+        if path.len() > u16::MAX as usize {
+            return Err(Error::new(ErrorKind::InvalidInput, "trace path too long"));
+        }
+        let mut request = Vec::with_capacity(8 + ranges.len() * 16 + threads.len() * 4 + path.len());
+        proto::put_u32(&mut request, kinds_mask);
+        request.extend_from_slice(&(ranges.len() as u16).to_le_bytes());
+        for (lo, hi) in ranges {
+            proto::put_u64(&mut request, *lo);
+            proto::put_u64(&mut request, *hi);
+        }
+        request.extend_from_slice(&(threads.len() as u16).to_le_bytes());
+        for tid in threads {
+            proto::put_u32(&mut request, *tid);
+        }
+        request.extend_from_slice(&(path.len() as u16).to_le_bytes());
+        request.extend_from_slice(path.as_bytes());
+        let body = self.request(proto::op::TRACE_START_SPEC, &request)?;
+        if proto::Reader::new(&body).u32_or_err()? == 0 {
+            return Err(Error::new(ErrorKind::Other, "trace start refused"));
+        }
+        Ok(())
+    }
+
+    /// Adds executable/data ranges to an armed trace. Existing thread and
+    /// kind filters remain unchanged; the native recorder updates its gate
+    /// before subsequent ring claims.
+    pub fn trace_extend(&mut self, ranges: &[(u64, u64)]) -> Result<()> {
+        if ranges.is_empty() || ranges.len() > 16 {
+            return Err(Error::new(ErrorKind::InvalidInput, "invalid trace extension size"));
+        }
+        let mut request = Vec::with_capacity(2 + ranges.len() * 16);
+        request.extend_from_slice(&(ranges.len() as u16).to_le_bytes());
+        for (lo, hi) in ranges {
+            proto::put_u64(&mut request, *lo);
+            proto::put_u64(&mut request, *hi);
+        }
+        self.request(proto::op::TRACE_EXTEND, &request)?;
+        Ok(())
+    }
+
+    /// Queries the virtual memory region containing `address`.
+    pub fn memory_region(&mut self, address: u64) -> Result<Option<MemoryRegion>> {
+        let mut request = Vec::with_capacity(8);
+        proto::put_u64(&mut request, address);
+        let body = self.request(proto::op::MEMORY_REGION, &request)?;
+        if body.is_empty() || body[0] == 0 {
+            return Ok(None);
+        }
+        let mut r = proto::Reader::new(&body[1..]);
+        Ok(Some(MemoryRegion {
+            base: r.u64_or_err()?,
+            size: r.u64_or_err()?,
+            allocation_base: r.u64_or_err()?,
+            protect: r.u32_or_err()?,
+            state: r.u32_or_err()?,
+            kind: r.u32_or_err()?,
+        }))
+    }
+
     /// Stops the recording session (waits for the file drain, ~5s bound).
     /// Returns (recorded, dropped).
     pub fn trace_stop(&mut self) -> Result<(u64, u64)> {
@@ -542,6 +705,16 @@ impl Client {
         let mut r = proto::Reader::new(&body[1..]);
         Ok((active, r.u64_or_err()?, r.u64_or_err()?))
     }
+}
+
+/// Windows VirtualQuery result for a target address.
+pub struct MemoryRegion {
+    pub base: u64,
+    pub size: u64,
+    pub allocation_base: u64,
+    pub protect: u32,
+    pub state: u32,
+    pub kind: u32,
 }
 
 /// SCRIPT_STATUS snapshot; state: 0 none, 1 running, 2 error.
