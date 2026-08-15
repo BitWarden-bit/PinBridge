@@ -149,7 +149,8 @@ service-class 高位会在进入事件和过滤器前移除。entry/exit 通过�
 - `pb.counters() -> (total, dropped, capacity, [kind_counts])`(kind_counts 8 类）
 - `pb.exc_policy(enabled, code=0) -> bool`（异常暂停策略；停止窗口按设计不精确）
 - `pb.instrumentation_set(kinds=None, ranges=None, threads=None) -> generation`：替换当前插件
-  的高频采集规则。`kinds` 可取 `instruction`、`instruction.decode`、`memory`、`branch.edge`；`ranges` 是半开区间
+  的原生采集规则。`kinds` 可取 `instruction`、`instruction.decode`、`memory`、`branch.edge`、
+  `trace.instrument`、`routine.instrument`、`basic_block.instrument`；`ranges` 是半开区间
   `(lo, hi)` 列表，省略时使用启动配置的 trace range；`threads` 省略或空列表表示全部线程。
 - `pb.instrumentation_policy() -> (kinds, ranges, threads) | None`：读取当前插件自己的规则。
 - `pb.instrumentation_clear() -> bool`：移除当前插件的规则，不影响其他插件。
@@ -201,6 +202,14 @@ Pin 的 XED 回调发生在解码前，不是“已解码指令通知”。平�
 为 `size`、`category`、`extension`、`opcode`、`memory_operand_count`、
 `has_fall_through`、`is_branch`、`is_call`、`is_return`、`is_syscall`。这些值已经从 INS/XED
 对象复制到固定记录；回调需要文本时可在脚本线程按地址调用 `pb.disasm`。
+
+函数、Trace 和基本块同样使用“Python 声明、原生产生、脚本线程批量消费”的模型。先用
+`pb.on` 或 `pb.watch` 订阅对应名字，再把相同种类加入 `pb.instrumentation_set`。函数策略
+启用时会枚举已加载模块的函数，弥补脚本热加载晚于模块加载的问题；以后 Pin 新发现的函数
+继续由 RTN 回调投递。Trace 和基本块在代码缓存创建/重新翻译时投递，因此同一地址可能因
+失效重编译出现多次，`policy_generation` 用于区分策略版本。这三类是静态插桩事件，
+`tid == -1`，`threads` 过滤不适用；`ranges` 仍在原生回调内精确执行。函数名和模块名不从
+借用的 Pin 对象跨线程复制，脚本需要文本时按 `address` 调用 `pb.resolve`。
 
 轨迹录制（.pbtr，见 docs/taint-roadmap.md 第 2 层；与 64K 主环相互独立）:
 - `pb.trace_start(path, kinds=None, range=None) -> bool`;kinds 名映射到录制档：
@@ -320,7 +329,8 @@ pb.off(subscription_id)
 `thread.exit`、`module.load`、`module.unload`、`exception`、`context.change`、
 `syscall`、`hook.entry`、`hook.return`、`instruction`、`instruction.decode`、`memory`、`branch.edge`、
 `code.smc`、`pin.detach`、`pin.attach`、`memory.oom`、`pin.internal_exception`、
-`debugger.breakpoint`、`debugger.single_step`、`debugger.async_break`。
+`debugger.breakpoint`、`debugger.single_step`、`debugger.async_break`、
+`trace.instrument`、`routine.instrument`、`basic_block.instrument`。
 
 订阅 `instruction`、`memory`、`branch.edge` 或 `syscall` 会把对应的原生采集引擎加入
 脚本需求并在下一次宿主节拍开启。取消订阅不会擅自关闭可能由 CLI/UI 开启的全局引擎。
@@ -342,6 +352,9 @@ pb.off(subscription_id)
 | `pin.detach` | `phase="detached"` | 已接入 JIT/Probe 原生完成回调；分离后不承诺 Python 仍被调度 |
 | `pin.attach` | `phase="attached"` | 字段已固定；完整重新附加控制链仍在开发 |
 | `debugger.breakpoint` / `debugger.single_step` / `debugger.async_break` | `ip`, `debugging_event`, `stack_pointer`, `flags`, `return_value` | Pin 准备把停止事件报告给应用调试器时产生；这里只观察，不改变处理结果 |
+| `trace.instrument` | `size`, `basic_block_count`, `instruction_count`, `has_fall_through`, `routine_address`, `policy_generation` | Pin 为执行路径创建动态 Trace 时产生 |
+| `routine.instrument` | `size`, `instruction_count`, `routine_id`, `is_dynamic`, `is_artificial`, `policy_generation` | 策略启用时补当前函数快照，随后接收 Pin 新发现函数 |
+| `basic_block.instrument` | `size`, `instruction_count`, `has_fall_through`, `is_original`, `policy_generation` | Trace 内的基本块静态元数据 |
 
 原生生命周期回调只写固定大小记录，不分配内存、不获取 GIL，也不等待 Python。
 Python 处理函数统一在脚本内部线程按“插件名、注册顺序”稳定调用。处理函数异常只把

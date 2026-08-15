@@ -118,7 +118,7 @@ fixtures\child_follow_demo\run.ps1 -Follow $true   # 子进程跟随决定
 fixtures\hook_python_demo\run.ps1                  # Hook 入口跳过 + 返回值同步修改
 fixtures\syscall_python_demo\run.ps1               # syscall 入口参数 + 出口状态同步修改
 fixtures\exception_python_demo\run.ps1             # 异常现场交给 Python 改写后恢复执行
-fixtures\instrumentation_python_demo\run.ps1       # Python 配置范围并动态触发原生重新插桩
+fixtures\instrumentation_python_demo\run.ps1       # 动态重新插桩 + 指令/函数/Trace/基本块生命周期
 fixtures\memory_translation_python_demo\run.ps1    # Python 映射地址并由原生层改写真实访存
 fixtures\code_fetch_python_demo\run.ps1            # Python 预置机器码并触发原生重新取码
 fixtures\xed_decode_python_demo\run.ps1             # XED 预解码策略 + 已解码命名/批量事件

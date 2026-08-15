@@ -6,7 +6,8 @@
 
 use crate::event::{
     Event, EVENT_BRANCH_EDGE, EVENT_EXEC, EVENT_HOOK_REGS, EVENT_HOOK_RETURN, EVENT_MEMORY,
-    EVENT_INSTRUCTION_DECODE, EVENT_SYSCALL,
+    EVENT_BBL_INSTRUMENT, EVENT_INSTRUCTION_DECODE, EVENT_ROUTINE_INSTRUMENT, EVENT_SYSCALL,
+    EVENT_TRACE_INSTRUMENT,
 };
 use crate::ring::submit;
 use core::ffi::c_void;
@@ -27,8 +28,12 @@ pub const INSTRUMENT_EXEC: u32 = 1 << EVENT_EXEC;
 pub const INSTRUMENT_MEMORY: u32 = 1 << EVENT_MEMORY;
 pub const INSTRUMENT_BRANCH: u32 = 1 << EVENT_BRANCH_EDGE;
 pub const INSTRUMENT_DECODE: u32 = 1 << EVENT_INSTRUCTION_DECODE;
+pub const INSTRUMENT_TRACE: u32 = 1 << EVENT_TRACE_INSTRUMENT;
+pub const INSTRUMENT_ROUTINE: u32 = 1 << EVENT_ROUTINE_INSTRUMENT;
+pub const INSTRUMENT_BBL: u32 = 1 << EVENT_BBL_INSTRUMENT;
 pub const INSTRUMENT_ALL: u32 =
-    INSTRUMENT_EXEC | INSTRUMENT_MEMORY | INSTRUMENT_BRANCH | INSTRUMENT_DECODE;
+    INSTRUMENT_EXEC | INSTRUMENT_MEMORY | INSTRUMENT_BRANCH | INSTRUMENT_DECODE
+        | INSTRUMENT_TRACE | INSTRUMENT_ROUTINE | INSTRUMENT_BBL;
 pub const MAX_INSTRUMENTATION_RANGES: usize = 64;
 pub const MAX_INSTRUMENTATION_THREADS: usize = 64;
 
@@ -119,11 +124,22 @@ fn policy() -> &'static InstrumentationPolicy {
 }
 
 #[inline]
-fn wants_at_instrumentation(address: u64, kind: u32) -> bool {
+pub(crate) fn wants_at_instrumentation(address: u64, kind: u32) -> bool {
     policy()
         .rules
         .iter()
         .any(|rule| rule.matches_instrumentation(address, kind))
+}
+
+pub(crate) fn wants_instrumentation_kind(kind: u32) -> bool {
+    policy()
+        .rules
+        .iter()
+        .any(|rule| rule.kinds & (1 << kind) != 0)
+}
+
+pub(crate) fn policy_generation() -> u64 {
+    POLICY_GENERATION.load(Ordering::Acquire)
 }
 
 #[inline]
@@ -179,6 +195,7 @@ pub fn set_instrumentation_policies(
                 return Err(status);
             }
         }
+        crate::instrumentation_lifecycle::request_routine_snapshot(generation);
         return Ok(generation);
     }
 
@@ -221,6 +238,7 @@ pub fn set_instrumentation_policies(
             return Err(status);
         }
     }
+    crate::instrumentation_lifecycle::request_routine_snapshot(generation);
     Ok(generation)
 }
 

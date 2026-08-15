@@ -730,6 +730,13 @@ fn instrumentation_kind(name: &str) -> Option<u32> {
         "instruction.decode" | "instruction_decode" | "decode" => {
             crate::engines::INSTRUMENT_DECODE
         }
+        "trace.instrument" | "trace_instrument" | "trace" => crate::engines::INSTRUMENT_TRACE,
+        "routine.instrument" | "routine_instrument" | "routine" | "function" => {
+            crate::engines::INSTRUMENT_ROUTINE
+        }
+        "basic_block.instrument" | "basic_block_instrument" | "bbl.instrument" | "bbl" => {
+            crate::engines::INSTRUMENT_BBL
+        }
         _ => return None,
     })
 }
@@ -759,7 +766,7 @@ fn pb_instrumentation_set(
     }) {
         kind_mask |= instrumentation_kind(&name).ok_or_else(|| {
             PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-                "unknown instrumentation kind {name:?}; expected instruction, instruction.decode, memory, or branch.edge"
+                "unknown instrumentation kind {name:?}; expected instruction, instruction.decode, memory, branch.edge, trace.instrument, routine.instrument, or basic_block.instrument"
             ))
         })?;
     }
@@ -860,6 +867,15 @@ fn pb_instrumentation_policy() -> PyResult<Option<(Vec<String>, Vec<(u64, u64)>,
             }
             if spec.kinds & crate::engines::INSTRUMENT_DECODE != 0 {
                 kinds.push("instruction.decode".to_string());
+            }
+            if spec.kinds & crate::engines::INSTRUMENT_TRACE != 0 {
+                kinds.push("trace.instrument".to_string());
+            }
+            if spec.kinds & crate::engines::INSTRUMENT_ROUTINE != 0 {
+                kinds.push("routine.instrument".to_string());
+            }
+            if spec.kinds & crate::engines::INSTRUMENT_BBL != 0 {
+                kinds.push("basic_block.instrument".to_string());
             }
             (kinds, spec.ranges.clone(), spec.threads.clone())
         })
@@ -1264,6 +1280,13 @@ fn kind_bit(name: &str) -> Option<u32> {
         "module_unload" => 1 << 8,
         "instruction.decode" | "instruction_decode" | "decode" => {
             1 << crate::event::EVENT_INSTRUCTION_DECODE
+        }
+        "trace.instrument" | "trace_instrument" => 1 << crate::event::EVENT_TRACE_INSTRUMENT,
+        "routine.instrument" | "routine_instrument" | "function.instrument" => {
+            1 << crate::event::EVENT_ROUTINE_INSTRUMENT
+        }
+        "basic_block.instrument" | "basic_block_instrument" | "bbl.instrument" => {
+            1 << crate::event::EVENT_BBL_INSTRUMENT
         }
         _ => return None,
     })

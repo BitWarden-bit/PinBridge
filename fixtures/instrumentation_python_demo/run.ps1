@@ -95,7 +95,13 @@ try {
     if (-not $pinProcess.HasExited) { throw "target did not exit" }
     [void]$pinProcess.WaitForExit()
     if (Test-Path -LiteralPath $log) { $captured += "`n" + (Get-Content -LiteralPath $log -Raw) }
-    foreach ($marker in @("INSTRUMENTATION_POLICY_READY", "INSTRUMENTATION_NATIVE_HIT")) {
+    foreach ($marker in @(
+        "INSTRUMENTATION_POLICY_READY",
+        "INSTRUMENTATION_NATIVE_HIT",
+        "INSTRUMENTATION_LIFECYCLE_HIT type=trace.instrument",
+        "INSTRUMENTATION_LIFECYCLE_HIT type=routine.instrument",
+        "INSTRUMENTATION_LIFECYCLE_HIT type=basic_block.instrument"
+    )) {
         if (-not $captured.Contains($marker)) { throw "missing callback marker: $marker" }
     }
     if ($captured.Contains("callback failed") -or $captured.Contains("native range filter leaked")) {
@@ -111,6 +117,7 @@ try {
         target_exit = $pinProcess.ExitCode
         dynamic_reinstrumentation = $true
         excluded_range_filtered = $true
+        lifecycle_events = @("trace.instrument", "routine.instrument", "basic_block.instrument")
         target_output = $targetOutput
     } | ConvertTo-Json -Depth 3
 } finally {

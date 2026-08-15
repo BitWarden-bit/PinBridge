@@ -336,12 +336,15 @@ Python 只接触值快照，原应用线程醒来后才由原生层写回经验�
 
 ## 已完成：Python 配置高频插桩、原生执行
 
-指令、内存和分支事件不能逐条同步进入 Python。脚本只声明要采集什么，原生层把声明编译
+指令、内存、分支和插桩生命周期事件不能逐条同步进入 Python。脚本只声明要采集什么，原生层把声明编译
 为不可变规则：
 
 ```python
 generation = pb.instrumentation_set(
-    kinds=["instruction", "instruction.decode", "memory", "branch.edge"],
+    kinds=[
+        "instruction", "instruction.decode", "memory", "branch.edge",
+        "trace.instrument", "routine.instrument", "basic_block.instrument",
+    ],
     ranges=[(module_start, module_end), (jit_start, jit_end)],
     threads=[worker_tid],       # 省略或 [] 表示全部线程
 )
@@ -366,6 +369,21 @@ Pin 热路径不获取 GIL、不调用 Python、不分配规则对象。
 `pb.instrumentation_set` 决定原生层采集哪些事件；两者职责分开。真实 Pin 回归先在引擎
 关闭时执行并缓存一个函数，再由 Python 只启用该函数范围，验证动态重新插桩成功且相邻
 排除函数没有泄漏事件。
+
+函数、Trace 和基本块生命周期沿用同一个规则快照，而不是另建一套容易交叉放宽的过滤器：
+
+- `routine.instrument`：策略发布后遍历当前已加载镜像的 section/routine，补发范围内函数
+  快照；以后 RTN 原生回调继续投递新函数；
+- `trace.instrument`：Pin 创建动态 TRACE 时复制起点、大小、基本块数、指令数、是否贯穿
+  以及所在函数地址；
+- `basic_block.instrument`：在 TRACE 回调内遍历 BBL，复制起点、大小、指令数、贯穿和
+  original 标志。
+
+所有遍历都有镜像/节/函数数量硬上限，借用的 RTN/TRACE/BBL 句柄不离开回调。三类事件
+使用普通遥测环和批量 Python 路由，允许覆盖并报告 `missed`，不把静态代码发现伪装成
+同步控制流。它们没有应用线程，`tid=-1`；线程过滤仅作用于运行期 instruction/memory/
+branch，地址范围仍适用于全部种类。策略变化失效范围内代码缓存，Trace/基本块可在同一
+`policy_generation` 内重复出现，这是 Pin 重翻译的真实生命周期，不做虚假全局去重。
 
 ## 已完成：Python 配置内存地址转换、原生改写访存
 
@@ -486,3 +504,4 @@ pb.instrumentation_set(
 | 取机器码 | `pb.code_fetch_set/clear/policy` | 已完成，动态重新取码和原始地址回退真实 Pin 测试通过 |
 | XED 解码输入 | `pb.xed_decode_set/clear/policy` | 已完成，CET/CLDEMOTE/MPX 原生预解码配置，冲突回滚和重新解码已接入 |
 | 已解码指令通知 | `pb.on("instruction.decode")` + `pb.instrumentation_set` | 已完成，原生范围过滤、命名/批量 Python 回调真实 Pin 测试通过 |
+| 函数/Trace/基本块生命周期 | `pb.on(...)` + `pb.instrumentation_set` | 已完成，热加载函数快照、动态重新翻译、三类原生范围过滤真实 Pin 测试通过 |

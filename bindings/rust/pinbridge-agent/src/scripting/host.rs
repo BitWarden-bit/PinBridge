@@ -908,6 +908,9 @@ fn tick(pending: &mut Vec<(String, Py<PyAny>)>, port: u16) {
     if !python_ready() {
         return;
     }
+    // A policy can be installed by pb_init before its ring cursor exists.
+    // Replay loaded routines only after exec_pending has established it.
+    crate::instrumentation_lifecycle::emit_pending_routine_snapshot();
     super::interceptors::dispatch_pending();
     // adapt the pull size to last tick's measured Python cost (routed count)
     adapt_page_limit();

@@ -12,7 +12,7 @@ use pyo3::types::PyDict;
 const CONTEXT_CHANGE_EXCEPTION: u64 = 4;
 static NEXT_SUBSCRIPTION_ID: AtomicU64 = AtomicU64::new(1);
 
-pub const PUBLIC_EVENT_NAMES: [&str; 23] = [
+pub const PUBLIC_EVENT_NAMES: [&str; 26] = [
     "process.start",
     "process.exit",
     "thread.start",
@@ -36,6 +36,9 @@ pub const PUBLIC_EVENT_NAMES: [&str; 23] = [
     "debugger.breakpoint",
     "debugger.single_step",
     "debugger.async_break",
+    "trace.instrument",
+    "routine.instrument",
+    "basic_block.instrument",
 ];
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -86,6 +89,12 @@ impl EventSelector {
             "debugger.async_break" | "debugger_async_break" => {
                 Self::Kind(EVENT_DEBUGGER_ASYNC_BREAK)
             }
+            "trace.instrument" | "trace_instrument" => Self::Kind(EVENT_TRACE_INSTRUMENT),
+            "routine.instrument" | "routine_instrument" | "function.instrument" => {
+                Self::Kind(EVENT_ROUTINE_INSTRUMENT)
+            }
+            "basic_block.instrument" | "basic_block_instrument" | "bbl.instrument"
+            | "bbl_instrument" => Self::Kind(EVENT_BBL_INSTRUMENT),
             _ => return None,
         })
     }
@@ -115,6 +124,9 @@ impl EventSelector {
             Self::Kind(EVENT_DEBUGGER_BREAKPOINT) => "debugger.breakpoint",
             Self::Kind(EVENT_DEBUGGER_SINGLE_STEP) => "debugger.single_step",
             Self::Kind(EVENT_DEBUGGER_ASYNC_BREAK) => "debugger.async_break",
+            Self::Kind(EVENT_TRACE_INSTRUMENT) => "trace.instrument",
+            Self::Kind(EVENT_ROUTINE_INSTRUMENT) => "routine.instrument",
+            Self::Kind(EVENT_BBL_INSTRUMENT) => "basic_block.instrument",
             Self::Kind(_) => "unknown",
         }
     }
@@ -286,6 +298,29 @@ pub fn build_event_dict(
             row.set_item("flags", event.arg2)?;
             row.set_item("return_value", event.arg3)?;
         }
+        EventSelector::Kind(EVENT_TRACE_INSTRUMENT) => {
+            row.set_item("size", event.arg0)?;
+            row.set_item("basic_block_count", event.arg1)?;
+            row.set_item("instruction_count", event.arg2)?;
+            row.set_item("has_fall_through", event.arg3 != 0)?;
+            row.set_item("routine_address", event.arg4)?;
+            row.set_item("policy_generation", event.arg7)?;
+        }
+        EventSelector::Kind(EVENT_ROUTINE_INSTRUMENT) => {
+            row.set_item("size", event.arg0)?;
+            row.set_item("instruction_count", event.arg1)?;
+            row.set_item("routine_id", event.arg2)?;
+            row.set_item("is_dynamic", event.arg3 != 0)?;
+            row.set_item("is_artificial", event.arg4 != 0)?;
+            row.set_item("policy_generation", event.arg7)?;
+        }
+        EventSelector::Kind(EVENT_BBL_INSTRUMENT) => {
+            row.set_item("size", event.arg0)?;
+            row.set_item("instruction_count", event.arg1)?;
+            row.set_item("has_fall_through", event.arg2 != 0)?;
+            row.set_item("is_original", event.arg3 != 0)?;
+            row.set_item("policy_generation", event.arg7)?;
+        }
         EventSelector::Kind(EVENT_MODULE_LOAD) => {
             row.set_item("base", event.arg0)?;
             row.set_item("end", event.arg1)?;
@@ -386,6 +421,14 @@ mod tests {
         assert!(!EventSelector::parse("thread.start")
             .expect("thread selector")
             .requires_smc_registration());
+        for name in [
+            "trace.instrument",
+            "routine.instrument",
+            "basic_block.instrument",
+        ] {
+            assert!(PUBLIC_EVENT_NAMES.contains(&name));
+            assert!(EventSelector::parse(name).is_some());
+        }
     }
 
     #[test]

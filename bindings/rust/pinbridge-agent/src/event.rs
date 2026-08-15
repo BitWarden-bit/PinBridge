@@ -81,6 +81,18 @@ pub const EVENT_DEBUGGER_BREAKPOINT: u32 = 26;
 pub const EVENT_DEBUGGER_SINGLE_STEP: u32 = 27;
 /// Pin is about to report an asynchronous debugger interruption.
 pub const EVENT_DEBUGGER_ASYNC_BREAK: u32 = 28;
+/// Pin created a dynamic TRACE for instrumentation. address=start,
+/// arg0=size, arg1=BBL count, arg2=instruction count, arg3=fall-through,
+/// arg4=containing routine address, arg7=policy generation.
+pub const EVENT_TRACE_INSTRUMENT: u32 = 29;
+/// Pin discovered or snapshotted a routine. address=start, arg0=size,
+/// arg1=instruction count, arg2=routine id, arg3=dynamic, arg4=artificial,
+/// arg7=policy generation.
+pub const EVENT_ROUTINE_INSTRUMENT: u32 = 30;
+/// One BBL inside a newly instrumented TRACE. address=start, arg0=size,
+/// arg1=instruction count, arg2=fall-through, arg3=original,
+/// arg7=policy generation.
+pub const EVENT_BBL_INSTRUMENT: u32 = 31;
 
 pub const EVENT_KIND_COUNT: usize = 9;
 
@@ -161,6 +173,9 @@ pub fn kind_name(kind: u32) -> &'static str {
         EVENT_DEBUGGER_BREAKPOINT => "debugger_breakpoint",
         EVENT_DEBUGGER_SINGLE_STEP => "debugger_single_step",
         EVENT_DEBUGGER_ASYNC_BREAK => "debugger_async_break",
+        EVENT_TRACE_INSTRUMENT => "trace_instrument",
+        EVENT_ROUTINE_INSTRUMENT => "routine_instrument",
+        EVENT_BBL_INSTRUMENT => "basic_block_instrument",
         _ => "unknown",
     }
 }
