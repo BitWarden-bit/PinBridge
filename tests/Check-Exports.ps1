@@ -1,12 +1,14 @@
 [CmdletBinding()]
 param(
     [ValidateSet("Debug", "Release")]
-    [string]$Configuration = "Release"
+    [string]$Configuration = "Release",
+    [ValidateSet("x64", "ia32")]
+    [string]$Arch = "x64"
 )
 
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
-$dll = Join-Path $root "build\pin\x64\$Configuration\pinbridge.dll"
+$dll = Join-Path $root "build\pin\$Arch\$Configuration\pinbridge.dll"
 $expected = Join-Path $PSScriptRoot "expected_exports.txt"
 if (-not (Test-Path -LiteralPath $dll)) { throw "Missing $dll. Run Build-Pin.ps1 first." }
 if (-not (Test-Path -LiteralPath $expected)) { throw "Missing $expected. Run tools/generate_rust_bindings.py first." }

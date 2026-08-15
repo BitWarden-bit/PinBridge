@@ -21,6 +21,7 @@ use pinbridge_client::client::Client;
 use pinbridge_proto::ARCH_X64;
 use pinbridge_sys::{pb_pin_sleep, PbRegId, PB_INVALID_THREAD_ID, PB_OK, PB_REG_INVALID_};
 use pyo3::prelude::*;
+use pyo3::types::PyBytes;
 
 /// Runtime architecture id from a PING reply (x64 fallback against an agent
 /// that predates the arch extension).
@@ -1034,6 +1035,100 @@ fn pb_memory_translation_policy() -> PyResult<Option<MemoryTranslationPolicy>> {
     .ok_or_else(no_plugin)
 }
 
+/// Replaces this plugin's native instruction-byte overlays. Each tuple is
+/// (virtual_address, bytes). Active plugins may not own overlapping ranges.
+#[pyfunction(name = "code_fetch_set")]
+fn pb_code_fetch_set(segments: Vec<(u64, Vec<u8>)>) -> PyResult<u64> {
+    if current_plugin_name().is_none() {
+        return Err(no_plugin());
+    }
+    if segments.is_empty() || segments.len() > super::code_fetch::MAX_SEGMENTS {
+        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+            "code fetch segments must contain 1..={} entries",
+            super::code_fetch::MAX_SEGMENTS
+        )));
+    }
+    let total_bytes = segments
+        .iter()
+        .try_fold(0usize, |total, (_, bytes)| total.checked_add(bytes.len()))
+        .ok_or_else(|| {
+            PyErr::new::<pyo3::exceptions::PyValueError, _>("code fetch byte count overflow")
+        })?;
+    if total_bytes == 0 || total_bytes > super::code_fetch::MAX_TOTAL_BYTES {
+        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+            "code fetch policy must contain 1..={} bytes",
+            super::code_fetch::MAX_TOTAL_BYTES
+        )));
+    }
+
+    let mut segments = segments;
+    segments.sort_unstable_by_key(|segment| segment.0);
+    let mut native_segments = Vec::with_capacity(segments.len());
+    let mut previous_end = 0u64;
+    for (index, (start, bytes)) in segments.into_iter().enumerate() {
+        let end = start.checked_add(bytes.len() as u64).ok_or_else(|| {
+            PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "code fetch segment end address overflow",
+            )
+        })?;
+        if bytes.is_empty() || (index != 0 && start < previous_end) {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "code fetch segments must be non-empty and non-overlapping",
+            ));
+        }
+        previous_end = end;
+        native_segments.push(super::code_fetch::Segment { start, bytes });
+    }
+
+    let spec = super::code_fetch::Spec {
+        segments: native_segments,
+    };
+    let previous = with_current_plugin_mut(|plugin| plugin.code_fetch.replace(spec))
+        .ok_or_else(no_plugin)?;
+    match super::code_fetch::publish() {
+        Ok(generation) => Ok(generation),
+        Err(status) => {
+            with_current_plugin_mut(|plugin| plugin.code_fetch = previous);
+            super::native_policies::refresh_best_effort("rollback failed code fetch update");
+            Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+                "native code fetch update failed with status {status}; active plugin segments must not overlap"
+            )))
+        }
+    }
+}
+
+#[pyfunction(name = "code_fetch_clear")]
+fn pb_code_fetch_clear() -> PyResult<bool> {
+    let previous =
+        with_current_plugin_mut(|plugin| plugin.code_fetch.take()).ok_or_else(no_plugin)?;
+    if previous.is_none() {
+        return Ok(false);
+    }
+    match super::code_fetch::publish() {
+        Ok(_) => Ok(true),
+        Err(status) => {
+            with_current_plugin_mut(|plugin| plugin.code_fetch = previous);
+            super::native_policies::refresh_best_effort("rollback failed code fetch clear");
+            Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+                "native code fetch clear failed with status {status}"
+            )))
+        }
+    }
+}
+
+#[pyfunction(name = "code_fetch_policy")]
+fn pb_code_fetch_policy(py: Python<'_>) -> PyResult<Option<Vec<(u64, Py<PyBytes>)>>> {
+    with_current_plugin_mut(|plugin| {
+        plugin.code_fetch.as_ref().map(|spec| {
+            spec.segments
+                .iter()
+                .map(|segment| (segment.start, PyBytes::new_bound(py, &segment.bytes).unbind()))
+                .collect()
+        })
+    })
+    .ok_or_else(no_plugin)
+}
+
 /// Subscribes on_event_batch to the given event kinds (hook, mem, exec,
 /// branch, syscall, ctx, module_load, module_unload), optionally limited to
 /// an address range; batch paces the per-tick page size (default 512).
@@ -1148,6 +1243,9 @@ fn pb(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(pb_memory_translation_set, m)?)?;
     m.add_function(wrap_pyfunction!(pb_memory_translation_clear, m)?)?;
     m.add_function(wrap_pyfunction!(pb_memory_translation_policy, m)?)?;
+    m.add_function(wrap_pyfunction!(pb_code_fetch_set, m)?)?;
+    m.add_function(wrap_pyfunction!(pb_code_fetch_clear, m)?)?;
+    m.add_function(wrap_pyfunction!(pb_code_fetch_policy, m)?)?;
     m.add_function(wrap_pyfunction!(pb_watch, m)?)?;
     m.add_function(wrap_pyfunction!(pb_unsubscribe, m)?)?;
     m.add_function(wrap_pyfunction!(pb_subscribe, m)?)?;

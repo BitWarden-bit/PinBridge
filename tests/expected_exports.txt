@@ -350,6 +350,7 @@ pb_pin_exit_application
 pb_pin_exit_process
 pb_pin_exit_thread
 pb_pin_fetch_code
+pb_pin_fetch_original_code
 pb_pin_get_buffer_pointer
 pb_pin_get_context_fpstate
 pb_pin_get_context_fxsave

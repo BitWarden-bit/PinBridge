@@ -21,4 +21,11 @@ pub fn refresh_best_effort(reason: &str) {
             ));
         }
     }
+    if let Err(status) = super::code_fetch::publish() {
+        if status != PB_OK {
+            crate::log::line(&format!(
+                "code fetch policy refresh failed ({reason}) -> {status}"
+            ));
+        }
+    }
 }

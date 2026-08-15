@@ -744,6 +744,7 @@ fn exec_one(name: &str, code: Py<PyAny>, port: u16) {
             decisions: crate::new_map(),
             instrumentation: None,
             memory_translation: None,
+            code_fetch: None,
             breakpoints: crate::new_map(),
             filters: super::Filters::default(),
             cursor: 0,

@@ -40,5 +40,15 @@ int main(void)
         pb_pin_fetch_code(bytes, UINT64_C(0x2000), sizeof(bytes), 0, 0) !=
             PB_ERR_INVALID_ARGUMENT)
         return 5;
+    if (pb_pin_fetch_original_code(bytes, UINT64_C(0x3000), sizeof(bytes), 0, &copied) != PB_OK ||
+        copied != sizeof(bytes) || bytes[0] != 0x55 || bytes[3] != 0xe5)
+        return 6;
+    if (pb_pin_fetch_original_code(bytes, 0, sizeof(bytes), 0, &copied) != PB_OK || copied != 0)
+        return 7;
+    if (pb_pin_fetch_original_code(0, UINT64_C(0x3000), 1, 0, &copied) !=
+            PB_ERR_INVALID_ARGUMENT ||
+        pb_pin_fetch_original_code(bytes, UINT64_C(0x3000), sizeof(bytes), 0, 0) !=
+            PB_ERR_INVALID_ARGUMENT)
+        return 8;
     return 0;
 }

@@ -48,3 +48,13 @@ uint64_t PbBackendFetchCode(
         static_cast<size_t>(max_size),
         reinterpret_cast<EXCEPTION_INFO*>(exception_info)));
 }
+
+uint64_t PbBackendFetchOriginalCode(
+    void* copy_buffer, uint64_t address, uint64_t max_size,
+    PbExceptionInfoHandle exception_info)
+{
+    return static_cast<uint64_t>(PIN_SafeCopyEx(
+        copy_buffer, reinterpret_cast<const void*>(static_cast<uintptr_t>(address)),
+        static_cast<size_t>(max_size),
+        reinterpret_cast<EXCEPTION_INFO*>(exception_info)));
+}

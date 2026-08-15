@@ -3,9 +3,9 @@
 
 #include "pinbridge/pinbridge.h"
 
-/* ABI v1.7 identity. */
+/* ABI v1.8 identity. */
 _Static_assert(PB_ABI_VERSION_MAJOR == 1u, "ABI major must stay 1 in this snapshot");
-_Static_assert(PB_ABI_VERSION_MINOR == 7u, "ABI minor tracks v1.1..v1.7 additions");
+_Static_assert(PB_ABI_VERSION_MINOR == 8u, "ABI minor tracks v1.1..v1.8 additions");
 
 /* Status codes are part of the contract. */
 _Static_assert(PB_OK == 0, "PB_OK must be 0");

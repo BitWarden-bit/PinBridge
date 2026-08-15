@@ -27,6 +27,7 @@ use std::sync::mpsc::Sender;
 use crate::{new_map, TlsFreeMap, TlsFreeSet};
 
 pub mod api;
+mod code_fetch;
 mod decisions;
 mod events;
 mod host;
@@ -142,6 +143,9 @@ pub struct Plugin {
     /// Virtual-to-backing memory mappings compiled for Pin's process-global
     /// memory-address translation callback.
     pub memory_translation: Option<memory_translation::Spec>,
+    /// Python-provided instruction bytes served directly by the native Pin
+    /// code-fetch callback.
+    pub code_fetch: Option<code_fetch::Spec>,
     /// New-style callbacks bound to exact native breakpoint ids.  Legacy
     /// `on_bp_hit` remains separate and receives every stop notification.
     pub breakpoints: TlsFreeMap<u32, subscriptions::BreakpointSubscription>,

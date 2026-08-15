@@ -3,8 +3,8 @@
 use core::ffi::{c_char, c_void};
 
 pub const PB_ABI_VERSION_MAJOR: u32 = 1;
-pub const PB_ABI_VERSION_MINOR: u32 = 7;
-pub const PB_ABI_VERSION: u32 = 65543;
+pub const PB_ABI_VERSION_MINOR: u32 = 8;
+pub const PB_ABI_VERSION: u32 = 65544;
 pub const PB_TRI_YES: PbTri = 0;
 pub const PB_TRI_NO: PbTri = 1;
 pub const PB_TRI_MAYBE: PbTri = 2;
@@ -2139,6 +2139,7 @@ unsafe extern "C" {
     pub fn pb_pin_add_xed_decode_callback_function(callback: PbXedDecodeCallback, user_data: *mut c_void) -> PbStatus;
     pub fn pb_pin_add_fetch_function(callback: PbFetchCallback, user_data: *mut c_void) -> PbStatus;
     pub fn pb_pin_fetch_code(copy_buffer: *mut c_void, address: u64, max_size: u64, exception_info: PbExceptionInfoHandle, out_copied: *mut u64) -> PbStatus;
+    pub fn pb_pin_fetch_original_code(copy_buffer: *mut c_void, address: u64, max_size: u64, exception_info: PbExceptionInfoHandle, out_copied: *mut u64) -> PbStatus;
     pub fn pb_pin_add_internal_exception_handler(callback: PbInternalExceptionCallback, user_data: *mut c_void, out_callback: *mut PbCallbackHandle) -> PbStatus;
     pub fn pb_pin_try_start(thread_id: PbThreadId, callback: PbInternalExceptionCallback, user_data: *mut c_void, out_scope: *mut PbCallbackHandle) -> PbStatus;
     pub fn pb_pin_try_end(thread_id: PbThreadId, scope: *mut PbCallbackHandle) -> PbStatus;

@@ -171,6 +171,17 @@ Pin 插桩回调和分析回调在原生层执行种类、范围和线程过滤�
 一次访存必须完整落在源区间内才转换，跨界访问保持原地址。默认不转换 Pin 自身访问；
 原子读改写按 `store` 分类。规则发布后，原生层让所选指令范围重新 JIT，并用两个 Pin 工具
 寄存器承接转换结果、改写应用的真实内存操作数。热路径不运行 Python。
+- `pb.code_fetch_set(segments) -> generation`：替换当前插件预置的机器码段。每项是
+  `(virtual_address, bytes)`；发布后旧、新范围的 Pin 翻译缓存立即失效。
+- `pb.code_fetch_policy() -> [(virtual_address, bytes), ...] | None`：读取当前插件策略。
+- `pb.code_fetch_clear() -> bool`：移除当前插件的机器码段，不影响其他插件。
+
+机器码段在插件内部和所有运行插件之间都不得重叠；合计最多 64 段、1 MiB。Pin 取码
+回调命中段时直接复制不可变原生快照，未命中部分通过 `PIN_SafeCopyEx` 语义读取原应用
+字节；热路径不运行 Python、不分配、不加锁。插件卸载或进入 error 状态时自动撤销其段。
+取码器只在第一次非空策略时注册，但 Pin 没有注销接口；此后 `clear` 是全量原始取码透传。
+自定义取码器启用后 Pin 不再保证自动发现全部 SMC，平台只自动失效本 API 更新涉及的
+范围；目标自行改写的其他代码需要脚本显式重新发布策略。
 
 轨迹录制（.pbtr，见 docs/taint-roadmap.md 第 2 层；与 64K 主环相互独立）:
 - `pb.trace_start(path, kinds=None, range=None) -> bool`;kinds 名映射到录制档：
@@ -452,3 +463,7 @@ decision_id = pb.intercept(
 地址转换真实回归入口为 `fixtures/memory_translation_python_demo/run.ps1`：Python 把源
 变量映射到 backing 变量，只允许指定函数的 `load`；目标输出同时证明映射读取已生效、
 未匹配的物理访问仍留在源地址。
+
+机器码取码真实回归入口为 `fixtures/code_fetch_python_demo/run.ps1`：目标先执行并缓存返回
+`1` 的原函数，握手后 Python 预置另一函数的字节，第二次调用返回 `2`，同时覆盖运行期
+注册、旧翻译失效、不可变原生快照和未映射地址安全回退。

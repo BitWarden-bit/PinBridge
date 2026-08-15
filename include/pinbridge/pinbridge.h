@@ -28,7 +28,7 @@ extern "C" {
 #endif
 
 #define PB_ABI_VERSION_MAJOR 1u
-#define PB_ABI_VERSION_MINOR 7u
+#define PB_ABI_VERSION_MINOR 8u
 #define PB_ABI_VERSION ((PB_ABI_VERSION_MAJOR << 16u) | PB_ABI_VERSION_MINOR)
 
 typedef int32_t PbStatus;
@@ -1501,6 +1501,11 @@ PB_API PbStatus PB_CALL pb_pin_add_xed_decode_callback_function(
 PB_API PbStatus PB_CALL pb_pin_add_fetch_function(
     PbFetchCallback callback, void* user_data);
 PB_API PbStatus PB_CALL pb_pin_fetch_code(
+    void* copy_buffer, uint64_t address, uint64_t max_size,
+    PbExceptionInfoHandle exception_info, uint64_t* out_copied);
+/* ABI v1.8: raw fallback for use inside PbFetchCallback. Unlike
+   pb_pin_fetch_code, this never invokes the registered fetch callback. */
+PB_API PbStatus PB_CALL pb_pin_fetch_original_code(
     void* copy_buffer, uint64_t address, uint64_t max_size,
     PbExceptionInfoHandle exception_info, uint64_t* out_copied);
 PB_API PbStatus PB_CALL pb_pin_add_internal_exception_handler(
