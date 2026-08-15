@@ -166,8 +166,10 @@ impl EventSelector {
     pub fn is_priority(self) -> bool {
         matches!(
             self,
-            Self::ProcessExit
+            Self::Exception
+                | Self::ProcessExit
                 | Self::ProcessPrepareFini
+                | Self::Kind(EVENT_CONTEXT_CHANGE)
                 | Self::Kind(EVENT_THREAD_START)
                 | Self::Kind(EVENT_THREAD_EXIT)
                 | Self::Kind(EVENT_PROCESS_START)
@@ -191,7 +193,10 @@ impl EventSelector {
         !self.is_priority()
             || matches!(
                 self,
-                Self::Kind(EVENT_MODULE_LOAD) | Self::Kind(EVENT_MODULE_UNLOAD)
+                Self::Exception
+                    | Self::Kind(EVENT_CONTEXT_CHANGE)
+                    | Self::Kind(EVENT_MODULE_LOAD)
+                    | Self::Kind(EVENT_MODULE_UNLOAD)
             )
     }
 
@@ -212,9 +217,10 @@ pub struct EventSubscription {
     /// Latest allocation-failure occurrence delivered from either the
     /// priority ring or the emergency latest-value slot.
     pub oom_generation: u64,
-    /// Latest native module edge delivered from either the high-priority or
-    /// compatibility ring.
-    pub module_generation: u64,
+    /// Latest mirrored module/exception edge delivered from either the
+    /// high-priority or compatibility ring. A selector belongs to at most one
+    /// of these generation domains.
+    pub mirror_generation: u64,
 }
 
 impl EventSubscription {
@@ -227,11 +233,16 @@ impl EventSubscription {
         } else {
             0
         };
-        let module_generation = if matches!(
+        let mirror_generation = if matches!(
             selector,
             EventSelector::Kind(EVENT_MODULE_LOAD) | EventSelector::Kind(EVENT_MODULE_UNLOAD)
         ) {
             crate::modules::generation()
+        } else if matches!(
+            selector,
+            EventSelector::Exception | EventSelector::Kind(EVENT_CONTEXT_CHANGE)
+        ) {
+            crate::exception::generation()
         } else {
             0
         };
@@ -244,7 +255,7 @@ impl EventSubscription {
                 order: id,
                 sticky_delivered: false,
                 oom_generation,
-                module_generation,
+                mirror_generation,
             },
         )
     }
@@ -273,6 +284,15 @@ pub fn unseen_oom_occurrence(last_delivered: u64, event: &EventRecord) -> Option
 /// consume both copies exactly once per handler.
 pub fn unseen_module_generation(last_delivered: u64, event: &EventRecord) -> Option<u64> {
     (matches!(event.kind, EVENT_MODULE_LOAD | EVENT_MODULE_UNLOAD)
+        && event.arg3 != 0
+        && event.arg3 > last_delivered)
+        .then_some(event.arg3)
+}
+
+/// Returns the generation carried by a new mirrored exception edge.
+pub fn unseen_exception_generation(last_delivered: u64, event: &EventRecord) -> Option<u64> {
+    (event.kind == EVENT_CONTEXT_CHANGE
+        && event.arg0 == CONTEXT_CHANGE_EXCEPTION
         && event.arg3 != 0
         && event.arg3 > last_delivered)
         .then_some(event.arg3)
@@ -316,6 +336,13 @@ pub fn build_event_dict(
             row.set_item("reason", event.arg0)?;
             row.set_item("code", event.arg1)?;
             row.set_item("ip", event.arg2)?;
+            row.set_item("exception_generation", event.arg3)?;
+        }
+        EventSelector::Kind(EVENT_CONTEXT_CHANGE) => {
+            row.set_item("reason", event.arg0)?;
+            row.set_item("info", event.arg1 as i64)?;
+            row.set_item("ip", event.arg2)?;
+            row.set_item("exception_generation", event.arg3)?;
         }
         EventSelector::Kind(EVENT_THREAD_START) => {
             row.set_item("ip", event.address)?;
@@ -445,11 +472,6 @@ pub fn build_event_dict(
                 row.set_item("errno", event.arg4)?;
             }
         }
-        EventSelector::Kind(EVENT_CONTEXT_CHANGE) => {
-            row.set_item("reason", event.arg0)?;
-            row.set_item("info", event.arg1 as i64)?;
-            row.set_item("ip", event.arg2)?;
-        }
         EventSelector::Kind(EVENT_MEMORY) => {
             row.set_item("memory_address", event.arg0)?;
             row.set_item("size", event.arg1)?;
@@ -523,6 +545,11 @@ mod tests {
         assert!(EventSelector::ProcessPrepareFini.is_priority());
         assert!(EventSelector::ProcessExit.is_sticky());
         assert!(EventSelector::ProcessPrepareFini.is_sticky());
+        for name in ["exception", "context.change"] {
+            let selector = EventSelector::parse(name).expect("context selector");
+            assert!(selector.is_priority());
+            assert!(selector.uses_compatibility_ring());
+        }
         for name in ["module.load", "module.unload"] {
             let selector = EventSelector::parse(name).expect("module selector");
             assert!(selector.is_priority());
@@ -630,5 +657,30 @@ mod tests {
             ..ring_copy
         };
         assert_eq!(unseen_module_generation(11, &unload), Some(12));
+    }
+
+    #[test]
+    fn exception_generation_deduplicates_priority_and_compatibility_records() {
+        let priority_copy = EventRecord {
+            kind: EVENT_CONTEXT_CHANGE,
+            arg0: CONTEXT_CHANGE_EXCEPTION,
+            arg1: 0xc000_0005,
+            arg3: 21,
+            ..EventRecord::default()
+        };
+        assert_eq!(unseen_exception_generation(20, &priority_copy), Some(21));
+
+        let ring_copy = EventRecord {
+            sequence: 700,
+            ..priority_copy
+        };
+        assert_eq!(unseen_exception_generation(21, &ring_copy), None);
+
+        let non_exception = EventRecord {
+            arg0: 1,
+            arg3: 0,
+            ..ring_copy
+        };
+        assert_eq!(unseen_exception_generation(21, &non_exception), None);
     }
 }

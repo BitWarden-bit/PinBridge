@@ -168,6 +168,8 @@ pub struct Plugin {
     /// Last module edge delivered to the legacy fixed module callbacks. Named
     /// subscriptions keep their own generation so both APIs may coexist.
     pub module_generation: u64,
+    /// Last mirrored exception delivered to the legacy on_exception callback.
+    pub exception_generation: u64,
     pub last_stop_gen: u64,
     /// Separate edge cursor for bound breakpoint callbacks.  It must not
     /// share `last_stop_gen`: a plugin may use both the new handler and the

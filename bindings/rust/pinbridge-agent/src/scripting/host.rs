@@ -752,6 +752,7 @@ fn exec_one(name: &str, code: Py<PyAny>, port: u16) {
             cursor: 0,
             priority_cursor: 0,
             module_generation: 0,
+            exception_generation: 0,
             last_stop_gen: 0,
             last_breakpoint_gen: 0,
             delivered: 0,
@@ -823,6 +824,7 @@ fn exec_one(name: &str, code: Py<PyAny>, port: u16) {
                 p.cursor = cursor;
                 p.priority_cursor = priority_cursor;
                 p.module_generation = crate::modules::generation();
+                p.exception_generation = crate::exception::generation();
                 p.last_stop_gen = gen;
             }
         });
@@ -876,7 +878,8 @@ fn consumes_ring(p: &Plugin) -> bool {
 }
 
 fn consumes_priority(p: &Plugin) -> bool {
-    p.on_module_load.is_some()
+    p.on_exception.is_some()
+        || p.on_module_load.is_some()
         || p.on_module_unload.is_some()
         || p
             .events
@@ -1393,13 +1396,14 @@ struct EventHandlerSnapshot {
     order: u64,
     sticky_delivered: bool,
     oom_generation: u64,
-    module_generation: u64,
+    mirror_generation: u64,
 }
 
 struct DispatchSnapshot {
     cursor: u64,
     priority_cursor: u64,
     module_generation: u64,
+    exception_generation: u64,
     last_stop_gen: u64,
     on_exception: Option<Py<PyAny>>,
     on_syscall: Option<Py<PyAny>>,
@@ -1432,7 +1436,7 @@ fn dispatch_one(py: Python<'_>, name: &str, shared: &TickShared) {
                 order: subscription.order,
                 sticky_delivered: subscription.sticky_delivered,
                 oom_generation: subscription.oom_generation,
-                module_generation: subscription.module_generation,
+                mirror_generation: subscription.mirror_generation,
             })
             .collect();
         event_handlers.sort_by_key(|handler| handler.order);
@@ -1440,6 +1444,7 @@ fn dispatch_one(py: Python<'_>, name: &str, shared: &TickShared) {
             cursor: plugin.cursor,
             priority_cursor: plugin.priority_cursor,
             module_generation: plugin.module_generation,
+            exception_generation: plugin.exception_generation,
             last_stop_gen: plugin.last_stop_gen,
             on_exception: plugin.on_exception.as_ref().map(|c| c.clone_ref(py)),
             on_syscall: plugin.on_syscall.as_ref().map(|c| c.clone_ref(py)),
@@ -1682,6 +1687,7 @@ fn dispatch_one(py: Python<'_>, name: &str, shared: &TickShared) {
             p.cursor = s.cursor;
             p.priority_cursor = s.priority_cursor;
             p.module_generation = p.module_generation.max(s.module_generation);
+            p.exception_generation = p.exception_generation.max(s.exception_generation);
             p.last_stop_gen = s.last_stop_gen;
             p.delivered += delivered;
             p.dropped += dropped;
@@ -1695,9 +1701,9 @@ fn dispatch_one(py: Python<'_>, name: &str, shared: &TickShared) {
                     subscription.oom_generation = subscription
                         .oom_generation
                         .max(handler.oom_generation);
-                    subscription.module_generation = subscription
-                        .module_generation
-                        .max(handler.module_generation);
+                    subscription.mirror_generation = subscription
+                        .mirror_generation
+                        .max(handler.mirror_generation);
                 }
             }
             for id in &remove_event_handlers {
@@ -1752,16 +1758,30 @@ fn route_named_handlers(
         }
         if matches!(
             handler.selector,
+            EventSelector::Exception | EventSelector::Kind(EVENT_CONTEXT_CHANGE)
+        ) && event.kind == EVENT_CONTEXT_CHANGE
+            && event.arg0 == CONTEXT_CHANGE_EXCEPTION
+            && event.arg3 != 0
+        {
+            let Some(generation) =
+                events::unseen_exception_generation(handler.mirror_generation, event)
+            else {
+                continue;
+            };
+            handler.mirror_generation = generation;
+        }
+        if matches!(
+            handler.selector,
             EventSelector::Kind(EVENT_MODULE_LOAD) | EventSelector::Kind(EVENT_MODULE_UNLOAD)
         ) && matches!(event.kind, EVENT_MODULE_LOAD | EVENT_MODULE_UNLOAD)
             && event.arg3 != 0
         {
             let Some(generation) =
-                events::unseen_module_generation(handler.module_generation, event)
+                events::unseen_module_generation(handler.mirror_generation, event)
             else {
                 continue;
             };
-            handler.module_generation = generation;
+            handler.mirror_generation = generation;
         }
 
         if handler.selector.is_sticky() {
@@ -1813,6 +1833,14 @@ fn route_event(
 ) -> bool {
     let result: Option<Result<(), String>> = match event.kind {
         EVENT_CONTEXT_CHANGE if event.arg0 == CONTEXT_CHANGE_EXCEPTION => {
+            if event.arg3 != 0 {
+                let Some(generation) =
+                    events::unseen_exception_generation(s.exception_generation, event)
+                else {
+                    return false;
+                };
+                s.exception_generation = generation;
+            }
             let code = event.arg1 as u32;
             match (&s.on_exception, &s.exc_codes) {
                 (Some(callback), codes) if codes.as_ref().map_or(true, |c| c.contains(&code)) => {
@@ -1821,6 +1849,7 @@ fn route_event(
                     let _ = dict.set_item("code", event.arg1);
                     let _ = dict.set_item("rip", event.arg2);
                     let _ = dict.set_item("reason", event.arg0);
+                    let _ = dict.set_item("exception_generation", event.arg3);
                     Some(
                         callback
                             .call1(py, (dict,))

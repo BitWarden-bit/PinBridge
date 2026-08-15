@@ -1,16 +1,22 @@
 //! Context-change events and the exception pause policy.
-//! Every context change lands in the main ring; when the policy matches an
-//! exception, the breaker is asked to stop the application.
+//! Every context change lands in the compatibility ring. True exception
+//! edges are also mirrored into the high-priority ring with one generation
+//! so Python observation survives telemetry floods without duplicate calls.
 
 use crate::event::{Event, EVENT_CONTEXT_CHANGE};
 use crate::ring::submit;
 use core::ffi::c_void;
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use pinbridge_sys::*;
 
 static POLICY_ENABLED: AtomicBool = AtomicBool::new(false);
 static POLICY_CODE: AtomicU32 = AtomicU32::new(0); // 0 = any exception code
 static PENDING: AtomicBool = AtomicBool::new(false);
+static EXCEPTION_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+pub fn generation() -> u64 {
+    EXCEPTION_GENERATION.load(Ordering::Acquire)
+}
 
 pub fn set_policy(enabled: bool, code: u32) {
     POLICY_CODE.store(code, Ordering::Relaxed);
@@ -36,25 +42,26 @@ unsafe extern "C" fn on_context_change(
 ) {
     let mut rip: u64 = 0;
     pb_pin_get_context_reg(from, crate::arch::instr_ptr_reg(), &mut rip);
-    submit(Event {
+    let exception_generation = if reason == PB_CONTEXT_CHANGE_REASON_EXCEPTION {
+        EXCEPTION_GENERATION.fetch_add(1, Ordering::AcqRel) + 1
+    } else {
+        0
+    };
+    let event = Event {
         kind: EVENT_CONTEXT_CHANGE,
         thread_id,
         address: rip,
         arg0: reason as u64,
         arg1: info as i64 as u64,
         arg2: rip,
-        ..Event::EMPTY
-    });
-    let trace_event = Event {
-        kind: EVENT_CONTEXT_CHANGE,
-        thread_id,
-        address: rip,
-        arg0: reason as u64,
-        arg1: info as i64 as u64,
-        arg2: rip,
+        arg3: exception_generation,
         ..Event::EMPTY
     };
-    crate::record::submit_global(from, trace_event);
+    if exception_generation != 0 {
+        crate::priority::submit(event);
+    }
+    submit(event);
+    crate::record::submit_global(from, event);
 
     if reason == PB_CONTEXT_CHANGE_REASON_EXCEPTION {
         if let Some(response) = crate::sync_intercept::decide_exception(

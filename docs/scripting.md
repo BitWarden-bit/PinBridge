@@ -84,7 +84,7 @@ kinds 合法值:`hook`/`hook_regs`、`mem`/`memory`、`exec`、`branch`/`branch_
 | 回调 | 触发 | 参数 |
 |---|---|---|
 | `pb_init()` | 顶层跑完之后 | 无 |
-| `on_exception(evt)` | context_change 异常事件 | `{tid, code, rip, reason}` |
+| `on_exception(evt)` | context_change 异常事件 | `{tid, code, rip, reason, exception_generation}` |
 | `on_syscall(evt)` | syscall 引擎事件 | `{number, phase, tid, args[6], retval}`(phase 0=entry 带六参,1=exit 带 retval) |
 | `on_bp_hit(evt)` | 断点命中停下 | `{tid, addr, id}` |
 | `on_module_load(evt)` | 镜像加载 | `{base, end, is_main, name, module_generation}` |
@@ -105,7 +105,7 @@ kinds 合法值:`hook`/`hook_regs`、`mem`/`memory`、`exec`、`branch`/`branch_
 | 3 | exec | 指令地址 | — | — | — | — | — |
 | 4 | branch_edge | 指令地址 | target | taken | — | — | — |
 | 5 | syscall | — | number | phase(0=entry,1=exit) | entry:arg0 | entry:arg1 / exit:retval | entry:arg2..arg5 / exit:a4=errno |
-| 6 | context_change | 异常 IP | reason(4=异常) | info(异常码) | ip | — | — |
+| 6 | context_change | 异常 IP | reason(4=异常) | info(异常码) | ip | exception_generation（非异常为 0） | — |
 | 7 | module_load | base | base | end | is_main | module_generation | — |
 | 8 | module_unload | base | base | — | — | module_generation | — |
 
@@ -300,9 +300,9 @@ VMP 系保护壳把自己的异常导向 SEH 处理；经典解法是掐 `KiUser
 
 1. **python 就绪竞态**：脚本功能约在端口绑定后 ~1s 才可用（预加载 + 解释器初始化在脚本
    线程上异步完成）;`script run` 报 "python unavailable" 时重试即可。
-2. **部分稀有类事件仍走普通环**：生命周期、模块加载/卸载、SMC、Pin 分离/附加和内存不足
-   已经接入独立 4096 槽高优先级环；异常和系统调用观察仍可能被默认引擎洪流
-   （~100 万 exec/s）挤出 64K 普通环。等异常/syscall 时关掉用不到的引擎
+2. **部分事件仍只走普通环**：生命周期、模块加载/卸载、异常边沿、SMC、Pin 分离/附加和
+   内存不足已经接入独立 4096 槽高优先级环；系统调用观察和非异常 context change 仍可能
+   被默认引擎洪流（~100 万 exec/s）挤出 64K 普通环。等 syscall 时关掉用不到的引擎
    （`engine 2 off; engine 3 off; engine 4 off`)——`tests/control_e2e.py` 就是这么做的。
 3. **异常码符号扩展**:`on_exception` 的 `code` 到达时是符号扩展的 64 位值
    （如 `0xFFFFFFFFC0000005`)，用前掩到 u32(`code & 0xFFFFFFFF`)。
@@ -355,6 +355,8 @@ pb.off(subscription_id)
 | `thread.exit` | `ip`, `exit_code` | 退出码按有符号 64 位值提供 |
 | `module.load` | `base`, `end`, `is_main`, `name`, `module_generation` | 高优先级环和兼容普通环双写；同一原生代号对每个处理函数只投递一次 |
 | `module.unload` | `base`, `name`, `module_generation` | 与加载事件共享单调递增的原生代号；真实 DLL 卸载回归已覆盖 |
+| `exception` | `reason`, `code`, `ip`, `exception_generation` | 异常边沿向高优先级环和兼容普通环双写；命名回调与旧固定回调各自去重 |
+| `context.change` | `reason`, `info`, `ip`, `exception_generation` | 异常原因携带非零代号并双写；其他上下文切换仍只走普通环，代号为 0 |
 | `code.smc` | `trace_start`, `trace_end` | 第一次订阅时才启用 Pin 的 SMC 跟踪 |
 | `memory.oom` | `requested_size`, `occurrence`, `recovered_from_emergency_slot` | 原生先追加 `pinbridge_oom.log`，存活时再通知 Python；`recovered_from_emergency_slot=True` 表示普通高优先级环未作为唯一投递来源 |
 | `pin.internal_exception` | `ip`, `code`, `exception_address`, `fault_address`, `fault_address_known`, `access_type`, `exception_class` | 先写原生崩溃记录；只有 Pin 仍存活时 Python 才可能收到 |
@@ -378,11 +380,14 @@ Python；退出交接也只有有界确认等待。Python 处理函数统一在�
 启动前用 `PINBRIDGE_SCRIPT_EXIT_GRACE_MS=0..5000` 调整；正常路径最坏合计为两倍该值。
 超时后原生层无条件继续退出，Python 故障不会把被分析进程永久卡在结束阶段。
 
-上述生命周期、模块加载/卸载、SMC、Pin 分离/附加、内存不足、Pin 内部异常和调试器事件使用独立 4096 槽高优先级环，先于
+上述生命周期、模块加载/卸载、异常边沿、SMC、Pin 分离/附加、内存不足、Pin 内部异常和调试器事件使用独立 4096 槽高优先级环，先于
 普通遥测派发。生产回调只执行固定记录和 try-lock，不调用 Python；仅上述退出交接使用
 有上限的确认等待。
 模块事件仍同步写入普通环，保持 CLI/UI 和旧 `on_event_batch` 兼容；两份记录携带同一个
 `module_generation`，命名回调和旧固定回调各自去重，不会因为双写而调用两次 Python。
+异常边沿采用相同的兼容设计，两份记录携带同一个 `exception_generation`。每个
+`pb.on("exception")`、`pb.on("context.change")` 处理函数和旧 `on_exception` 回调分别保存
+自己的已投递代号，所以三种 API 可以同时使用而不会互相吞事件或各自收到双份事件。
 内存不足另有不分配 Rust 堆、不加锁的紧急路径：先用预先转换好的固定文件名追加
 `pinbridge_oom.log`，再发布一个原子保底槽并尝试写高优先级环。脚本宿主先处理当次可用的
 环记录，缺失时读取保底槽，并按 `occurrence` 去重迟到的环记录，因此同一次原生回调只调用一次 Python。并发 OOM
@@ -510,7 +515,8 @@ decision_id = pb.intercept(
 
 直接把 `rip/eip` 改到函数入口不等同于执行一次 `call`，栈布局仍由脚本负责。真实 x64
 回归 `fixtures/exception_python_demo/run.ps1` 触发访问违规，回调根据 `from_registers`
-构造 Win64 栈并改写 `rip/rsp`，目标跳到恢复入口、绕过原生 SEH 处理器并以 0 退出。
+构造 Win64 栈并改写 `rip/rsp`，目标跳到恢复入口、绕过原生 SEH 处理器并以 0 退出；同一
+回归还验证 `pb.on("exception")`、`pb.on("context.change")` 和旧 `on_exception` 各精确一次。
 
 ### 同步调试器事件
 

@@ -23,7 +23,7 @@ Python 是分析平台的控制面：脚本负责注册事件、设置过滤条�
 
 ### 高优先级通知
 
-进程/线程/模块生命周期、动态代码修改等低频事件进入独立的高优先级队列。原生回调只复制固定大小的数据，Python 随后处理；只有退出前的两阶段交接使用有上限的确认等待，其余异步事件不在 Pin 回调线程等待 Python。普通异常观察仍保留在兼容遥测环，同步异常接管则使用独立固定槽。
+进程/线程/模块生命周期、异常边沿、动态代码修改等低频事件进入独立的高优先级队列。原生回调只复制固定大小的数据，Python 随后处理；只有退出前的两阶段交接使用有上限的确认等待，其余异步事件不在 Pin 回调线程等待 Python。异常观察同时保留兼容遥测记录并按原生代号去重，同步异常接管则使用独立固定槽。
 
 ### 普通遥测
 
@@ -170,7 +170,7 @@ PrepareForFini 确实到达。真正的 PrepareForFini/Fini 只设置原生状�
 ## 已完成：高优先级事件通道
 
 第三阶段增加了独立于 64K 遥测环的 4096 槽高优先级环。进程/线程/模块生命周期、
-`code.smc`、`pin.detach`、`pin.attach`、`memory.oom`、`pin.internal_exception` 和三类调试器事件使用自己的游标，脚本宿主每个
+异常边沿、`code.smc`、`pin.detach`、`pin.attach`、`memory.oom`、`pin.internal_exception` 和三类调试器事件使用自己的游标，脚本宿主每个
 节拍先处理高优先级记录，再处理断点和普通遥测。因此指令或内存事件洪流不会再把这些
 记录从普通环中挤掉。
 
@@ -182,6 +182,12 @@ PrepareForFini 确实到达。真正的 PrepareForFini/Fini 只设置原生状�
 POD 记录共享 `module_generation`；每个 `pb.on` 处理函数以及旧固定模块回调分别保存自己的
 已投递代号，因此两种 Python API 可以共存，而同一个 API 不会收到双份事件。真实 Pin
 回归会加载并卸载专用 DLL，验证名称解析、加载/卸载字段和两类事件各精确一次。
+
+异常边沿同样写入高优先级环和兼容普通环，两份 POD 记录共享单调递增的
+`exception_generation`。`pb.on("exception")`、`pb.on("context.change")` 的每个处理函数与
+旧 `on_exception` 分别持有去重游标，因而可以同时观察同一次异常，并且各自只回调一次。
+非异常上下文切换仍只写普通环。真实 x64 Pin 回归触发访问违规并验证三类观察接口各精确
+一次，同时由独立同步通道改写 `rip/rsp` 后成功恢复目标进程。
 
 `memory.oom` 在高优先级环之外还有两层专用保障。原生回调首先以固定栈缓冲和原始 Win32
 写入追加 `pinbridge_oom.log`，这条路径不进行 Rust 堆分配、不获取锁，文件名也已在正常
@@ -524,6 +530,7 @@ pb.instrumentation_set(
 | 子进程跟随决策 | `pb.intercept("child.follow", ...)` | 已完成，跟随/不跟随真实 Pin 测试通过；子进程独立控制端口待开发 |
 | Hook 同步决定 | `pb.intercept("hook.entry/return", ..., address=...)` | 已完成，入口跳过/返回值改写真实 Pin 测试通过 |
 | 系统调用同步决定 | `pb.intercept("syscall.entry/exit", ..., numbers=...)` | 已完成，入口参数/出口返回值真实 Pin 测试通过 |
+| 异常观察 | `pb.on("exception", ...)` / `pb.on("context.change", ...)` / `on_exception` | 高优先级/兼容环双写和逐处理函数去重完成，三类接口真实 Pin 测试各精确一次 |
 | 异常同步决定 | `pb.intercept("exception.handle", ..., codes=...)` | 已完成，异常现场读取/目标上下文改写真实 Pin 测试通过 |
 | 调试器事件观察 | `pb.on("debugger.breakpoint/single_step/async_break", ...)` | 已完成，三类 Pin 回调进入高优先级队列；附加调试器交互测试待独立环境 |
 | 调试器同步决定 | `pb.intercept("debugger.breakpoint/single_step/async_break", ...)` | 已完成，支持去向决定和寄存器改写，强制执行 Pin 的异步中断/IP 限制；ABI 与 Rust 测试通过 |

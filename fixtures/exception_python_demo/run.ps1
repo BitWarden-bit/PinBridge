@@ -94,7 +94,14 @@ try {
     if (-not $pinProcess.HasExited) { throw "target did not exit" }
     [void]$pinProcess.WaitForExit()
     if (Test-Path -LiteralPath $log) { $captured += "`n" + (Get-Content -LiteralPath $log -Raw) }
-    foreach ($marker in @("EXCEPTION_INTERCEPT_READY", "EXCEPTION_HANDLE_PASS")) {
+    foreach ($marker in @(
+        "EXCEPTION_INTERCEPT_READY",
+        "EXCEPTION_HANDLE_PASS",
+        "EXCEPTION_OBSERVE_NAMED",
+        "EXCEPTION_OBSERVE_CONTEXT",
+        "EXCEPTION_OBSERVE_LEGACY",
+        "EXCEPTION_OBSERVE_COUNTS named=1 context=1 legacy=1"
+    )) {
         if (-not $captured.Contains($marker)) { throw "missing callback marker: $marker" }
     }
     $targetOutput = $stdoutTask.Result.Trim()
@@ -109,6 +116,9 @@ try {
         result = "EXCEPTION_PYTHON_INTERCEPT_PASS"
         target_exit = $pinProcess.ExitCode
         decisions = 1
+        named_observer_exact_once = $true
+        context_observer_exact_once = $true
+        legacy_observer_exact_once = $true
         native_handler_bypassed = $true
         target_output = $targetOutput
     } | ConvertTo-Json -Depth 3

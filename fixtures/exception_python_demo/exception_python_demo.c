@@ -16,6 +16,8 @@ int main(void)
     if (setjmp(g_recovery) != 0) {
         printf("exception_python_demo: RECOVERED\n");
         fflush(stdout);
+        /* Let asynchronous Python observers drain the mirrored exception. */
+        Sleep(750);
         return 0;
     }
     /* Give the runner time to load the Python interceptor. */

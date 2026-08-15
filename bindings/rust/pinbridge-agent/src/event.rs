@@ -14,7 +14,8 @@ pub const EVENT_EXEC: u32 = 3;
 pub const EVENT_BRANCH_EDGE: u32 = 4;
 /// Syscall entry (number + 6 args) / exit (number + return + errno).
 pub const EVENT_SYSCALL: u32 = 5;
-/// Pin context-change notification (reason + info + ip).
+/// Pin context-change notification (arg0=reason, arg1=info, arg2=ip;
+/// exception edges additionally carry arg3=exception generation).
 pub const EVENT_CONTEXT_CHANGE: u32 = 6;
 /// Image loaded (arg0=low, arg1=high, arg2=is_main, arg3=generation;
 /// address=low).
