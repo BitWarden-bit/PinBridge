@@ -528,7 +528,7 @@ fn pb_event_names() -> Vec<&'static str> {
 /// native event waits for a bounded time and consumes the callback result.
 #[pyfunction(
     name = "intercept",
-    signature = (event, callback, *, once=false, address=None, thread_id=None)
+    signature = (event, callback, *, once=false, address=None, thread_id=None, numbers=None)
 )]
 fn pb_intercept(
     py: Python<'_>,
@@ -537,6 +537,7 @@ fn pb_intercept(
     once: bool,
     address: Option<u64>,
     thread_id: Option<u32>,
+    numbers: Option<Vec<u64>>,
 ) -> PyResult<u64> {
     if current_plugin_name().is_none() {
         return Err(no_plugin());
@@ -551,7 +552,17 @@ fn pb_intercept(
             "unknown interceptor {event:?}; use pb.decision_names() to list supported names"
         ))
     })?;
+    let number_filter = numbers.map(|numbers| {
+        let mut filter = crate::new_set();
+        filter.extend(numbers.into_iter().map(|number| number as u32));
+        filter
+    });
     let created_hook = if selector.is_hook() {
+        if number_filter.is_some() {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "Hook interceptors do not accept numbers",
+            ));
+        }
         let address = address.filter(|address| *address != 0).ok_or_else(|| {
             PyErr::new::<pyo3::exceptions::PyValueError, _>(
                 "hook interceptor requires a non-zero address",
@@ -563,16 +574,29 @@ fn pb_intercept(
             )
         })?;
         Some((address, !existing.contains(&address)))
-    } else {
-        if address.is_some() || thread_id.is_some() {
+    } else if selector == DecisionSelector::ChildFollow {
+        if address.is_some() || thread_id.is_some() || number_filter.is_some() {
             return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                "child.follow does not accept address or thread_id",
+                "child.follow does not accept address, thread_id, or numbers",
+            ));
+        }
+        None
+    } else {
+        if address.is_some() {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "syscall interceptors do not accept address",
             ));
         }
         None
     };
-    let (id, subscription) =
-        DecisionSubscription::new(selector, callback, once, address, thread_id);
+    let (id, subscription) = DecisionSubscription::new(
+        selector,
+        callback,
+        once,
+        address,
+        thread_id,
+        number_filter,
+    );
     with_current_plugin_mut(|plugin| plugin.decisions.insert(id, subscription))
         .ok_or_else(no_plugin)?;
     super::host::publish_decision_interests();

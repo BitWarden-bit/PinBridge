@@ -316,7 +316,7 @@ def pb_init():
 
 - `pb.intercept(name, callback, once=False) -> decision_id`：注册当前插件拥有的同步处理函数；
 - `pb.unintercept(decision_id) -> bool`：删除当前插件的同步处理函数；
-- `pb.decision_names() -> list[str]`：当前返回 `["child.follow"]`；
+- `pb.decision_names() -> list[str]`：返回所有同步决定名；
 - 回调返回 `bool` 或 `{"follow": bool}`；多处理函数采用“全部同意才跟随”；
 - 事件字段为 `type`、`generation`、`process_id`/`pid`、`argv` 和 `argv_bytes`；
 - 默认等待上限为 2000ms，可用 `PINBRIDGE_SCRIPT_DECISION_TIMEOUT_MS=1..10000` 调整；
@@ -361,3 +361,30 @@ Hook 集合中的对应点；订阅卸载时按所有权计数释放。返回字
 脚本线程。槽满、超时、Python 不可用、返回结构错误或多插件补丁冲突时继续原上下文。
 决定回调里 `pb.print` 可用，普通 `pb.*` 目标 RPC 会快速失败。真实回归入口为
 `fixtures/hook_python_demo/run.ps1`，同时验证入口跳过和返回值修改。
+
+### 同步系统调用
+
+```python
+def before(event):
+    args = list(event["arguments"])
+    args[0] = 0
+    return {"arguments": args}
+
+entry_id = pb.intercept("syscall.entry", before, numbers=[0x0F], once=True)
+
+def after(event):
+    return {"return_value": 0xC0000022, "errno": 0}
+
+exit_id = pb.intercept("syscall.exit", after, numbers=[0x0F])
+```
+
+- `numbers=[...]` 是原生号码过滤；省略表示全部，生产脚本应避免全量同步等待；
+- `thread_id` 可选；`address` 不适用于 syscall；
+- entry 可返回 `number` 和最多六项 `arguments`；
+- exit 可返回 `return_value` 和 `errno`；
+- `None` 表示不修改，插件可在回调中调用 `pb.unintercept(id)` 结束常驻拦截；
+- 同一字段的多插件返回冲突、异常、超时或槽满时保留原上下文。
+
+同步过滤与异步 `pb.on("syscall")`/`pb.on_syscall` 分开管理。真实回归入口为
+`fixtures/syscall_python_demo/run.ps1`：第一轮在 entry 把 `NtClose` 句柄改为无效值，
+第二轮让内核真正关闭句柄，再在 exit 修改 NTSTATUS。

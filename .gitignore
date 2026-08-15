@@ -43,3 +43,6 @@ fixtures/child_follow_demo/*.lib
 fixtures/hook_python_demo/*.exe
 fixtures/hook_python_demo/*.exp
 fixtures/hook_python_demo/*.lib
+fixtures/syscall_python_demo/*.exe
+fixtures/syscall_python_demo/*.exp
+fixtures/syscall_python_demo/*.lib

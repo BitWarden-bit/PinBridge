@@ -160,21 +160,38 @@ unsafe extern "C" fn on_entry(
 ) {
     // Clear any unpaired value before beginning a new entry/exit pair.
     let _ = take_syscall_number(thread_id);
-    if !enabled() {
-        return;
-    }
     let mut number: u64 = 0;
     let mut args = [0u64; 6];
     pb_pin_get_syscall_number(context, standard, &mut number);
     number = canonical_number(number);
-    if !number_allowed(number) {
-        return;
-    }
-    if !remember_syscall_number(thread_id, number) {
-        return;
-    }
     for (index, slot) in args.iter_mut().enumerate() {
         pb_pin_get_syscall_argument(context, standard, index as u32, slot);
+    }
+    if let Some(response) = crate::sync_intercept::decide_syscall(
+        crate::sync_intercept::SYSCALL_ENTRY,
+        thread_id,
+        context,
+        standard,
+        number,
+        args,
+        0,
+        0,
+    ) {
+        crate::sync_intercept::apply_syscall_response(
+            context,
+            standard,
+            crate::sync_intercept::SYSCALL_ENTRY,
+            &response,
+        );
+    }
+    let capture = enabled() && number_allowed(number);
+    let intercept_exit =
+        crate::sync_intercept::syscall_interested(crate::sync_intercept::SYSCALL_EXIT, number);
+    if (capture || intercept_exit) && !remember_syscall_number(thread_id, number) {
+        return;
+    }
+    if !capture {
+        return;
     }
     submit(Event {
         kind: EVENT_SYSCALL,
@@ -214,9 +231,6 @@ unsafe extern "C" fn on_exit(
     // Always consume the entry decision, even if capture was disabled between
     // entry and exit, so a later syscall can never reuse stale TLS state.
     let number = take_syscall_number(thread_id);
-    if !enabled() {
-        return;
-    }
     let mut return_value: u64 = 0;
     let mut errno: u64 = 0;
     let Some(number) = number else {
@@ -224,6 +238,26 @@ unsafe extern "C" fn on_exit(
     };
     pb_pin_get_syscall_return(context, standard, &mut return_value);
     pb_pin_get_syscall_errno(context, standard, &mut errno);
+    if let Some(response) = crate::sync_intercept::decide_syscall(
+        crate::sync_intercept::SYSCALL_EXIT,
+        thread_id,
+        context,
+        standard,
+        number,
+        [0; 6],
+        return_value,
+        errno,
+    ) {
+        crate::sync_intercept::apply_syscall_response(
+            context,
+            standard,
+            crate::sync_intercept::SYSCALL_EXIT,
+            &response,
+        );
+    }
+    if !enabled() || !number_allowed(number) {
+        return;
+    }
     submit(Event {
         kind: EVENT_SYSCALL,
         thread_id,

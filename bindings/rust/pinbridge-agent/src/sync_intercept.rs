@@ -12,6 +12,8 @@ use pinbridge_sys::*;
 
 pub const HOOK_ENTRY: u32 = 1;
 pub const HOOK_RETURN: u32 = 2;
+pub const SYSCALL_ENTRY: u32 = 3;
+pub const SYSCALL_EXIT: u32 = 4;
 
 pub const HOOK_ACTION_CONTINUE: u32 = 0;
 pub const HOOK_ACTION_RETURN: u32 = 1;
@@ -19,6 +21,7 @@ pub const HOOK_ACTION_RETURN: u32 = 1;
 const SLOT_COUNT: usize = 16;
 pub const MAX_REGISTERS: usize = 18;
 pub const MAX_STACK_ARGUMENTS: usize = 4;
+pub const MAX_SYSCALL_ARGUMENTS: usize = 6;
 const DEFAULT_TIMEOUT_MS: u32 = 2000;
 const MAX_TIMEOUT_MS: u32 = 10_000;
 
@@ -37,6 +40,10 @@ struct HookInterest {
 
 static HOOK_INTERESTS: AtomicPtr<Vec<HookInterest>> = AtomicPtr::new(core::ptr::null_mut());
 static RETIRED_INTERESTS: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+static SYSCALL_ENTRY_ALL: AtomicU32 = AtomicU32::new(0);
+static SYSCALL_EXIT_ALL: AtomicU32 = AtomicU32::new(0);
+static SYSCALL_ENTRY_NUMBERS: AtomicPtr<Vec<u32>> = AtomicPtr::new(core::ptr::null_mut());
+static SYSCALL_EXIT_NUMBERS: AtomicPtr<Vec<u32>> = AtomicPtr::new(core::ptr::null_mut());
 
 #[derive(Clone, Copy)]
 struct NativeRequest {
@@ -46,6 +53,11 @@ struct NativeRequest {
     register_mask: u32,
     registers: [u64; MAX_REGISTERS],
     stack_arguments: [u64; MAX_STACK_ARGUMENTS],
+    syscall_standard: u32,
+    syscall_number: u64,
+    syscall_arguments: [u64; MAX_SYSCALL_ARGUMENTS],
+    syscall_return: u64,
+    syscall_errno: u64,
 }
 
 impl NativeRequest {
@@ -56,11 +68,16 @@ impl NativeRequest {
         register_mask: 0,
         registers: [0; MAX_REGISTERS],
         stack_arguments: [0; MAX_STACK_ARGUMENTS],
+        syscall_standard: 0,
+        syscall_number: 0,
+        syscall_arguments: [0; MAX_SYSCALL_ARGUMENTS],
+        syscall_return: 0,
+        syscall_errno: 0,
     };
 }
 
 #[derive(Clone, Copy)]
-pub struct HookRequest {
+pub struct InterceptRequest {
     pub slot: usize,
     pub generation: u64,
     pub kind: u32,
@@ -69,24 +86,45 @@ pub struct HookRequest {
     pub register_mask: u32,
     pub registers: [u64; MAX_REGISTERS],
     pub stack_arguments: [u64; MAX_STACK_ARGUMENTS],
+    pub syscall_standard: u32,
+    pub syscall_number: u64,
+    pub syscall_arguments: [u64; MAX_SYSCALL_ARGUMENTS],
+    pub syscall_return: u64,
+    pub syscall_errno: u64,
 }
 
 #[derive(Clone, Copy)]
-pub struct HookResponse {
+pub struct InterceptResponse {
     pub action: u32,
     pub register_mask: u32,
     pub registers: [u64; MAX_REGISTERS],
     pub stack_argument_mask: u32,
     pub stack_arguments: [u64; MAX_STACK_ARGUMENTS],
+    pub syscall_number_set: bool,
+    pub syscall_number: u64,
+    pub syscall_argument_mask: u32,
+    pub syscall_arguments: [u64; MAX_SYSCALL_ARGUMENTS],
+    pub syscall_return_set: bool,
+    pub syscall_return: u64,
+    pub syscall_errno_set: bool,
+    pub syscall_errno: u64,
 }
 
-impl HookResponse {
+impl InterceptResponse {
     pub const EMPTY: Self = Self {
         action: HOOK_ACTION_CONTINUE,
         register_mask: 0,
         registers: [0; MAX_REGISTERS],
         stack_argument_mask: 0,
         stack_arguments: [0; MAX_STACK_ARGUMENTS],
+        syscall_number_set: false,
+        syscall_number: 0,
+        syscall_argument_mask: 0,
+        syscall_arguments: [0; MAX_SYSCALL_ARGUMENTS],
+        syscall_return_set: false,
+        syscall_return: 0,
+        syscall_errno_set: false,
+        syscall_errno: 0,
     };
 }
 
@@ -95,7 +133,7 @@ struct Slot {
     generation: AtomicU64,
     semaphore: AtomicUsize,
     request: core::cell::UnsafeCell<NativeRequest>,
-    response: core::cell::UnsafeCell<HookResponse>,
+    response: core::cell::UnsafeCell<InterceptResponse>,
 }
 
 unsafe impl Sync for Slot {}
@@ -107,7 +145,7 @@ impl Slot {
             generation: AtomicU64::new(0),
             semaphore: AtomicUsize::new(0),
             request: core::cell::UnsafeCell::new(NativeRequest::EMPTY),
-            response: core::cell::UnsafeCell::new(HookResponse::EMPTY),
+            response: core::cell::UnsafeCell::new(InterceptResponse::EMPTY),
         }
     }
 }
@@ -175,6 +213,50 @@ fn hook_interested(address: u64, kind: u32) -> bool {
         .is_ok()
 }
 
+fn publish_numbers(target: &AtomicPtr<Vec<u32>>, numbers: &[u32]) {
+    let mut snapshot = numbers.to_vec();
+    snapshot.sort_unstable();
+    snapshot.dedup();
+    let old = target.swap(Box::into_raw(Box::new(snapshot)), Ordering::AcqRel);
+    if !old.is_null() {
+        RETIRED_INTERESTS
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .push(old as usize);
+    }
+}
+
+pub fn publish_syscall_interests(
+    entry_all: bool,
+    entry_numbers: &[u32],
+    exit_all: bool,
+    exit_numbers: &[u32],
+) {
+    publish_numbers(&SYSCALL_ENTRY_NUMBERS, entry_numbers);
+    publish_numbers(&SYSCALL_EXIT_NUMBERS, exit_numbers);
+    SYSCALL_ENTRY_ALL.store(entry_all as u32, Ordering::Release);
+    SYSCALL_EXIT_ALL.store(exit_all as u32, Ordering::Release);
+}
+
+fn number_interested(all: &AtomicU32, numbers: &AtomicPtr<Vec<u32>>, number: u64) -> bool {
+    if all.load(Ordering::Acquire) != 0 {
+        return true;
+    }
+    let Ok(number) = u32::try_from(number) else {
+        return false;
+    };
+    let snapshot = numbers.load(Ordering::Acquire);
+    !snapshot.is_null() && unsafe { &*snapshot }.binary_search(&number).is_ok()
+}
+
+pub fn syscall_interested(kind: u32, number: u64) -> bool {
+    match kind {
+        SYSCALL_ENTRY => number_interested(&SYSCALL_ENTRY_ALL, &SYSCALL_ENTRY_NUMBERS, number),
+        SYSCALL_EXIT => number_interested(&SYSCALL_EXIT_ALL, &SYSCALL_EXIT_NUMBERS, number),
+        _ => false,
+    }
+}
+
 unsafe fn capture_hook(
     kind: u32,
     address: u64,
@@ -189,6 +271,11 @@ unsafe fn capture_hook(
         register_mask: 0,
         registers: [0; MAX_REGISTERS],
         stack_arguments,
+        syscall_standard: 0,
+        syscall_number: 0,
+        syscall_arguments: [0; MAX_SYSCALL_ARGUMENTS],
+        syscall_return: 0,
+        syscall_errno: 0,
     };
     for (index, (_, register)) in crate::arch::gp_registers().iter().enumerate() {
         let mut value = 0;
@@ -200,19 +287,7 @@ unsafe fn capture_hook(
     request
 }
 
-/// Called from a Hook analysis callback. Returns None when the event is not
-/// intercepted or a safe decision could not be obtained in time.
-pub unsafe fn decide_hook(
-    address: u64,
-    thread_id: u32,
-    is_return: bool,
-    context: PbContextHandle,
-    stack_arguments: [u64; MAX_STACK_ARGUMENTS],
-) -> Option<HookResponse> {
-    let kind = if is_return { HOOK_RETURN } else { HOOK_ENTRY };
-    if context.is_null() || !crate::scripting::python_ready() || !hook_interested(address, kind) {
-        return None;
-    }
+unsafe fn rendezvous(request: NativeRequest) -> Option<InterceptResponse> {
     let Some(slot_index) = SLOTS.iter().position(|slot| {
         slot.state
             .compare_exchange(IDLE, WRITING, Ordering::AcqRel, Ordering::Acquire)
@@ -224,8 +299,8 @@ pub unsafe fn decide_hook(
     let slot = &SLOTS[slot_index];
     let generation = NEXT_GENERATION.fetch_add(1, Ordering::AcqRel) + 1;
     slot.generation.store(generation, Ordering::Release);
-    *slot.request.get() = capture_hook(kind, address, thread_id, context, stack_arguments);
-    *slot.response.get() = HookResponse::EMPTY;
+    *slot.request.get() = request;
+    *slot.response.get() = InterceptResponse::EMPTY;
     let semaphore = slot.semaphore.load(Ordering::Acquire) as PbSemaphoreHandle;
     if semaphore.is_null() {
         slot.state.store(IDLE, Ordering::Release);
@@ -270,7 +345,96 @@ pub unsafe fn decide_hook(
     }
 }
 
-pub fn take_pending() -> Option<HookRequest> {
+/// Called from a Hook analysis callback. Returns None when the event is not
+/// intercepted or a safe decision could not be obtained in time.
+pub unsafe fn decide_hook(
+    address: u64,
+    thread_id: u32,
+    is_return: bool,
+    context: PbContextHandle,
+    stack_arguments: [u64; MAX_STACK_ARGUMENTS],
+) -> Option<InterceptResponse> {
+    let kind = if is_return { HOOK_RETURN } else { HOOK_ENTRY };
+    if context.is_null() || !crate::scripting::python_ready() || !hook_interested(address, kind) {
+        return None;
+    }
+    rendezvous(capture_hook(
+        kind,
+        address,
+        thread_id,
+        context,
+        stack_arguments,
+    ))
+}
+
+pub unsafe fn decide_syscall(
+    kind: u32,
+    thread_id: u32,
+    context: PbContextHandle,
+    standard: PbSyscallStandard,
+    number: u64,
+    arguments: [u64; MAX_SYSCALL_ARGUMENTS],
+    return_value: u64,
+    errno: u64,
+) -> Option<InterceptResponse> {
+    if context.is_null()
+        || !crate::scripting::python_ready()
+        || !syscall_interested(kind, number)
+    {
+        return None;
+    }
+    let mut request = NativeRequest {
+        kind,
+        thread_id,
+        address: 0,
+        register_mask: 0,
+        registers: [0; MAX_REGISTERS],
+        stack_arguments: [0; MAX_STACK_ARGUMENTS],
+        syscall_standard: standard,
+        syscall_number: number,
+        syscall_arguments: arguments,
+        syscall_return: return_value,
+        syscall_errno: errno,
+    };
+    let _ = pb_pin_get_context_reg(
+        context as PbConstContextHandle,
+        crate::arch::instr_ptr_reg(),
+        &mut request.address,
+    );
+    rendezvous(request)
+}
+
+pub unsafe fn apply_syscall_response(
+    context: PbContextHandle,
+    standard: PbSyscallStandard,
+    kind: u32,
+    response: &InterceptResponse,
+) {
+    if kind == SYSCALL_ENTRY {
+        if response.syscall_number_set {
+            let _ = pb_pin_set_syscall_number(context, standard, response.syscall_number);
+        }
+        for index in 0..MAX_SYSCALL_ARGUMENTS {
+            if response.syscall_argument_mask & (1u32 << index) != 0 {
+                let _ = pb_pin_set_syscall_argument(
+                    context,
+                    standard,
+                    index as u32,
+                    response.syscall_arguments[index],
+                );
+            }
+        }
+    } else if kind == SYSCALL_EXIT {
+        if response.syscall_return_set {
+            let _ = pb_pin_set_syscall_return(context, standard, response.syscall_return);
+        }
+        if response.syscall_errno_set {
+            let _ = pb_pin_set_syscall_errno(context, standard, response.syscall_errno);
+        }
+    }
+}
+
+pub fn take_pending() -> Option<InterceptRequest> {
     for (slot_index, slot) in SLOTS.iter().enumerate() {
         if slot
             .state
@@ -278,7 +442,7 @@ pub fn take_pending() -> Option<HookRequest> {
             .is_ok()
         {
             let request = unsafe { *slot.request.get() };
-            return Some(HookRequest {
+            return Some(InterceptRequest {
                 slot: slot_index,
                 generation: slot.generation.load(Ordering::Acquire),
                 kind: request.kind,
@@ -287,6 +451,11 @@ pub fn take_pending() -> Option<HookRequest> {
                 register_mask: request.register_mask,
                 registers: request.registers,
                 stack_arguments: request.stack_arguments,
+                syscall_standard: request.syscall_standard,
+                syscall_number: request.syscall_number,
+                syscall_arguments: request.syscall_arguments,
+                syscall_return: request.syscall_return,
+                syscall_errno: request.syscall_errno,
             });
         }
         if slot
@@ -300,7 +469,7 @@ pub fn take_pending() -> Option<HookRequest> {
     None
 }
 
-pub fn complete(slot_index: usize, generation: u64, response: HookResponse) {
+pub fn complete(slot_index: usize, generation: u64, response: InterceptResponse) {
     let Some(slot) = SLOTS.get(slot_index) else {
         return;
     };
@@ -336,7 +505,7 @@ pub fn pending() -> bool {
 /// when the caller must commit the changed context with execute_at.
 pub unsafe fn apply_hook_response(
     context: PbContextHandle,
-    response: &HookResponse,
+    response: &InterceptResponse,
     is_return: bool,
 ) -> bool {
     let mut changed = false;
@@ -363,7 +532,7 @@ pub unsafe fn apply_hook_response(
     changed
 }
 
-pub fn response_changes_instruction_pointer(response: &HookResponse) -> bool {
+pub fn response_changes_instruction_pointer(response: &InterceptResponse) -> bool {
     crate::arch::gp_registers()
         .iter()
         .position(|(_, register)| *register == crate::arch::instr_ptr_reg())

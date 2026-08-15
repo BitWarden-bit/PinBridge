@@ -4,20 +4,28 @@
 //! not own control flow, while interceptors have a bounded native waiter and
 //! an explicit conservative fallback.
 
-use crate::{new_map, TlsFreeMap};
+use crate::{new_map, TlsFreeMap, TlsFreeSet};
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use pyo3::prelude::*;
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 static PYTHON_DECISION_ACTIVE: AtomicBool = AtomicBool::new(false);
 
-pub const PUBLIC_DECISION_NAMES: [&str; 3] = ["child.follow", "hook.entry", "hook.return"];
+pub const PUBLIC_DECISION_NAMES: [&str; 5] = [
+    "child.follow",
+    "hook.entry",
+    "hook.return",
+    "syscall.entry",
+    "syscall.exit",
+];
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum DecisionSelector {
     ChildFollow,
     HookEntry,
     HookReturn,
+    SyscallEntry,
+    SyscallExit,
 }
 
 impl DecisionSelector {
@@ -26,6 +34,8 @@ impl DecisionSelector {
             "child.follow" | "child_follow" | "follow_child" => Some(Self::ChildFollow),
             "hook.entry" | "hook_entry" => Some(Self::HookEntry),
             "hook.return" | "hook_return" => Some(Self::HookReturn),
+            "syscall.entry" | "syscall_entry" => Some(Self::SyscallEntry),
+            "syscall.exit" | "syscall_exit" => Some(Self::SyscallExit),
             _ => None,
         }
     }
@@ -42,6 +52,7 @@ pub struct DecisionSubscription {
     pub order: u64,
     pub address: Option<u64>,
     pub thread_id: Option<u32>,
+    pub numbers: Option<TlsFreeSet<u32>>,
 }
 
 impl DecisionSubscription {
@@ -51,6 +62,7 @@ impl DecisionSubscription {
         once: bool,
         address: Option<u64>,
         thread_id: Option<u32>,
+        numbers: Option<TlsFreeSet<u32>>,
     ) -> (u64, Self) {
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         (
@@ -62,6 +74,7 @@ impl DecisionSubscription {
                 order: id,
                 address,
                 thread_id,
+                numbers,
             },
         )
     }
@@ -189,6 +202,10 @@ mod tests {
         assert_eq!(
             DecisionSelector::parse("hook_return"),
             Some(DecisionSelector::HookReturn)
+        );
+        assert_eq!(
+            DecisionSelector::parse("syscall.entry"),
+            Some(DecisionSelector::SyscallEntry)
         );
         assert_eq!(DecisionSelector::parse("unknown"), None);
     }

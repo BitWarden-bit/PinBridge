@@ -116,6 +116,7 @@ python examples\python\replay\test_taint.py   # 重放单测 16/16
 fixtures\child_follow_demo\run.ps1 -Follow $false  # 子进程不跟随决定
 fixtures\child_follow_demo\run.ps1 -Follow $true   # 子进程跟随决定
 fixtures\hook_python_demo\run.ps1                  # Hook 入口跳过 + 返回值同步修改
+fixtures\syscall_python_demo\run.ps1               # syscall 入口参数 + 出口状态同步修改
 ```
 
 ## 项目结构

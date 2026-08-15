@@ -243,6 +243,25 @@ pb.intercept("hook.return", on_return, address=return_instruction)
 真实 Pin 测试同时覆盖入口直接返回（证明原函数未执行）和返回指令改写返回值；Fini
 日志使用 `sync_decisions`、`sync_timeouts`、`sync_busy` 证明原生采用了两次 Python 决定。
 
+### 系统调用同步拦截
+
+系统调用入口和出口使用同一个固定同步通道，并必须尽量按号码收窄：
+
+```python
+pb.intercept("syscall.entry", on_entry, numbers=[nt_close_number])
+pb.intercept("syscall.exit", on_exit, numbers=[nt_close_number])
+```
+
+入口事件包含 `number`、`arguments`（六项）、`standard`、`tid` 和回调现场地址；返回
+`{"number": n, "arguments": [...]}` 可修改即将进入内核的系统调用号和参数。出口事件
+增加 `return_value`、`errno`，返回同名字段可在应用继续前修改结果。`thread_id` 可进一步
+限制线程；`numbers=None` 表示全部系统调用，但只适合短时诊断，不能当作常驻配置。
+
+号码过滤在原生不可变快照中执行，不匹配的 syscall 不进入同步槽。异步 `pb.on("syscall")`
+及原生事件位图仍是独立观察面；即使异步引擎关闭，同步拦截仍然有效。多个处理函数的同一
+字段必须返回相同值，否则本次保留原系统调用上下文。真实 Windows/Pin 测试用 `NtClose`
+验证入口参数被替换、内核副作用被阻止，以及出口状态被改写为 `0xC0000022`。
+
 ### 当前交付状态
 
 | 功能 | Python 入口 | 当前状态 |
@@ -255,5 +274,6 @@ pb.intercept("hook.return", on_return, address=return_instruction)
 | Pin 重新附加 | `pb.on("pin.attach", ...)` | 事件结构已完成，重新附加控制链待开发 |
 | 子进程跟随决策 | `pb.intercept("child.follow", ...)` | 已完成，跟随/不跟随真实 Pin 测试通过；子进程独立控制端口待开发 |
 | Hook 同步决定 | `pb.intercept("hook.entry/return", ..., address=...)` | 已完成，入口跳过/返回值改写真实 Pin 测试通过 |
-| 系统调用/异常同步决定 | 尚未发布 | 待开发；现有命名事件仅观察 |
+| 系统调用同步决定 | `pb.intercept("syscall.entry/exit", ..., numbers=...)` | 已完成，入口参数/出口返回值真实 Pin 测试通过 |
+| 异常同步决定 | 尚未发布 | 待开发；现有命名事件仅观察 |
 | 地址转换/取码/插桩规则 | 尚未发布 | 待开发；必须采用 Python 配置、原生执行 |
