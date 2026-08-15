@@ -73,6 +73,14 @@ pub const EVENT_PIN_INTERNAL_EXCEPTION: u32 = 24;
 /// arg2=XED extension, arg3=opcode/iclass, arg4=memory operand count,
 /// arg5=control-flow flags (fall-through/branch/call/return/syscall).
 pub const EVENT_INSTRUCTION_DECODE: u32 = 25;
+/// Pin is about to report an application breakpoint to the debugger.
+/// address=IP, arg0=Pin debugging-event id, arg1=SP, arg2=flags,
+/// arg3=integer return register.
+pub const EVENT_DEBUGGER_BREAKPOINT: u32 = 26;
+/// Pin is about to report a single-step stop to the debugger.
+pub const EVENT_DEBUGGER_SINGLE_STEP: u32 = 27;
+/// Pin is about to report an asynchronous debugger interruption.
+pub const EVENT_DEBUGGER_ASYNC_BREAK: u32 = 28;
 
 pub const EVENT_KIND_COUNT: usize = 9;
 
@@ -150,6 +158,9 @@ pub fn kind_name(kind: u32) -> &'static str {
         EVENT_OUT_OF_MEMORY => "out_of_memory",
         EVENT_PIN_INTERNAL_EXCEPTION => "pin_internal_exception",
         EVENT_INSTRUCTION_DECODE => "instruction_decode",
+        EVENT_DEBUGGER_BREAKPOINT => "debugger_breakpoint",
+        EVENT_DEBUGGER_SINGLE_STEP => "debugger_single_step",
+        EVENT_DEBUGGER_ASYNC_BREAK => "debugger_async_break",
         _ => "unknown",
     }
 }

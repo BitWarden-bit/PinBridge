@@ -70,6 +70,16 @@ pub fn return_reg() -> PbRegId {
     }
 }
 
+/// Architected flags register for the current application architecture.
+#[inline]
+pub fn flags_reg() -> PbRegId {
+    if is_64() {
+        pinbridge_sys::PB_REG_RFLAGS
+    } else {
+        pinbridge_sys::PB_REG_EFLAGS
+    }
+}
+
 /// The four register slots exposed by the hook event. On ia32 these are the
 /// native ECX/EDX/EAX/EBX values; stdcall stack arguments are exposed in the
 /// additional a4..a7 slots and can be addressed by `stackN` rules.

@@ -5,6 +5,7 @@
 //! thread and keeps control-flow decisions separate from telemetry routing.
 
 mod child;
+mod debugger;
 mod exception;
 mod hook;
 mod syscall;
@@ -14,7 +15,16 @@ use super::{with_registry, STATE_RUNNING};
 use pyo3::prelude::*;
 
 pub fn publish_interests() {
-    let (hooks, entry_all, entry_numbers, exit_all, exit_numbers, exception_all, exception_codes) =
+    let (
+        hooks,
+        entry_all,
+        entry_numbers,
+        exit_all,
+        exit_numbers,
+        exception_all,
+        exception_codes,
+        debugger_mask,
+    ) =
         with_registry(|registry| {
             let mut hooks = Vec::new();
             let mut entry_all = false;
@@ -23,6 +33,7 @@ pub fn publish_interests() {
             let mut exit_numbers = Vec::new();
             let mut exception_all = false;
             let mut exception_codes = Vec::new();
+            let mut debugger_mask = 0u32;
             for plugin in registry.values() {
                 if plugin.state != STATE_RUNNING {
                     continue;
@@ -51,6 +62,9 @@ pub fn publish_interests() {
                             Some(codes) => exception_codes.extend(codes.iter().copied()),
                             None => exception_all = true,
                         },
+                        DecisionSelector::DebuggerBreakpoint => debugger_mask |= 1 << 0,
+                        DecisionSelector::DebuggerSingleStep => debugger_mask |= 1 << 1,
+                        DecisionSelector::DebuggerAsyncBreak => debugger_mask |= 1 << 2,
                         DecisionSelector::ChildFollow => {}
                     }
                 }
@@ -63,6 +77,7 @@ pub fn publish_interests() {
                 exit_numbers,
                 exception_all,
                 exception_codes,
+                debugger_mask,
             )
         });
     crate::sync_intercept::publish_hook_interests(&hooks);
@@ -73,6 +88,7 @@ pub fn publish_interests() {
         &exit_numbers,
     );
     crate::sync_intercept::publish_exception_interests(exception_all, &exception_codes);
+    crate::sync_intercept::publish_debugger_interests(debugger_mask);
 }
 
 pub fn dispatch_pending() {
@@ -99,6 +115,9 @@ fn dispatch_one() {
             syscall::dispatch(request)
         }
         crate::sync_intercept::EXCEPTION_HANDLE => exception::dispatch(request),
+        crate::sync_intercept::DEBUGGER_BREAKPOINT
+        | crate::sync_intercept::DEBUGGER_SINGLE_STEP
+        | crate::sync_intercept::DEBUGGER_ASYNC_BREAK => debugger::dispatch(request),
         _ => crate::sync_intercept::complete(
             request.slot,
             request.generation,

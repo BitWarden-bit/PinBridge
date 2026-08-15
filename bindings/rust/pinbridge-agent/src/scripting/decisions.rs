@@ -11,13 +11,16 @@ use pyo3::prelude::*;
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 static PYTHON_DECISION_ACTIVE: AtomicBool = AtomicBool::new(false);
 
-pub const PUBLIC_DECISION_NAMES: [&str; 6] = [
+pub const PUBLIC_DECISION_NAMES: [&str; 9] = [
     "child.follow",
     "hook.entry",
     "hook.return",
     "syscall.entry",
     "syscall.exit",
     "exception.handle",
+    "debugger.breakpoint",
+    "debugger.single_step",
+    "debugger.async_break",
 ];
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -28,6 +31,9 @@ pub enum DecisionSelector {
     SyscallEntry,
     SyscallExit,
     ExceptionHandle,
+    DebuggerBreakpoint,
+    DebuggerSingleStep,
+    DebuggerAsyncBreak,
 }
 
 impl DecisionSelector {
@@ -41,12 +47,22 @@ impl DecisionSelector {
             "exception.handle" | "exception_handle" | "exception.intercept" => {
                 Some(Self::ExceptionHandle)
             }
+            "debugger.breakpoint" | "debugger_breakpoint" => Some(Self::DebuggerBreakpoint),
+            "debugger.single_step" | "debugger_single_step" => Some(Self::DebuggerSingleStep),
+            "debugger.async_break" | "debugger_async_break" => Some(Self::DebuggerAsyncBreak),
             _ => None,
         }
     }
 
     pub fn is_hook(self) -> bool {
         matches!(self, Self::HookEntry | Self::HookReturn)
+    }
+
+    pub fn is_debugger(self) -> bool {
+        matches!(
+            self,
+            Self::DebuggerBreakpoint | Self::DebuggerSingleStep | Self::DebuggerAsyncBreak
+        )
     }
 }
 
@@ -218,6 +234,10 @@ mod tests {
         assert_eq!(
             DecisionSelector::parse("exception.handle"),
             Some(DecisionSelector::ExceptionHandle)
+        );
+        assert_eq!(
+            DecisionSelector::parse("debugger.single_step"),
+            Some(DecisionSelector::DebuggerSingleStep)
         );
         assert_eq!(DecisionSelector::parse("unknown"), None);
     }

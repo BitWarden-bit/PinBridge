@@ -319,7 +319,8 @@ pb.off(subscription_id)
 目前已接入的命名事件：`process.start`、`process.exit`、`thread.start`、
 `thread.exit`、`module.load`、`module.unload`、`exception`、`context.change`、
 `syscall`、`hook.entry`、`hook.return`、`instruction`、`instruction.decode`、`memory`、`branch.edge`、
-`code.smc`、`pin.detach`、`pin.attach`、`memory.oom`、`pin.internal_exception`。
+`code.smc`、`pin.detach`、`pin.attach`、`memory.oom`、`pin.internal_exception`、
+`debugger.breakpoint`、`debugger.single_step`、`debugger.async_break`。
 
 订阅 `instruction`、`memory`、`branch.edge` 或 `syscall` 会把对应的原生采集引擎加入
 脚本需求并在下一次宿主节拍开启。取消订阅不会擅自关闭可能由 CLI/UI 开启的全局引擎。
@@ -340,6 +341,7 @@ pb.off(subscription_id)
 | `pin.internal_exception` | `ip`, `code`, `exception_address`, `fault_address`, `fault_address_known`, `access_type`, `exception_class` | 先写原生崩溃记录；只有 Pin 仍存活时 Python 才可能收到 |
 | `pin.detach` | `phase="detached"` | 已接入 JIT/Probe 原生完成回调；分离后不承诺 Python 仍被调度 |
 | `pin.attach` | `phase="attached"` | 字段已固定；完整重新附加控制链仍在开发 |
+| `debugger.breakpoint` / `debugger.single_step` / `debugger.async_break` | `ip`, `debugging_event`, `stack_pointer`, `flags`, `return_value` | Pin 准备把停止事件报告给应用调试器时产生；这里只观察，不改变处理结果 |
 
 原生生命周期回调只写固定大小记录，不分配内存、不获取 GIL，也不等待 Python。
 Python 处理函数统一在脚本内部线程按“插件名、注册顺序”稳定调用。处理函数异常只把
@@ -350,7 +352,7 @@ Python 处理函数统一在脚本内部线程按“插件名、注册顺序”�
 `PINBRIDGE_SCRIPT_EXIT_GRACE_MS=0..5000` 调整。超时后原生层无条件继续退出，Python
 故障不会把被分析进程永久卡在结束阶段。
 
-上述生命周期、SMC、Pin 分离/附加、内存不足和 Pin 内部异常事件使用独立 4096 槽高优先级环，先于
+上述生命周期、SMC、Pin 分离/附加、内存不足、Pin 内部异常和调试器事件使用独立 4096 槽高优先级环，先于
 普通遥测派发。生产回调只执行固定记录和 try-lock，不调用 Python、不做阻塞等待。
 `pinbridge-agent.log` 的 Fini 行提供 `priority_total` 和 `priority_dropped`。
 
@@ -474,6 +476,48 @@ decision_id = pb.intercept(
 直接把 `rip/eip` 改到函数入口不等同于执行一次 `call`，栈布局仍由脚本负责。真实 x64
 回归 `fixtures/exception_python_demo/run.ps1` 触发访问违规，回调根据 `from_registers`
 构造 Win64 栈并改写 `rip/rsp`，目标跳到恢复入口、绕过原生 SEH 处理器并以 0 退出。
+
+### 同步调试器事件
+
+Pin 在把应用断点、单步或异步中断报告给已连接的应用调试器前调用拦截器。观察现场使用
+`pb.on(...)`；需要暂停该应用线程、等待 Python 返回决定时使用同名 `pb.intercept(...)`：
+
+```python
+def breakpoint_for_debugger(event):
+    regs = event["registers"]
+    if regs["rax"] == 0x1234:
+        # 吞掉这个调试器断点，修改现场后直接恢复应用线程。
+        return {
+            "pass_to_debugger": False,
+            "registers": {"rax": 0, "rip": recovery_address},
+        }
+    # 不修改现场，仍让调试器正常停住。
+    return None
+
+decision_id = pb.intercept(
+    "debugger.breakpoint",
+    breakpoint_for_debugger,
+    thread_id=None,
+)
+```
+
+- 可拦截名为 `debugger.breakpoint`、`debugger.single_step`、`debugger.async_break`；
+- 事件包含 `type/id/generation/tid/thread_id/address/addr/registers`，寄存器按当前 x86/x64
+  架构命名；只接受可选的 `thread_id` 过滤；
+- 返回 `None` 默认继续交给调试器；返回字典可带 `pass_to_debugger: bool` 和
+  `registers: {name: value}`，也可用 `action="pass"` / `action="squash"`；
+- Pin 明确禁止吞掉 `debugger.async_break`。断点或单步继续交给调试器时也禁止修改
+  `rip/eip`；要修改指令指针，回调必须在同一个字典中明确返回
+  `pass_to_debugger=False`；
+- 多插件对去向或同一寄存器给出冲突值、Python 异常、超时、同步槽满或返回值非法时，
+  本次不应用任何寄存器补丁，并继续把事件交给调试器；
+- 原生回调不获取 GIL。只有原生兴趣位命中时，该应用线程才在固定同步槽上等待脚本线程，
+  等待上限仍由 `PINBRIDGE_SCRIPT_DECISION_TIMEOUT_MS` 控制。
+
+这里的真假方向来自 Pin 原始接口：`true` 表示“继续报告给调试器”，`false` 表示“吞掉并恢复
+线程”。平台使用完整字段名 `pass_to_debugger`，不使用含义容易相反的 `handled`。当前已完成
+原生三类回调注册、优先级观察事件、同步现场复制、返回校验和上下文写回；自动测试覆盖 ABI
+契约与 Rust 逻辑。连接 WinDbg/GDB 的交互回归需要独立调试器测试环境，当前不虚报为已通过。
 
 高频规则的真实回归入口为 `fixtures/instrumentation_python_demo/run.ps1`。测试先在
 `PINBRIDGE_AGENT_ENGINES=none` 下执行并缓存目标函数，再热加载 Python 规则，只允许一个

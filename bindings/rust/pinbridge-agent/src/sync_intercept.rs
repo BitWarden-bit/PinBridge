@@ -15,6 +15,9 @@ pub const HOOK_RETURN: u32 = 2;
 pub const SYSCALL_ENTRY: u32 = 3;
 pub const SYSCALL_EXIT: u32 = 4;
 pub const EXCEPTION_HANDLE: u32 = 5;
+pub const DEBUGGER_BREAKPOINT: u32 = 6;
+pub const DEBUGGER_SINGLE_STEP: u32 = 7;
+pub const DEBUGGER_ASYNC_BREAK: u32 = 8;
 
 pub const HOOK_ACTION_CONTINUE: u32 = 0;
 pub const HOOK_ACTION_RETURN: u32 = 1;
@@ -47,6 +50,7 @@ static SYSCALL_ENTRY_NUMBERS: AtomicPtr<Vec<u32>> = AtomicPtr::new(core::ptr::nu
 static SYSCALL_EXIT_NUMBERS: AtomicPtr<Vec<u32>> = AtomicPtr::new(core::ptr::null_mut());
 static EXCEPTION_ALL: AtomicU32 = AtomicU32::new(0);
 static EXCEPTION_CODES: AtomicPtr<Vec<u32>> = AtomicPtr::new(core::ptr::null_mut());
+static DEBUGGER_INTERESTS: AtomicU32 = AtomicU32::new(0);
 
 #[derive(Clone, Copy)]
 struct NativeRequest {
@@ -123,6 +127,8 @@ pub struct InterceptResponse {
     pub syscall_return: u64,
     pub syscall_errno_set: bool,
     pub syscall_errno: u64,
+    pub debugger_pass_set: bool,
+    pub debugger_pass_to_debugger: bool,
 }
 
 impl InterceptResponse {
@@ -140,6 +146,8 @@ impl InterceptResponse {
         syscall_return: 0,
         syscall_errno_set: false,
         syscall_errno: 0,
+        debugger_pass_set: false,
+        debugger_pass_to_debugger: true,
     };
 }
 
@@ -279,6 +287,19 @@ pub fn publish_exception_interests(all: bool, codes: &[u32]) {
 
 fn exception_interested(code: u32) -> bool {
     number_interested(&EXCEPTION_ALL, &EXCEPTION_CODES, code as u64)
+}
+
+pub fn publish_debugger_interests(mask: u32) {
+    DEBUGGER_INTERESTS.store(mask & 0b111, Ordering::Release);
+}
+
+fn debugger_kind(event: PbDebuggingEvent) -> Option<(u32, u32)> {
+    match event {
+        PB_DEBUGGING_EVENT_BREAKPOINT => Some((DEBUGGER_BREAKPOINT, 1 << 0)),
+        PB_DEBUGGING_EVENT_SINGLE_STEP => Some((DEBUGGER_SINGLE_STEP, 1 << 1)),
+        PB_DEBUGGING_EVENT_ASYNC_BREAK => Some((DEBUGGER_ASYNC_BREAK, 1 << 2)),
+        _ => None,
+    }
 }
 
 unsafe fn capture_registers(
@@ -531,6 +552,85 @@ pub unsafe fn apply_exception_response(
             let _ = pb_pin_set_context_reg(to, *register, response.registers[index]);
         }
     }
+}
+
+/// Requests a bounded Python decision for a Pin-to-debugger event. A missing
+/// decision is represented by `None`; the native callback must then preserve
+/// Pin's normal behavior and pass the event to the debugger.
+pub unsafe fn decide_debugger(
+    thread_id: u32,
+    event: PbDebuggingEvent,
+    context: PbContextHandle,
+) -> Option<InterceptResponse> {
+    let (kind, interest_bit) = debugger_kind(event)?;
+    if context.is_null()
+        || !crate::scripting::python_ready()
+        || DEBUGGER_INTERESTS.load(Ordering::Acquire) & interest_bit == 0
+    {
+        return None;
+    }
+    let mut request = NativeRequest {
+        kind,
+        thread_id,
+        address: 0,
+        register_mask: 0,
+        registers: [0; MAX_REGISTERS],
+        source_register_mask: 0,
+        source_registers: [0; MAX_REGISTERS],
+        stack_arguments: [0; MAX_STACK_ARGUMENTS],
+        syscall_standard: 0,
+        syscall_number: 0,
+        syscall_arguments: [0; MAX_SYSCALL_ARGUMENTS],
+        syscall_return: 0,
+        syscall_errno: 0,
+        exception_reason: 0,
+        exception_code: 0,
+    };
+    request.register_mask = capture_registers(
+        context as PbConstContextHandle,
+        &mut request.registers,
+    );
+    if let Some(index) = crate::arch::gp_registers()
+        .iter()
+        .position(|(_, register)| *register == crate::arch::instr_ptr_reg())
+    {
+        if request.register_mask & (1u32 << index) != 0 {
+            request.address = request.registers[index];
+        }
+    }
+    rendezvous(request)
+}
+
+/// Applies a validated debugger decision and returns Pin's callback result:
+/// true passes the stop to the debugger; false squashes it. Pin forbids
+/// squashing asynchronous breaks and forbids changing IP when a breakpoint
+/// or single-step is passed on, so these rules are also enforced here.
+pub unsafe fn apply_debugger_response(
+    context: PbContextHandle,
+    event: PbDebuggingEvent,
+    response: &InterceptResponse,
+) -> bool {
+    let mut pass_to_debugger = !response.debugger_pass_set
+        || response.debugger_pass_to_debugger;
+    if event == PB_DEBUGGING_EVENT_ASYNC_BREAK {
+        pass_to_debugger = true;
+    }
+    for (index, (_, register)) in crate::arch::gp_registers().iter().enumerate() {
+        if response.register_mask & (1u32 << index) == 0 {
+            continue;
+        }
+        if pass_to_debugger
+            && matches!(
+                event,
+                PB_DEBUGGING_EVENT_BREAKPOINT | PB_DEBUGGING_EVENT_SINGLE_STEP
+            )
+            && *register == crate::arch::instr_ptr_reg()
+        {
+            continue;
+        }
+        let _ = pb_pin_set_context_reg(context, *register, response.registers[index]);
+    }
+    pass_to_debugger
 }
 
 pub fn take_pending() -> Option<InterceptRequest> {

@@ -618,6 +618,13 @@ fn pb_intercept(
             ));
         }
         None
+    } else if selector.is_debugger() {
+        if address.is_some() || number_filter.is_some() || code_filter.is_some() {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "debugger interceptors accept only the optional thread_id filter",
+            ));
+        }
+        None
     } else {
         if address.is_some() || number_filter.is_some() {
             return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(

@@ -12,7 +12,7 @@ use pyo3::types::PyDict;
 const CONTEXT_CHANGE_EXCEPTION: u64 = 4;
 static NEXT_SUBSCRIPTION_ID: AtomicU64 = AtomicU64::new(1);
 
-pub const PUBLIC_EVENT_NAMES: [&str; 20] = [
+pub const PUBLIC_EVENT_NAMES: [&str; 23] = [
     "process.start",
     "process.exit",
     "thread.start",
@@ -33,6 +33,9 @@ pub const PUBLIC_EVENT_NAMES: [&str; 20] = [
     "pin.attach",
     "memory.oom",
     "pin.internal_exception",
+    "debugger.breakpoint",
+    "debugger.single_step",
+    "debugger.async_break",
 ];
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -74,6 +77,15 @@ impl EventSelector {
             "pin.internal_exception" | "pin_internal_exception" | "internal_exception" => {
                 Self::Kind(EVENT_PIN_INTERNAL_EXCEPTION)
             }
+            "debugger.breakpoint" | "debugger_breakpoint" => {
+                Self::Kind(EVENT_DEBUGGER_BREAKPOINT)
+            }
+            "debugger.single_step" | "debugger_single_step" => {
+                Self::Kind(EVENT_DEBUGGER_SINGLE_STEP)
+            }
+            "debugger.async_break" | "debugger_async_break" => {
+                Self::Kind(EVENT_DEBUGGER_ASYNC_BREAK)
+            }
             _ => return None,
         })
     }
@@ -100,6 +112,9 @@ impl EventSelector {
             Self::Kind(EVENT_PIN_ATTACH) => "pin.attach",
             Self::Kind(EVENT_OUT_OF_MEMORY) => "memory.oom",
             Self::Kind(EVENT_PIN_INTERNAL_EXCEPTION) => "pin.internal_exception",
+            Self::Kind(EVENT_DEBUGGER_BREAKPOINT) => "debugger.breakpoint",
+            Self::Kind(EVENT_DEBUGGER_SINGLE_STEP) => "debugger.single_step",
+            Self::Kind(EVENT_DEBUGGER_ASYNC_BREAK) => "debugger.async_break",
             Self::Kind(_) => "unknown",
         }
     }
@@ -132,6 +147,9 @@ impl EventSelector {
                 | Self::Kind(EVENT_PIN_ATTACH)
                 | Self::Kind(EVENT_OUT_OF_MEMORY)
                 | Self::Kind(EVENT_PIN_INTERNAL_EXCEPTION)
+                | Self::Kind(EVENT_DEBUGGER_BREAKPOINT)
+                | Self::Kind(EVENT_DEBUGGER_SINGLE_STEP)
+                | Self::Kind(EVENT_DEBUGGER_ASYNC_BREAK)
         )
     }
 
@@ -259,6 +277,15 @@ pub fn build_event_dict(
             row.set_item("access_type", event.arg3)?;
             row.set_item("exception_class", event.arg4)?;
         }
+        EventSelector::Kind(EVENT_DEBUGGER_BREAKPOINT)
+        | EventSelector::Kind(EVENT_DEBUGGER_SINGLE_STEP)
+        | EventSelector::Kind(EVENT_DEBUGGER_ASYNC_BREAK) => {
+            row.set_item("ip", event.address)?;
+            row.set_item("debugging_event", event.arg0)?;
+            row.set_item("stack_pointer", event.arg1)?;
+            row.set_item("flags", event.arg2)?;
+            row.set_item("return_value", event.arg3)?;
+        }
         EventSelector::Kind(EVENT_MODULE_LOAD) => {
             row.set_item("base", event.arg0)?;
             row.set_item("end", event.arg1)?;
@@ -345,6 +372,9 @@ mod tests {
             "pin.attach",
             "memory.oom",
             "pin.internal_exception",
+            "debugger.breakpoint",
+            "debugger.single_step",
+            "debugger.async_break",
         ] {
             let selector = EventSelector::parse(name).expect("public event must parse");
             assert!(selector.is_priority());

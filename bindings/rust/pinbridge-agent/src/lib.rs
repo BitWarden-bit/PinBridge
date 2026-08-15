@@ -11,6 +11,7 @@ mod context;
 mod control;
 mod diag;
 mod disasm;
+mod debugger;
 mod engines;
 mod event;
 mod exception;
@@ -164,14 +165,18 @@ fn agent_main(argc: c_int, argv: *mut *mut c_char) -> c_int {
         let lifecycle_status = lifecycle::register();
         let (oom_status, detach_status) = high_priority::register();
         let child_status = child_process::init_and_register();
+        let debugger_status = debugger::register();
         log::line(&format!(
-            "engines: syscall -> {syscall_status}, exception -> {exception_status}, modules -> {modules_status}, lifecycle -> {lifecycle_status}, oom -> {oom_status}, detach -> {detach_status}, child.follow -> {child_status}"
+            "engines: syscall -> {syscall_status}, exception -> {exception_status}, modules -> {modules_status}, lifecycle -> {lifecycle_status}, oom -> {oom_status}, detach -> {detach_status}, child.follow -> {child_status}, debugger.events -> {debugger_status}"
         ));
         if lifecycle_status != PB_OK {
             return 10;
         }
         if child_status != PB_OK {
             return 13;
+        }
+        if debugger_status != PB_OK {
+            return 16;
         }
         if std::env::var("PINBRIDGE_ENTRY_BP").ok().as_deref() == Some("1") {
             // The main image is not in the image list at tool-init time, so

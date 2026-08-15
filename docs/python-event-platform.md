@@ -167,7 +167,7 @@ pb.off(sid)
 ## 已完成：高优先级事件通道
 
 第三阶段增加了独立于 64K 遥测环的 4096 槽高优先级环。进程/线程生命周期、
-`code.smc`、`pin.detach`、`pin.attach`、`memory.oom` 和 `pin.internal_exception` 使用自己的游标，脚本宿主每个
+`code.smc`、`pin.detach`、`pin.attach`、`memory.oom`、`pin.internal_exception` 和三类调试器事件使用自己的游标，脚本宿主每个
 节拍先处理高优先级记录，再处理断点和普通遥测。因此指令或内存事件洪流不会再把这些
 记录从普通环中挤掉。
 
@@ -297,6 +297,42 @@ Pin 上下文切换回调不获取 GIL：它复制固定大小的源/目标寄�
 如果把指令指针直接改到普通函数，脚本还必须按目标 ABI 构造正确的栈；接口不会虚构一次
 `call`。真实 x64 Pin 测试触发访问违规，Python 同时改写 `rip/rsp`，跳到恢复入口并绕过
 原生 SEH 处理器；目标最终正常退出，日志证明 1 次同步决定、0 超时、0 槽位拥塞。
+
+### 调试器事件：观察与同步决定分离
+
+Pin 的调试器拦截回调只有三类：应用断点、单步和异步中断。平台为每类事件同时提供两条
+独立路径：
+
+```python
+# 异步观察：不拥有控制流，返回值被忽略。
+pb.on("debugger.breakpoint", log_debug_break)
+
+# 同步决定：命中的应用线程限时等待 Python。
+pb.intercept("debugger.breakpoint", decide_debug_break, thread_id=None)
+```
+
+原生回调先把 `tid`、指令指针、栈指针、标志和返回寄存器复制到高优先级环，再检查一个
+三位原子兴趣掩码。没有同步订阅时立即返回，不进入同步槽；有订阅时复制当前架构的全部
+通用寄存器，通过现有 16 槽 rendezvous 交给脚本线程。借用的 Pin `CONTEXT*` 不跨线程，
+Python 只接触值快照，原应用线程醒来后才由原生层写回经验证的补丁。
+
+同步回调返回 `None` 或：
+
+```python
+{
+    "pass_to_debugger": False,       # False=吞掉并恢复线程；True=让调试器停住
+    "registers": {"rip": next_ip},
+}
+```
+
+失败默认值固定为 `pass_to_debugger=True` 且不写寄存器。多个处理函数必须对显式去向和同一
+寄存器值达成一致，否则整次补丁作废。Pin 的原始契约还有两条强制限制：异步中断不能被
+吞掉；断点/单步继续交给调试器时不能改 `rip/eip`。Python 参数校验和原生写回层各检查
+一次，避免脚本错误违反 Pin 约束。
+
+这类调试器事件不同于 `pb.breakpoint`：后者是平台自己的精确停点和脚本自动化机制；前者
+只在 Pin 准备与外部应用调试器交互时发生。当前自动测试覆盖 C ABI 注册、事件/决定选择器、
+两种架构编译和回退规则；连接外部 WinDbg/GDB 的端到端交互尚未列为自动通过项。
 
 ## 已完成：Python 配置高频插桩、原生执行
 
@@ -443,6 +479,8 @@ pb.instrumentation_set(
 | Hook 同步决定 | `pb.intercept("hook.entry/return", ..., address=...)` | 已完成，入口跳过/返回值改写真实 Pin 测试通过 |
 | 系统调用同步决定 | `pb.intercept("syscall.entry/exit", ..., numbers=...)` | 已完成，入口参数/出口返回值真实 Pin 测试通过 |
 | 异常同步决定 | `pb.intercept("exception.handle", ..., codes=...)` | 已完成，异常现场读取/目标上下文改写真实 Pin 测试通过 |
+| 调试器事件观察 | `pb.on("debugger.breakpoint/single_step/async_break", ...)` | 已完成，三类 Pin 回调进入高优先级队列；附加调试器交互测试待独立环境 |
+| 调试器同步决定 | `pb.intercept("debugger.breakpoint/single_step/async_break", ...)` | 已完成，支持去向决定和寄存器改写，强制执行 Pin 的异步中断/IP 限制；ABI 与 Rust 测试通过 |
 | 指令/内存/分支插桩规则 | `pb.instrumentation_set/clear/policy` | 已完成，动态重新插桩和原生范围过滤真实 Pin 测试通过 |
 | 地址转换 | `pb.memory_translation_set/clear/policy` | 已完成，真实访存改写和原生选择器真实 Pin 测试通过 |
 | 取机器码 | `pb.code_fetch_set/clear/policy` | 已完成，动态重新取码和原始地址回退真实 Pin 测试通过 |

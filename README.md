@@ -1,6 +1,6 @@
 # PinBridge
 
-Windows x64 动态二进制分析平台,基于 Intel Pin 3.31:冻结的 **C ABI**(695 个导出)
+Windows x64 动态二进制分析平台,基于 Intel Pin 3.31:冻结的 **C ABI**(696 个导出)
 把 Pin 的 C++ API 暴露给任何语言;其上是用 Rust 写的**调试 agent**(PinTool)——
 事件引擎、断点/单步、异常与 syscall 观测、全速 trace 录制——并**内嵌 CPython**,
 让分析逻辑成为任意时刻可热加载的 Python 插件;重分析(污点、反混淆)以
@@ -21,7 +21,7 @@ Windows x64 动态二进制分析平台,基于 Intel Pin 3.31:冻结的 **C ABI*
 │  trace 录制(独立大 ring + 落盘 .pbtr,ABI v1.5 档2 捕获)       │
 │  内嵌 CPython 3.10 多插件宿主(docs/scripting.md)              │
 ├─────────────────────────────────────────────────────────────┤
-│ pinbridge.dll:冻结 C ABI v1.8(695 个 pb_* 导出)              │
+│ pinbridge.dll:冻结 C ABI v1.9(696 个 pb_* 导出)              │
 │  Pin 3.31 公共 SDK 的 C 包装:无 C++/异常/STL 跨界,opaque     │
 │  handle,(buffer,capacity,required_size*) 三段式,无跨界所有权   │
 └─────────────────────────────────────────────────────────────┘
@@ -38,7 +38,7 @@ Windows x64 动态二进制分析平台,基于 Intel Pin 3.31:冻结的 **C ABI*
   syscall 号码位图过滤、4096 点运行时 hook(不吃断点槽,"hook 全部 ntdll 导出")
 - **Python 插件**(核心):任意时刻热加载/卸载/同名替换(目标停在断点上也行);
   `pb.on` 统一异步事件、`pb.breakpoint` 精确停点处理、`pb.intercept` 同步原生决定
-  （已支持子进程跟随）;完整动作 API;`pb.print` 输出直达 CLI/TUI
+  （子进程、Hook、syscall、异常、调试器事件）;完整动作 API;`pb.print` 输出直达 CLI/TUI
 - **录制与离线重放**:`trace start/stop` 录窗口(档2:指令字节 + 内存读写值),
   `.pbtr` 落盘;`examples/python/replay/` 纯 Python 重放库:capstone 解码、
   字节级影子内存、**前向污点 + 反向切片**(具体 EA 消别名)
