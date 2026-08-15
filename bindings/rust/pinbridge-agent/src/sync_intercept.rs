@@ -14,6 +14,7 @@ pub const HOOK_ENTRY: u32 = 1;
 pub const HOOK_RETURN: u32 = 2;
 pub const SYSCALL_ENTRY: u32 = 3;
 pub const SYSCALL_EXIT: u32 = 4;
+pub const EXCEPTION_HANDLE: u32 = 5;
 
 pub const HOOK_ACTION_CONTINUE: u32 = 0;
 pub const HOOK_ACTION_RETURN: u32 = 1;
@@ -44,6 +45,8 @@ static SYSCALL_ENTRY_ALL: AtomicU32 = AtomicU32::new(0);
 static SYSCALL_EXIT_ALL: AtomicU32 = AtomicU32::new(0);
 static SYSCALL_ENTRY_NUMBERS: AtomicPtr<Vec<u32>> = AtomicPtr::new(core::ptr::null_mut());
 static SYSCALL_EXIT_NUMBERS: AtomicPtr<Vec<u32>> = AtomicPtr::new(core::ptr::null_mut());
+static EXCEPTION_ALL: AtomicU32 = AtomicU32::new(0);
+static EXCEPTION_CODES: AtomicPtr<Vec<u32>> = AtomicPtr::new(core::ptr::null_mut());
 
 #[derive(Clone, Copy)]
 struct NativeRequest {
@@ -52,12 +55,16 @@ struct NativeRequest {
     address: u64,
     register_mask: u32,
     registers: [u64; MAX_REGISTERS],
+    source_register_mask: u32,
+    source_registers: [u64; MAX_REGISTERS],
     stack_arguments: [u64; MAX_STACK_ARGUMENTS],
     syscall_standard: u32,
     syscall_number: u64,
     syscall_arguments: [u64; MAX_SYSCALL_ARGUMENTS],
     syscall_return: u64,
     syscall_errno: u64,
+    exception_reason: u32,
+    exception_code: u32,
 }
 
 impl NativeRequest {
@@ -67,12 +74,16 @@ impl NativeRequest {
         address: 0,
         register_mask: 0,
         registers: [0; MAX_REGISTERS],
+        source_register_mask: 0,
+        source_registers: [0; MAX_REGISTERS],
         stack_arguments: [0; MAX_STACK_ARGUMENTS],
         syscall_standard: 0,
         syscall_number: 0,
         syscall_arguments: [0; MAX_SYSCALL_ARGUMENTS],
         syscall_return: 0,
         syscall_errno: 0,
+        exception_reason: 0,
+        exception_code: 0,
     };
 }
 
@@ -85,12 +96,16 @@ pub struct InterceptRequest {
     pub address: u64,
     pub register_mask: u32,
     pub registers: [u64; MAX_REGISTERS],
+    pub source_register_mask: u32,
+    pub source_registers: [u64; MAX_REGISTERS],
     pub stack_arguments: [u64; MAX_STACK_ARGUMENTS],
     pub syscall_standard: u32,
     pub syscall_number: u64,
     pub syscall_arguments: [u64; MAX_SYSCALL_ARGUMENTS],
     pub syscall_return: u64,
     pub syscall_errno: u64,
+    pub exception_reason: u32,
+    pub exception_code: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -257,6 +272,33 @@ pub fn syscall_interested(kind: u32, number: u64) -> bool {
     }
 }
 
+pub fn publish_exception_interests(all: bool, codes: &[u32]) {
+    publish_numbers(&EXCEPTION_CODES, codes);
+    EXCEPTION_ALL.store(all as u32, Ordering::Release);
+}
+
+fn exception_interested(code: u32) -> bool {
+    number_interested(&EXCEPTION_ALL, &EXCEPTION_CODES, code as u64)
+}
+
+unsafe fn capture_registers(
+    context: PbConstContextHandle,
+    values: &mut [u64; MAX_REGISTERS],
+) -> u32 {
+    if context.is_null() {
+        return 0;
+    }
+    let mut mask = 0;
+    for (index, (_, register)) in crate::arch::gp_registers().iter().enumerate() {
+        let mut value = 0;
+        if pb_pin_get_context_reg(context, *register, &mut value) == PB_OK {
+            mask |= 1u32 << index;
+            values[index] = value;
+        }
+    }
+    mask
+}
+
 unsafe fn capture_hook(
     kind: u32,
     address: u64,
@@ -270,20 +312,21 @@ unsafe fn capture_hook(
         address,
         register_mask: 0,
         registers: [0; MAX_REGISTERS],
+        source_register_mask: 0,
+        source_registers: [0; MAX_REGISTERS],
         stack_arguments,
         syscall_standard: 0,
         syscall_number: 0,
         syscall_arguments: [0; MAX_SYSCALL_ARGUMENTS],
         syscall_return: 0,
         syscall_errno: 0,
+        exception_reason: 0,
+        exception_code: 0,
     };
-    for (index, (_, register)) in crate::arch::gp_registers().iter().enumerate() {
-        let mut value = 0;
-        if pb_pin_get_context_reg(context as PbConstContextHandle, *register, &mut value) == PB_OK {
-            request.register_mask |= 1u32 << index;
-            request.registers[index] = value;
-        }
-    }
+    request.register_mask = capture_registers(
+        context as PbConstContextHandle,
+        &mut request.registers,
+    );
     request
 }
 
@@ -389,12 +432,16 @@ pub unsafe fn decide_syscall(
         address: 0,
         register_mask: 0,
         registers: [0; MAX_REGISTERS],
+        source_register_mask: 0,
+        source_registers: [0; MAX_REGISTERS],
         stack_arguments: [0; MAX_STACK_ARGUMENTS],
         syscall_standard: standard,
         syscall_number: number,
         syscall_arguments: arguments,
         syscall_return: return_value,
         syscall_errno: errno,
+        exception_reason: 0,
+        exception_code: 0,
     };
     let _ = pb_pin_get_context_reg(
         context as PbConstContextHandle,
@@ -434,6 +481,58 @@ pub unsafe fn apply_syscall_response(
     }
 }
 
+pub unsafe fn decide_exception(
+    thread_id: u32,
+    reason: PbContextChangeReason,
+    from: PbConstContextHandle,
+    to: PbContextHandle,
+    code: u32,
+) -> Option<InterceptResponse> {
+    if to.is_null() || !crate::scripting::python_ready() || !exception_interested(code) {
+        return None;
+    }
+    let mut request = NativeRequest {
+        kind: EXCEPTION_HANDLE,
+        thread_id,
+        address: 0,
+        register_mask: 0,
+        registers: [0; MAX_REGISTERS],
+        source_register_mask: 0,
+        source_registers: [0; MAX_REGISTERS],
+        stack_arguments: [0; MAX_STACK_ARGUMENTS],
+        syscall_standard: 0,
+        syscall_number: 0,
+        syscall_arguments: [0; MAX_SYSCALL_ARGUMENTS],
+        syscall_return: 0,
+        syscall_errno: 0,
+        exception_reason: reason,
+        exception_code: code,
+    };
+    request.source_register_mask = capture_registers(from, &mut request.source_registers);
+    request.register_mask =
+        capture_registers(to as PbConstContextHandle, &mut request.registers);
+    if let Some(index) = crate::arch::gp_registers()
+        .iter()
+        .position(|(_, register)| *register == crate::arch::instr_ptr_reg())
+    {
+        if request.source_register_mask & (1u32 << index) != 0 {
+            request.address = request.source_registers[index];
+        }
+    }
+    rendezvous(request)
+}
+
+pub unsafe fn apply_exception_response(
+    to: PbContextHandle,
+    response: &InterceptResponse,
+) {
+    for (index, (_, register)) in crate::arch::gp_registers().iter().enumerate() {
+        if response.register_mask & (1u32 << index) != 0 {
+            let _ = pb_pin_set_context_reg(to, *register, response.registers[index]);
+        }
+    }
+}
+
 pub fn take_pending() -> Option<InterceptRequest> {
     for (slot_index, slot) in SLOTS.iter().enumerate() {
         if slot
@@ -450,12 +549,16 @@ pub fn take_pending() -> Option<InterceptRequest> {
                 address: request.address,
                 register_mask: request.register_mask,
                 registers: request.registers,
+                source_register_mask: request.source_register_mask,
+                source_registers: request.source_registers,
                 stack_arguments: request.stack_arguments,
                 syscall_standard: request.syscall_standard,
                 syscall_number: request.syscall_number,
                 syscall_arguments: request.syscall_arguments,
                 syscall_return: request.syscall_return,
                 syscall_errno: request.syscall_errno,
+                exception_reason: request.exception_reason,
+                exception_code: request.exception_code,
             });
         }
         if slot

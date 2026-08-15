@@ -11,12 +11,13 @@ use pyo3::prelude::*;
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 static PYTHON_DECISION_ACTIVE: AtomicBool = AtomicBool::new(false);
 
-pub const PUBLIC_DECISION_NAMES: [&str; 5] = [
+pub const PUBLIC_DECISION_NAMES: [&str; 6] = [
     "child.follow",
     "hook.entry",
     "hook.return",
     "syscall.entry",
     "syscall.exit",
+    "exception.handle",
 ];
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -26,6 +27,7 @@ pub enum DecisionSelector {
     HookReturn,
     SyscallEntry,
     SyscallExit,
+    ExceptionHandle,
 }
 
 impl DecisionSelector {
@@ -36,6 +38,9 @@ impl DecisionSelector {
             "hook.return" | "hook_return" => Some(Self::HookReturn),
             "syscall.entry" | "syscall_entry" => Some(Self::SyscallEntry),
             "syscall.exit" | "syscall_exit" => Some(Self::SyscallExit),
+            "exception.handle" | "exception_handle" | "exception.intercept" => {
+                Some(Self::ExceptionHandle)
+            }
             _ => None,
         }
     }
@@ -53,6 +58,7 @@ pub struct DecisionSubscription {
     pub address: Option<u64>,
     pub thread_id: Option<u32>,
     pub numbers: Option<TlsFreeSet<u32>>,
+    pub codes: Option<TlsFreeSet<u32>>,
 }
 
 impl DecisionSubscription {
@@ -63,6 +69,7 @@ impl DecisionSubscription {
         address: Option<u64>,
         thread_id: Option<u32>,
         numbers: Option<TlsFreeSet<u32>>,
+        codes: Option<TlsFreeSet<u32>>,
     ) -> (u64, Self) {
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         (
@@ -75,6 +82,7 @@ impl DecisionSubscription {
                 address,
                 thread_id,
                 numbers,
+                codes,
             },
         )
     }
@@ -206,6 +214,10 @@ mod tests {
         assert_eq!(
             DecisionSelector::parse("syscall.entry"),
             Some(DecisionSelector::SyscallEntry)
+        );
+        assert_eq!(
+            DecisionSelector::parse("exception.handle"),
+            Some(DecisionSelector::ExceptionHandle)
         );
         assert_eq!(DecisionSelector::parse("unknown"), None);
     }

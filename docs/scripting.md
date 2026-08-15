@@ -388,3 +388,33 @@ exit_id = pb.intercept("syscall.exit", after, numbers=[0x0F])
 同步过滤与异步 `pb.on("syscall")`/`pb.on_syscall` 分开管理。真实回归入口为
 `fixtures/syscall_python_demo/run.ps1`：第一轮在 entry 把 `NtClose` 句柄改为无效值，
 第二轮让内核真正关闭句柄，再在 exit 修改 NTSTATUS。
+
+### 同步异常接管
+
+```python
+def recover(event):
+    # from_registers: 异常发生现场（只读快照）
+    # registers: Pin 即将切换到的目标现场
+    return {"registers": {"rip": recovery_address}}
+
+decision_id = pb.intercept(
+    "exception.handle",
+    recover,
+    codes=[0xC0000005],
+    thread_id=None,
+    once=True,
+)
+```
+
+- `codes=[...]` 是原生异常码过滤；省略表示全部异常；
+- `thread_id` 可选，`address` 和 `numbers` 不适用；
+- 事件字段为 `type/id/generation/tid/thread_id/address/addr/reason/code`，以及
+  `from_registers`、`registers` 两份按架构命名的寄存器字典；
+- 返回 `None` 表示保持目标上下文，返回 `{"registers": {name: value}}` 修改指定寄存器；
+- 未知寄存器、返回结构错误、回调异常、超时、槽满或多插件字段冲突时，本次不应用任何
+  Python 补丁，继续操作系统原有异常处理路径；
+- 回调在脚本线程执行，可以 `pb.print`，不能发起需要查询服务的目标 RPC。
+
+直接把 `rip/eip` 改到函数入口不等同于执行一次 `call`，栈布局仍由脚本负责。真实 x64
+回归 `fixtures/exception_python_demo/run.ps1` 触发访问违规，回调根据 `from_registers`
+构造 Win64 栈并改写 `rip/rsp`，目标跳到恢复入口、绕过原生 SEH 处理器并以 0 退出。

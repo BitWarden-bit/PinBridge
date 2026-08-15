@@ -30,7 +30,7 @@ unsafe extern "C" fn on_context_change(
     thread_id: PbThreadId,
     reason: PbContextChangeReason,
     from: PbConstContextHandle,
-    _to: PbContextHandle,
+    to: PbContextHandle,
     info: i32,
     _user_data: *mut c_void,
 ) {
@@ -55,6 +55,18 @@ unsafe extern "C" fn on_context_change(
         ..Event::EMPTY
     };
     crate::record::submit_global(from, trace_event);
+
+    if reason == PB_CONTEXT_CHANGE_REASON_EXCEPTION {
+        if let Some(response) = crate::sync_intercept::decide_exception(
+            thread_id,
+            reason,
+            from,
+            to,
+            info as u32,
+        ) {
+            crate::sync_intercept::apply_exception_response(to, &response);
+        }
+    }
 
     if reason == PB_CONTEXT_CHANGE_REASON_EXCEPTION
         && POLICY_ENABLED.load(Ordering::Relaxed)

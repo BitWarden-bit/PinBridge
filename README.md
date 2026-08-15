@@ -117,6 +117,7 @@ fixtures\child_follow_demo\run.ps1 -Follow $false  # 子进程不跟随决定
 fixtures\child_follow_demo\run.ps1 -Follow $true   # 子进程跟随决定
 fixtures\hook_python_demo\run.ps1                  # Hook 入口跳过 + 返回值同步修改
 fixtures\syscall_python_demo\run.ps1               # syscall 入口参数 + 出口状态同步修改
+fixtures\exception_python_demo\run.ps1             # 异常现场交给 Python 改写后恢复执行
 ```
 
 ## 项目结构
@@ -138,7 +139,7 @@ docs/                 scripting.md / taint-roadmap.md
 - 平台:Windows x64 / Pin 3.31 (build 98869) / Python 3.10;Linux 平台层未做
 - 已知怪癖见 `docs/scripting.md` 末章(稀有类事件在 exec 洪流下会被挤掉——
   等异常/syscall 前先关 exec 类引擎;异常码需 mask 到 u32;……)
-- Backlog:Phase B 精确异常拦截(context-change 回调内停泊 + `to` 上下文编辑)、
-  MCP 服务接入(作为客户端接查询协议)、runtime parity 编译期对拍、ABI 账本生成器
+- Backlog:地址转换/取码/插桩规则的 Python 配置层、MCP 服务接入(作为客户端接查询协议)、
+  runtime parity 编译期对拍、ABI 账本生成器
 
 本仓是早前内部原型的最底层 ABI 抽取 + 重写,当前为独立仓库。

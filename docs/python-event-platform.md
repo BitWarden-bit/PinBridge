@@ -262,6 +262,37 @@ pb.intercept("syscall.exit", on_exit, numbers=[nt_close_number])
 字段必须返回相同值，否则本次保留原系统调用上下文。真实 Windows/Pin 测试用 `NtClose`
 验证入口参数被替换、内核副作用被阻止，以及出口状态被改写为 `0xC0000022`。
 
+### 异常同步接管
+
+普通 `pb.on("exception", ...)` 只观察异常；需要在异常转入系统处理器前修改 Pin 的目标
+上下文时使用同步接管：
+
+```python
+def recover(event):
+    # from_registers 是异常发生现场；registers 是 Pin 即将采用的目标现场。
+    return {"registers": {"rip": recovery_address}}
+
+pb.intercept(
+    "exception.handle",
+    recover,
+    codes=[0xC0000005],
+    thread_id=None,
+    once=True,
+)
+```
+
+事件包含 `type/id/generation`、`tid/thread_id`、`address/addr`、`reason`、`code`、
+`from_registers` 和 `registers`。`codes` 在原生不可变快照中预过滤；省略表示全部异常，
+`thread_id` 可进一步限制线程。回调返回 `None` 或 `{"registers": {...}}`，只有返回字典中
+明确给出的通用寄存器会写回 Pin 提供的 `to` 上下文。
+
+Pin 上下文切换回调不获取 GIL：它复制固定大小的源/目标寄存器，使用同一个 16 槽同步
+通道限时等待脚本线程，再一次性应用补丁。无处理函数、Python 未就绪、槽满、超时、非法
+寄存器、回调异常或多插件字段冲突时都不修改目标上下文，操作系统原有异常路径继续执行。
+如果把指令指针直接改到普通函数，脚本还必须按目标 ABI 构造正确的栈；接口不会虚构一次
+`call`。真实 x64 Pin 测试触发访问违规，Python 同时改写 `rip/rsp`，跳到恢复入口并绕过
+原生 SEH 处理器；目标最终正常退出，日志证明 1 次同步决定、0 超时、0 槽位拥塞。
+
 ### 当前交付状态
 
 | 功能 | Python 入口 | 当前状态 |
@@ -275,5 +306,5 @@ pb.intercept("syscall.exit", on_exit, numbers=[nt_close_number])
 | 子进程跟随决策 | `pb.intercept("child.follow", ...)` | 已完成，跟随/不跟随真实 Pin 测试通过；子进程独立控制端口待开发 |
 | Hook 同步决定 | `pb.intercept("hook.entry/return", ..., address=...)` | 已完成，入口跳过/返回值改写真实 Pin 测试通过 |
 | 系统调用同步决定 | `pb.intercept("syscall.entry/exit", ..., numbers=...)` | 已完成，入口参数/出口返回值真实 Pin 测试通过 |
-| 异常同步决定 | 尚未发布 | 待开发；现有命名事件仅观察 |
+| 异常同步决定 | `pb.intercept("exception.handle", ..., codes=...)` | 已完成，异常现场读取/目标上下文改写真实 Pin 测试通过 |
 | 地址转换/取码/插桩规则 | 尚未发布 | 待开发；必须采用 Python 配置、原生执行 |

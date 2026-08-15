@@ -46,3 +46,6 @@ fixtures/hook_python_demo/*.lib
 fixtures/syscall_python_demo/*.exe
 fixtures/syscall_python_demo/*.exp
 fixtures/syscall_python_demo/*.lib
+fixtures/exception_python_demo/*.exe
+fixtures/exception_python_demo/*.exp
+fixtures/exception_python_demo/*.lib

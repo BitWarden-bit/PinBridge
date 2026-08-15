@@ -528,7 +528,7 @@ fn pb_event_names() -> Vec<&'static str> {
 /// native event waits for a bounded time and consumes the callback result.
 #[pyfunction(
     name = "intercept",
-    signature = (event, callback, *, once=false, address=None, thread_id=None, numbers=None)
+    signature = (event, callback, *, once=false, address=None, thread_id=None, numbers=None, codes=None)
 )]
 fn pb_intercept(
     py: Python<'_>,
@@ -538,6 +538,7 @@ fn pb_intercept(
     address: Option<u64>,
     thread_id: Option<u32>,
     numbers: Option<Vec<u64>>,
+    codes: Option<Vec<u64>>,
 ) -> PyResult<u64> {
     if current_plugin_name().is_none() {
         return Err(no_plugin());
@@ -552,15 +553,34 @@ fn pb_intercept(
             "unknown interceptor {event:?}; use pb.decision_names() to list supported names"
         ))
     })?;
-    let number_filter = numbers.map(|numbers| {
+    let number_filter = numbers.map(|numbers| -> PyResult<_> {
         let mut filter = crate::new_set();
-        filter.extend(numbers.into_iter().map(|number| number as u32));
-        filter
-    });
+        for number in numbers {
+            let number = u32::try_from(number).map_err(|_| {
+                PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                    "syscall number must fit in 32 bits",
+                )
+            })?;
+            filter.insert(number);
+        }
+        Ok(filter)
+    }).transpose()?;
+    let code_filter = codes.map(|codes| -> PyResult<_> {
+        let mut filter = crate::new_set();
+        for code in codes {
+            let code = u32::try_from(code).map_err(|_| {
+                PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                    "exception code must fit in 32 bits",
+                )
+            })?;
+            filter.insert(code);
+        }
+        Ok(filter)
+    }).transpose()?;
     let created_hook = if selector.is_hook() {
-        if number_filter.is_some() {
+        if number_filter.is_some() || code_filter.is_some() {
             return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                "Hook interceptors do not accept numbers",
+                "Hook interceptors do not accept numbers or codes",
             ));
         }
         let address = address.filter(|address| *address != 0).ok_or_else(|| {
@@ -575,16 +595,32 @@ fn pb_intercept(
         })?;
         Some((address, !existing.contains(&address)))
     } else if selector == DecisionSelector::ChildFollow {
-        if address.is_some() || thread_id.is_some() || number_filter.is_some() {
+        if address.is_some()
+            || thread_id.is_some()
+            || number_filter.is_some()
+            || code_filter.is_some()
+        {
             return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                "child.follow does not accept address, thread_id, or numbers",
+                "child.follow does not accept address, thread_id, numbers, or codes",
+            ));
+        }
+        None
+    } else if matches!(selector, DecisionSelector::SyscallEntry | DecisionSelector::SyscallExit) {
+        if address.is_some() {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "syscall interceptors do not accept address",
+            ));
+        }
+        if code_filter.is_some() {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "syscall interceptors do not accept codes",
             ));
         }
         None
     } else {
-        if address.is_some() {
+        if address.is_some() || number_filter.is_some() {
             return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                "syscall interceptors do not accept address",
+                "exception.handle does not accept address or numbers",
             ));
         }
         None
@@ -596,6 +632,7 @@ fn pb_intercept(
         address,
         thread_id,
         number_filter,
+        code_filter,
     );
     with_current_plugin_mut(|plugin| plugin.decisions.insert(id, subscription))
         .ok_or_else(no_plugin)?;
