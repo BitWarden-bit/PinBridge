@@ -74,3 +74,17 @@ PbStatus PB_CALL pb_pin_add_xed_decode_callback_function(
         return PbBackendAddXedDecodeCallbackFunction(callback, user_data);
     });
 }
+
+PbStatus PB_CALL pb_xed_decoded_inst_set_features(
+    PbXedDecodedInstHandle decoded_instruction,
+    uint32_t selected_features, uint32_t enabled_features)
+{
+    if (!decoded_instruction || selected_features == 0 ||
+        (selected_features & ~PB_XED_DECODE_FEATURE_ALL) != 0 ||
+        (enabled_features & ~selected_features) != 0)
+        return PB_ERR_INVALID_ARGUMENT;
+    return GuardRegistration([&]() -> PbStatus {
+        return PbBackendXedDecodedInstSetFeatures(
+            decoded_instruction, selected_features, enabled_features);
+    });
+}

@@ -79,6 +79,7 @@ static const char* const kRequiredSymbols[] = {
     "pb_pin_add_thread_fini_function",
     "pb_pin_add_context_change_function",
     "pb_pin_add_xed_decode_callback_function",
+    "pb_xed_decoded_inst_set_features",
     "pb_pin_add_fetch_function",
     "pb_pin_fetch_code",
     "pb_pin_add_internal_exception_handler",

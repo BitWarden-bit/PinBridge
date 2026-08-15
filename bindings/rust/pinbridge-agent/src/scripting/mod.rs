@@ -38,6 +38,7 @@ mod native_policies;
 pub mod output;
 mod python_data;
 mod subscriptions;
+mod xed_decode;
 
 pub const STATE_RUNNING: u8 = 1;
 pub const STATE_ERROR: u8 = 2;
@@ -146,6 +147,8 @@ pub struct Plugin {
     /// Python-provided instruction bytes served directly by the native Pin
     /// code-fetch callback.
     pub code_fetch: Option<code_fetch::Spec>,
+    /// Inputs applied by Pin's process-global pre-XED-decode callback.
+    pub xed_decode: Option<xed_decode::Spec>,
     /// New-style callbacks bound to exact native breakpoint ids.  Legacy
     /// `on_bp_hit` remains separate and receives every stop notification.
     pub breakpoints: TlsFreeMap<u32, subscriptions::BreakpointSubscription>,

@@ -3,7 +3,11 @@
 use pinbridge_sys::{PbStatus, PB_OK};
 
 pub fn initialize() -> PbStatus {
-    super::memory_translation::initialize()
+    let status = super::memory_translation::initialize();
+    if status != PB_OK {
+        return status;
+    }
+    super::xed_decode::initialize()
 }
 
 pub fn refresh_best_effort(reason: &str) {
@@ -25,6 +29,13 @@ pub fn refresh_best_effort(reason: &str) {
         if status != PB_OK {
             crate::log::line(&format!(
                 "code fetch policy refresh failed ({reason}) -> {status}"
+            ));
+        }
+    }
+    if let Err(status) = super::xed_decode::publish() {
+        if status != PB_OK {
+            crate::log::line(&format!(
+                "XED decode policy refresh failed ({reason}) -> {status}"
             ));
         }
     }

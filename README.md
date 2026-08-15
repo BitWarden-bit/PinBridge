@@ -107,7 +107,7 @@ python taint.py C:\tmp\win.pbtr slice --at 12345 --operand reg:rdx
 ## 测试
 
 ```powershell
-.\Run-Tests.ps1                    # CMake 契约 60/60 + 绑定生成 + 导出双向校验(695)
+.\Run-Tests.ps1                    # CMake 契约 60/60 + 绑定生成 + 导出双向校验(696)
 $env:PINBRIDGE_PIN_EXE = "<PIN_SDK_ROOT>\intel64\bin\pin.exe"
 python tests\control_e2e.py        # 控制面真机 e2e
 python tests\script_e2e.py         # 多插件脚本真机 e2e(12 步)
@@ -121,6 +121,7 @@ fixtures\exception_python_demo\run.ps1             # 异常现场交给 Python �
 fixtures\instrumentation_python_demo\run.ps1       # Python 配置范围并动态触发原生重新插桩
 fixtures\memory_translation_python_demo\run.ps1    # Python 映射地址并由原生层改写真实访存
 fixtures\code_fetch_python_demo\run.ps1            # Python 预置机器码并触发原生重新取码
+fixtures\xed_decode_python_demo\run.ps1             # XED 预解码策略 + 已解码命名/批量事件
 ```
 
 ## 项目结构

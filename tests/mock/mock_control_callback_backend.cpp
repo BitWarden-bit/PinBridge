@@ -60,3 +60,9 @@ PbStatus PbBackendAddXedDecodeCallbackFunction(
              user_data);
     return PB_OK;
 }
+
+PbStatus PbBackendXedDecodedInstSetFeatures(
+    PbXedDecodedInstHandle, uint32_t, uint32_t)
+{
+    return PB_OK;
+}

@@ -305,7 +305,7 @@ Pin 上下文切换回调不获取 GIL：它复制固定大小的源/目标寄�
 
 ```python
 generation = pb.instrumentation_set(
-    kinds=["instruction", "memory", "branch.edge"],
+    kinds=["instruction", "instruction.decode", "memory", "branch.edge"],
     ranges=[(module_start, module_end), (jit_start, jit_end)],
     threads=[worker_tid],       # 省略或 [] 表示全部线程
 )
@@ -326,7 +326,7 @@ pb.instrumentation_clear()
 运行阶段再次按种类、范围和线程过滤，因此旧代码缓存中的分析调用在规则收窄后立即失效。
 Pin 热路径不获取 GIL、不调用 Python、不分配规则对象。
 
-`pb.on("instruction"/"memory"/"branch.edge", callback)` 决定 Python 如何消费已采集事件，
+`pb.on("instruction"/"instruction.decode"/"memory"/"branch.edge", callback)` 决定 Python 如何消费已采集事件，
 `pb.instrumentation_set` 决定原生层采集哪些事件；两者职责分开。真实 Pin 回归先在引擎
 关闭时执行并缓存一个函数，再由 Python 只启用该函数范围，验证动态重新插桩成功且相邻
 排除函数没有泄漏事件。
@@ -398,6 +398,36 @@ SMC 检测覆盖全部情况。
 真实 Pin 回归先执行并缓存返回 `1` 的函数，完成握手后由 Python 读取另一函数的机器码并
 映射到原函数，第二次调用返回 `2`，同时验证未映射地址仍能正常取码。
 
+## 已完成：XED 解码输入与已解码指令通知
+
+Pin 的 `PIN_AddXedDecodeCallbackFunction` 在 XED 解码之前运行，没有指令地址，也不是
+解码结果通知。平台没有把这个借用指针伪装成异步 Python 事件，而是拆成两条职责清楚的
+链路：
+
+```python
+pb.xed_decode_set(cldemote=True, cet=None, mpx=None)
+pb.on("instruction.decode", on_decoded)
+pb.instrumentation_set(
+    kinds=["instruction.decode"],
+    ranges=[(code_start, code_end)],
+)
+```
+
+第一条链路把每个插件声明的 CET、CLDEMOTE、MPX 布尔输入合并为进程级原子快照。解码
+线程只执行一次原子读取和固定 C ABI 调用，不进入 Python、不分配、不加锁。不同插件对
+同一项给出相反明确值时拒绝更新；更新成功后全局失效旧翻译，使已 JIT 代码按新输入重新
+解码。C ABI v1.9 增加 `pb_xed_decoded_inst_set_features`，只在 Pin 回调有效期内修改受支持
+字段。
+
+第二条链路在普通 INS 插桩回调中运行，此时 Pin 已经完成解码且有稳定地址。原生层先应用
+`instrumentation_set` 的种类和地址范围，再复制长度、XED 类别、扩展、操作码、内存操作数
+数量和控制流标志到固定事件记录。`pb.on("instruction.decode")` 可逐条处理，
+`pb.watch(["instruction.decode"])` + `on_event_batch` 可批量处理；借用的 INS/XED 句柄从不
+离开 Pin 回调。该事件是静态插桩事件，`thread_id == -1`，线程过滤只适用于运行时事件。
+
+真实 Pin 回归使用 Pin 官方测试相同的 `0F 1C 00` CLDEMOTE 编码，验证 Python 策略让 XED
+识别为 CLDEMOTE、原生地址范围没有泄漏，并同时通过命名回调和批处理回调收到复制结果。
+
 ### 当前交付状态
 
 | 功能 | Python 入口 | 当前状态 |
@@ -416,3 +446,5 @@ SMC 检测覆盖全部情况。
 | 指令/内存/分支插桩规则 | `pb.instrumentation_set/clear/policy` | 已完成，动态重新插桩和原生范围过滤真实 Pin 测试通过 |
 | 地址转换 | `pb.memory_translation_set/clear/policy` | 已完成，真实访存改写和原生选择器真实 Pin 测试通过 |
 | 取机器码 | `pb.code_fetch_set/clear/policy` | 已完成，动态重新取码和原始地址回退真实 Pin 测试通过 |
+| XED 解码输入 | `pb.xed_decode_set/clear/policy` | 已完成，CET/CLDEMOTE/MPX 原生预解码配置，冲突回滚和重新解码已接入 |
+| 已解码指令通知 | `pb.on("instruction.decode")` + `pb.instrumentation_set` | 已完成，原生范围过滤、命名/批量 Python 回调真实 Pin 测试通过 |

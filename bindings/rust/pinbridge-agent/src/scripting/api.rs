@@ -720,6 +720,9 @@ fn instrumentation_kind(name: &str) -> Option<u32> {
         "instruction" | "instruction.exec" | "exec" => crate::engines::INSTRUMENT_EXEC,
         "memory" | "mem" => crate::engines::INSTRUMENT_MEMORY,
         "branch" | "branch.edge" | "branch_edge" => crate::engines::INSTRUMENT_BRANCH,
+        "instruction.decode" | "instruction_decode" | "decode" => {
+            crate::engines::INSTRUMENT_DECODE
+        }
         _ => return None,
     })
 }
@@ -749,7 +752,7 @@ fn pb_instrumentation_set(
     }) {
         kind_mask |= instrumentation_kind(&name).ok_or_else(|| {
             PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-                "unknown instrumentation kind {name:?}; expected instruction, memory, or branch.edge"
+                "unknown instrumentation kind {name:?}; expected instruction, instruction.decode, memory, or branch.edge"
             ))
         })?;
     }
@@ -847,6 +850,9 @@ fn pb_instrumentation_policy() -> PyResult<Option<(Vec<String>, Vec<(u64, u64)>,
             }
             if spec.kinds & crate::engines::INSTRUMENT_BRANCH != 0 {
                 kinds.push("branch.edge".to_string());
+            }
+            if spec.kinds & crate::engines::INSTRUMENT_DECODE != 0 {
+                kinds.push("instruction.decode".to_string());
             }
             (kinds, spec.ranges.clone(), spec.threads.clone())
         })
@@ -1129,6 +1135,70 @@ fn pb_code_fetch_policy(py: Python<'_>) -> PyResult<Option<Vec<(u64, Py<PyBytes>
     .ok_or_else(no_plugin)
 }
 
+/// Configures inputs consumed by Pin's pre-XED-decode callback. These are
+/// global decoding semantics, so active plugins must agree on every feature
+/// they explicitly select. None leaves a feature unspecified by this plugin.
+#[pyfunction(
+    name = "xed_decode_set",
+    signature = (*, cet=None, cldemote=None, mpx=None)
+)]
+fn pb_xed_decode_set(
+    cet: Option<bool>,
+    cldemote: Option<bool>,
+    mpx: Option<bool>,
+) -> PyResult<u64> {
+    if current_plugin_name().is_none() {
+        return Err(no_plugin());
+    }
+    if cet.is_none() && cldemote.is_none() && mpx.is_none() {
+        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+            "xed_decode_set needs cet, cldemote, or mpx; use xed_decode_clear to disable",
+        ));
+    }
+    let spec = super::xed_decode::Spec { cet, cldemote, mpx };
+    let previous = with_current_plugin_mut(|plugin| plugin.xed_decode.replace(spec))
+        .ok_or_else(no_plugin)?;
+    match super::xed_decode::publish() {
+        Ok(generation) => Ok(generation),
+        Err(status) => {
+            with_current_plugin_mut(|plugin| plugin.xed_decode = previous);
+            super::native_policies::refresh_best_effort("rollback failed XED decode update");
+            Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+                "native XED decode update failed with status {status}; active plugins must agree on explicit feature values"
+            )))
+        }
+    }
+}
+
+#[pyfunction(name = "xed_decode_clear")]
+fn pb_xed_decode_clear() -> PyResult<bool> {
+    let previous =
+        with_current_plugin_mut(|plugin| plugin.xed_decode.take()).ok_or_else(no_plugin)?;
+    if previous.is_none() {
+        return Ok(false);
+    }
+    match super::xed_decode::publish() {
+        Ok(_) => Ok(true),
+        Err(status) => {
+            with_current_plugin_mut(|plugin| plugin.xed_decode = previous);
+            super::native_policies::refresh_best_effort("rollback failed XED decode clear");
+            Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+                "native XED decode clear failed with status {status}"
+            )))
+        }
+    }
+}
+
+#[pyfunction(name = "xed_decode_policy")]
+fn pb_xed_decode_policy() -> PyResult<Option<(Option<bool>, Option<bool>, Option<bool>)>> {
+    with_current_plugin_mut(|plugin| {
+        plugin
+            .xed_decode
+            .map(|spec| (spec.cet, spec.cldemote, spec.mpx))
+    })
+    .ok_or_else(no_plugin)
+}
+
 /// Subscribes on_event_batch to the given event kinds (hook, mem, exec,
 /// branch, syscall, ctx, module_load, module_unload), optionally limited to
 /// an address range; batch paces the per-tick page size (default 512).
@@ -1185,6 +1255,9 @@ fn kind_bit(name: &str) -> Option<u32> {
         "ctx" | "context_change" => 1 << 6,
         "module_load" => 1 << 7,
         "module_unload" => 1 << 8,
+        "instruction.decode" | "instruction_decode" | "decode" => {
+            1 << crate::event::EVENT_INSTRUCTION_DECODE
+        }
         _ => return None,
     })
 }
@@ -1246,6 +1319,9 @@ fn pb(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(pb_code_fetch_set, m)?)?;
     m.add_function(wrap_pyfunction!(pb_code_fetch_clear, m)?)?;
     m.add_function(wrap_pyfunction!(pb_code_fetch_policy, m)?)?;
+    m.add_function(wrap_pyfunction!(pb_xed_decode_set, m)?)?;
+    m.add_function(wrap_pyfunction!(pb_xed_decode_clear, m)?)?;
+    m.add_function(wrap_pyfunction!(pb_xed_decode_policy, m)?)?;
     m.add_function(wrap_pyfunction!(pb_watch, m)?)?;
     m.add_function(wrap_pyfunction!(pb_unsubscribe, m)?)?;
     m.add_function(wrap_pyfunction!(pb_subscribe, m)?)?;

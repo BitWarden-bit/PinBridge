@@ -17,5 +17,8 @@ PbStatus PbBackendAddContextChangeFunction(
     PbContextChangeCallback callback, void* user_data, uint64_t* out_callback);
 PbStatus PbBackendAddXedDecodeCallbackFunction(
     PbXedDecodeCallback callback, void* user_data);
+PbStatus PbBackendXedDecodedInstSetFeatures(
+    PbXedDecodedInstHandle decoded_instruction,
+    uint32_t selected_features, uint32_t enabled_features);
 
 #endif

@@ -12,7 +12,7 @@ use pyo3::types::PyDict;
 const CONTEXT_CHANGE_EXCEPTION: u64 = 4;
 static NEXT_SUBSCRIPTION_ID: AtomicU64 = AtomicU64::new(1);
 
-pub const PUBLIC_EVENT_NAMES: [&str; 19] = [
+pub const PUBLIC_EVENT_NAMES: [&str; 20] = [
     "process.start",
     "process.exit",
     "thread.start",
@@ -25,6 +25,7 @@ pub const PUBLIC_EVENT_NAMES: [&str; 19] = [
     "hook.entry",
     "hook.return",
     "instruction",
+    "instruction.decode",
     "memory",
     "branch.edge",
     "code.smc",
@@ -47,6 +48,9 @@ impl EventSelector {
             "hook.return" | "hook_return" => Self::Kind(EVENT_HOOK_RETURN),
             "memory" | "mem" => Self::Kind(EVENT_MEMORY),
             "instruction" | "instruction.exec" | "exec" => Self::Kind(EVENT_EXEC),
+            "instruction.decode" | "instruction_decode" | "decode" => {
+                Self::Kind(EVENT_INSTRUCTION_DECODE)
+            }
             "branch" | "branch.edge" | "branch_edge" => Self::Kind(EVENT_BRANCH_EDGE),
             "syscall" => Self::Kind(EVENT_SYSCALL),
             "context" | "context.change" | "context_change" => Self::Kind(EVENT_CONTEXT_CHANGE),
@@ -81,6 +85,7 @@ impl EventSelector {
             Self::Kind(EVENT_HOOK_RETURN) => "hook.return",
             Self::Kind(EVENT_MEMORY) => "memory",
             Self::Kind(EVENT_EXEC) => "instruction",
+            Self::Kind(EVENT_INSTRUCTION_DECODE) => "instruction.decode",
             Self::Kind(EVENT_BRANCH_EDGE) => "branch.edge",
             Self::Kind(EVENT_SYSCALL) => "syscall",
             Self::Kind(EVENT_CONTEXT_CHANGE) => "context.change",
@@ -293,6 +298,18 @@ pub fn build_event_dict(
             row.set_item("memory_address", event.arg0)?;
             row.set_item("size", event.arg1)?;
             row.set_item("access", event.arg2)?;
+        }
+        EventSelector::Kind(EVENT_INSTRUCTION_DECODE) => {
+            row.set_item("size", event.arg0)?;
+            row.set_item("category", event.arg1)?;
+            row.set_item("extension", event.arg2)?;
+            row.set_item("opcode", event.arg3)?;
+            row.set_item("memory_operand_count", event.arg4)?;
+            row.set_item("has_fall_through", event.arg5 & 1 != 0)?;
+            row.set_item("is_branch", event.arg5 & (1 << 1) != 0)?;
+            row.set_item("is_call", event.arg5 & (1 << 2) != 0)?;
+            row.set_item("is_return", event.arg5 & (1 << 3) != 0)?;
+            row.set_item("is_syscall", event.arg5 & (1 << 4) != 0)?;
         }
         EventSelector::Kind(EVENT_BRANCH_EDGE) => {
             row.set_item("target", event.arg0)?;

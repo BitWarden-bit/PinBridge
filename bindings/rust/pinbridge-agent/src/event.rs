@@ -68,6 +68,11 @@ pub const EVENT_OUT_OF_MEMORY: u32 = 23;
 /// arg1=exception address, arg2=fault address, arg3=access type,
 /// arg4=exception class, arg5=fault address known.
 pub const EVENT_PIN_INTERNAL_EXCEPTION: u32 = 24;
+/// A statically decoded instruction observed during Pin instrumentation.
+/// address=instruction address, arg0=size, arg1=XED category,
+/// arg2=XED extension, arg3=opcode/iclass, arg4=memory operand count,
+/// arg5=control-flow flags (fall-through/branch/call/return/syscall).
+pub const EVENT_INSTRUCTION_DECODE: u32 = 25;
 
 pub const EVENT_KIND_COUNT: usize = 9;
 
@@ -144,6 +149,7 @@ pub fn kind_name(kind: u32) -> &'static str {
         EVENT_PIN_ATTACH => "pin_attach",
         EVENT_OUT_OF_MEMORY => "out_of_memory",
         EVENT_PIN_INTERNAL_EXCEPTION => "pin_internal_exception",
+        EVENT_INSTRUCTION_DECODE => "instruction_decode",
         _ => "unknown",
     }
 }

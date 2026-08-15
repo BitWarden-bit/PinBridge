@@ -64,6 +64,11 @@ int main(void)
     if (pb_pin_add_xed_decode_callback_function(OnXedDecode, &g_xed_decode_calls) != PB_OK ||
         g_xed_decode_calls != 1)
         return 5;
+    if (pb_xed_decoded_inst_set_features(
+            (PbXedDecodedInstHandle)(uintptr_t)UINT64_C(0x7000),
+            PB_XED_DECODE_FEATURE_CET | PB_XED_DECODE_FEATURE_CLDEMOTE,
+            PB_XED_DECODE_FEATURE_CLDEMOTE) != PB_OK)
+        return 6;
     if (pb_pin_add_application_start_function(0, 0, &callback) !=
             PB_ERR_INVALID_ARGUMENT || callback.opaque != 0 ||
         pb_pin_add_prepare_for_fini_function(OnPrepareForFini, 0, 0) !=
@@ -71,7 +76,16 @@ int main(void)
         pb_pin_add_fini_function(0, 0, 0) != PB_ERR_INVALID_ARGUMENT ||
         pb_pin_add_context_change_function(0, 0, &callback) !=
             PB_ERR_INVALID_ARGUMENT || callback.opaque != 0 ||
-        pb_pin_add_xed_decode_callback_function(0, 0) != PB_ERR_INVALID_ARGUMENT)
-        return 6;
+        pb_pin_add_xed_decode_callback_function(0, 0) != PB_ERR_INVALID_ARGUMENT ||
+        pb_xed_decoded_inst_set_features(
+            0, PB_XED_DECODE_FEATURE_CET, 0) != PB_ERR_INVALID_ARGUMENT ||
+        pb_xed_decoded_inst_set_features(
+            (PbXedDecodedInstHandle)(uintptr_t)UINT64_C(0x7000), 0, 0) !=
+            PB_ERR_INVALID_ARGUMENT ||
+        pb_xed_decoded_inst_set_features(
+            (PbXedDecodedInstHandle)(uintptr_t)UINT64_C(0x7000),
+            PB_XED_DECODE_FEATURE_CET, PB_XED_DECODE_FEATURE_CLDEMOTE) !=
+            PB_ERR_INVALID_ARGUMENT)
+        return 7;
     return 0;
 }

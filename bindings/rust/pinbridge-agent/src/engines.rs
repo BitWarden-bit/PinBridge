@@ -6,7 +6,7 @@
 
 use crate::event::{
     Event, EVENT_BRANCH_EDGE, EVENT_EXEC, EVENT_HOOK_REGS, EVENT_HOOK_RETURN, EVENT_MEMORY,
-    EVENT_SYSCALL,
+    EVENT_INSTRUCTION_DECODE, EVENT_SYSCALL,
 };
 use crate::ring::submit;
 use core::ffi::c_void;
@@ -26,7 +26,9 @@ static DEFAULT_INSTRUMENTATION_KINDS: AtomicU64 = AtomicU64::new(0);
 pub const INSTRUMENT_EXEC: u32 = 1 << EVENT_EXEC;
 pub const INSTRUMENT_MEMORY: u32 = 1 << EVENT_MEMORY;
 pub const INSTRUMENT_BRANCH: u32 = 1 << EVENT_BRANCH_EDGE;
-pub const INSTRUMENT_ALL: u32 = INSTRUMENT_EXEC | INSTRUMENT_MEMORY | INSTRUMENT_BRANCH;
+pub const INSTRUMENT_DECODE: u32 = 1 << EVENT_INSTRUCTION_DECODE;
+pub const INSTRUMENT_ALL: u32 =
+    INSTRUMENT_EXEC | INSTRUMENT_MEMORY | INSTRUMENT_BRANCH | INSTRUMENT_DECODE;
 pub const MAX_INSTRUMENTATION_RANGES: usize = 64;
 pub const MAX_INSTRUMENTATION_THREADS: usize = 64;
 
@@ -425,6 +427,48 @@ pub unsafe extern "C" fn on_ins(ins: PbInsHandle, _user_data: *mut c_void) {
         KIND_LINEAR
     };
     meta_record(address, kind, size.min(255) as u8);
+
+    // Unlike the runtime `instruction` event, this is emitted once when Pin
+    // has fully decoded the instruction for instrumentation. All values are
+    // copied now; no borrowed INS/XED object crosses into the Python thread.
+    if wants_at_instrumentation(address, EVENT_INSTRUCTION_DECODE) {
+        let mut category: i32 = 0;
+        let mut extension: i32 = 0;
+        let mut opcode: u32 = 0;
+        let mut memory_operands: u32 = 0;
+        let _ = pb_ins_category(ins, &mut category);
+        let _ = pb_ins_extension(ins, &mut extension);
+        let _ = pb_ins_opcode(ins, &mut opcode);
+        let _ = pb_ins_memory_operand_count(ins, &mut memory_operands);
+        let mut flags = 0u64;
+        if query_bool(ins, pb_ins_has_fall_through) {
+            flags |= 1;
+        }
+        if is_branch {
+            flags |= 1 << 1;
+        }
+        if is_call {
+            flags |= 1 << 2;
+        }
+        if is_ret {
+            flags |= 1 << 3;
+        }
+        if query_bool(ins, pb_ins_is_syscall) {
+            flags |= 1 << 4;
+        }
+        submit(Event {
+            kind: EVENT_INSTRUCTION_DECODE,
+            thread_id: PB_INVALID_THREAD_ID,
+            address,
+            arg0: size,
+            arg1: category as u32 as u64,
+            arg2: extension as u32 as u64,
+            arg3: opcode as u64,
+            arg4: memory_operands as u64,
+            arg5: flags,
+            ..Event::EMPTY
+        });
+    }
 
     if ENABLE_EXEC.load(Ordering::Relaxed) && wants_at_instrumentation(address, EVENT_EXEC) {
         pb_ins_insert_exec(ins, Some(on_exec), core::ptr::null_mut());

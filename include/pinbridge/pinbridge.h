@@ -28,7 +28,7 @@ extern "C" {
 #endif
 
 #define PB_ABI_VERSION_MAJOR 1u
-#define PB_ABI_VERSION_MINOR 8u
+#define PB_ABI_VERSION_MINOR 9u
 #define PB_ABI_VERSION ((PB_ABI_VERSION_MAJOR << 16u) | PB_ABI_VERSION_MINOR)
 
 typedef int32_t PbStatus;
@@ -106,6 +106,12 @@ typedef struct PbPinConfigurationOpaque* PbPinConfigurationHandle;
 
 /* Borrowed XED decode object. Valid only while PbXedDecodeCallback is running. */
 typedef struct PbXedDecodedInstOpaque* PbXedDecodedInstHandle;
+
+/* XED pre-decode feature bits. Only explicitly selected bits are changed. */
+#define PB_XED_DECODE_FEATURE_CET UINT32_C(0x1)
+#define PB_XED_DECODE_FEATURE_CLDEMOTE UINT32_C(0x2)
+#define PB_XED_DECODE_FEATURE_MPX UINT32_C(0x4)
+#define PB_XED_DECODE_FEATURE_ALL UINT32_C(0x7)
 
 /* Borrowed, logically opaque Pin exception info. NULL means details are not requested. */
 typedef struct PbExceptionInfoOpaque* PbExceptionInfoHandle;
@@ -1498,6 +1504,12 @@ PB_API PbStatus PB_CALL pb_pin_add_context_change_function(
 /* Pin owns one global XED decode callback slot; repeated calls replace bridge state. */
 PB_API PbStatus PB_CALL pb_pin_add_xed_decode_callback_function(
     PbXedDecodeCallback callback, void* user_data);
+/* ABI v1.9: safely changes supported inputs on the borrowed XED object.
+   selected_features says which inputs to change; enabled_features supplies
+   their Boolean values and must be a subset of selected_features. */
+PB_API PbStatus PB_CALL pb_xed_decoded_inst_set_features(
+    PbXedDecodedInstHandle decoded_instruction,
+    uint32_t selected_features, uint32_t enabled_features);
 PB_API PbStatus PB_CALL pb_pin_add_fetch_function(
     PbFetchCallback callback, void* user_data);
 PB_API PbStatus PB_CALL pb_pin_fetch_code(

@@ -693,3 +693,4 @@ pb_trace_size
 pb_trace_version
 pb_uint32_from_string
 pb_uint64_from_string
+pb_xed_decoded_inst_set_features

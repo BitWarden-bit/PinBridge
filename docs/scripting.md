@@ -149,7 +149,7 @@ service-class 高位会在进入事件和过滤器前移除。entry/exit 通过�
 - `pb.counters() -> (total, dropped, capacity, [kind_counts])`(kind_counts 8 类）
 - `pb.exc_policy(enabled, code=0) -> bool`（异常暂停策略；停止窗口按设计不精确）
 - `pb.instrumentation_set(kinds=None, ranges=None, threads=None) -> generation`：替换当前插件
-  的高频采集规则。`kinds` 可取 `instruction`、`memory`、`branch.edge`；`ranges` 是半开区间
+  的高频采集规则。`kinds` 可取 `instruction`、`instruction.decode`、`memory`、`branch.edge`；`ranges` 是半开区间
   `(lo, hi)` 列表，省略时使用启动配置的 trace range；`threads` 省略或空列表表示全部线程。
 - `pb.instrumentation_policy() -> (kinds, ranges, threads) | None`：读取当前插件自己的规则。
 - `pb.instrumentation_clear() -> bool`：移除当前插件的规则，不影响其他插件。
@@ -182,6 +182,25 @@ Pin 插桩回调和分析回调在原生层执行种类、范围和线程过滤�
 取码器只在第一次非空策略时注册，但 Pin 没有注销接口；此后 `clear` 是全量原始取码透传。
 自定义取码器启用后 Pin 不再保证自动发现全部 SMC，平台只自动失效本 API 更新涉及的
 范围；目标自行改写的其他代码需要脚本显式重新发布策略。
+
+XED 解码配置：
+- `pb.xed_decode_set(cet=None, cldemote=None, mpx=None) -> generation`：设置当前插件明确
+  指定的解码输入。`True`/`False` 都是明确值，`None` 表示本插件不决定该项。
+- `pb.xed_decode_policy() -> (cet, cldemote, mpx) | None`：读取当前插件自己的配置。
+- `pb.xed_decode_clear() -> bool`：撤销当前插件的配置。
+
+Pin 的 XED 回调发生在解码前，不是“已解码指令通知”。平台在该回调里只读取原子快照并
+设置 CET、CLDEMOTE、MPX 输入；借用的 XED 指针不会进入 Python。解码语义是进程级的，
+所以多个运行插件对同一项给出相反明确值时，更新失败并回滚。策略变化会让 Pin 全局翻译
+缓存失效，以便旧代码按新输入重新解码。
+
+已解码通知使用另一条正确的链路：先订阅 `pb.on("instruction.decode", callback)`，或定义
+`on_event_batch` 并调用 `pb.watch(["instruction.decode"], range=...)`；再用
+`pb.instrumentation_set(kinds=["instruction.decode"], ranges=[...])` 做原生地址过滤。
+事件在线程无关的插桩阶段产生，因此 `tid == -1`，`threads` 过滤不适用于该种类。专用字段
+为 `size`、`category`、`extension`、`opcode`、`memory_operand_count`、
+`has_fall_through`、`is_branch`、`is_call`、`is_return`、`is_syscall`。这些值已经从 INS/XED
+对象复制到固定记录；回调需要文本时可在脚本线程按地址调用 `pb.disasm`。
 
 轨迹录制（.pbtr，见 docs/taint-roadmap.md 第 2 层；与 64K 主环相互独立）:
 - `pb.trace_start(path, kinds=None, range=None) -> bool`;kinds 名映射到录制档：
@@ -299,7 +318,7 @@ pb.off(subscription_id)
 
 目前已接入的命名事件：`process.start`、`process.exit`、`thread.start`、
 `thread.exit`、`module.load`、`module.unload`、`exception`、`context.change`、
-`syscall`、`hook.entry`、`hook.return`、`instruction`、`memory`、`branch.edge`、
+`syscall`、`hook.entry`、`hook.return`、`instruction`、`instruction.decode`、`memory`、`branch.edge`、
 `code.smc`、`pin.detach`、`pin.attach`、`memory.oom`、`pin.internal_exception`。
 
 订阅 `instruction`、`memory`、`branch.edge` 或 `syscall` 会把对应的原生采集引擎加入

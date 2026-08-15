@@ -149,3 +149,21 @@ PbStatus PbBackendAddXedDecodeCallbackFunction(
     }
     return PB_OK;
 }
+
+PbStatus PbBackendXedDecodedInstSetFeatures(
+    PbXedDecodedInstHandle decoded_instruction,
+    uint32_t selected_features, uint32_t enabled_features)
+{
+    xed_decoded_inst_t* xedd =
+        reinterpret_cast<xed_decoded_inst_t*>(decoded_instruction);
+    if ((selected_features & PB_XED_DECODE_FEATURE_CET) != 0)
+        xed3_operand_set_cet(xedd,
+            (enabled_features & PB_XED_DECODE_FEATURE_CET) != 0 ? 1 : 0);
+    if ((selected_features & PB_XED_DECODE_FEATURE_CLDEMOTE) != 0)
+        xed3_operand_set_cldemote(xedd,
+            (enabled_features & PB_XED_DECODE_FEATURE_CLDEMOTE) != 0 ? 1 : 0);
+    if ((selected_features & PB_XED_DECODE_FEATURE_MPX) != 0)
+        xed3_operand_set_mpxmode(xedd,
+            (enabled_features & PB_XED_DECODE_FEATURE_MPX) != 0 ? 1 : 0);
+    return PB_OK;
+}

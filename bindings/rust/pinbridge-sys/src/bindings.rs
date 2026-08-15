@@ -3,8 +3,8 @@
 use core::ffi::{c_char, c_void};
 
 pub const PB_ABI_VERSION_MAJOR: u32 = 1;
-pub const PB_ABI_VERSION_MINOR: u32 = 8;
-pub const PB_ABI_VERSION: u32 = 65544;
+pub const PB_ABI_VERSION_MINOR: u32 = 9;
+pub const PB_ABI_VERSION: u32 = 65545;
 pub const PB_TRI_YES: PbTri = 0;
 pub const PB_TRI_NO: PbTri = 1;
 pub const PB_TRI_MAYBE: PbTri = 2;
@@ -21,6 +21,10 @@ pub const PB_PIN_COMMIT_HASH: &str = "fa6f126a8";
 pub const PB_PIN_PRODUCT_VERSION_MAJOR: u32 = 3;
 pub const PB_PIN_PRODUCT_VERSION_MINOR: u32 = 31;
 pub const PB_CALLBACK_INVALID_OPAQUE: u64 = 0;
+pub const PB_XED_DECODE_FEATURE_CET: u32 = 1;
+pub const PB_XED_DECODE_FEATURE_CLDEMOTE: u32 = 2;
+pub const PB_XED_DECODE_FEATURE_MPX: u32 = 4;
+pub const PB_XED_DECODE_FEATURE_ALL: u32 = 7;
 pub const PB_LOGTYPE_CONSOLE: PbLogType = 0;
 pub const PB_LOGTYPE_LOGFILE: PbLogType = 1;
 pub const PB_LOGTYPE_CONSOLE_AND_LOGFILE: PbLogType = 2;
@@ -2137,6 +2141,7 @@ unsafe extern "C" {
     pub fn pb_pin_add_thread_fini_function(callback: PbThreadFiniCallback, user_data: *mut c_void, out_callback: *mut PbCallbackHandle) -> PbStatus;
     pub fn pb_pin_add_context_change_function(callback: PbContextChangeCallback, user_data: *mut c_void, out_callback: *mut PbCallbackHandle) -> PbStatus;
     pub fn pb_pin_add_xed_decode_callback_function(callback: PbXedDecodeCallback, user_data: *mut c_void) -> PbStatus;
+    pub fn pb_xed_decoded_inst_set_features(decoded_instruction: PbXedDecodedInstHandle, selected_features: u32, enabled_features: u32) -> PbStatus;
     pub fn pb_pin_add_fetch_function(callback: PbFetchCallback, user_data: *mut c_void) -> PbStatus;
     pub fn pb_pin_fetch_code(copy_buffer: *mut c_void, address: u64, max_size: u64, exception_info: PbExceptionInfoHandle, out_copied: *mut u64) -> PbStatus;
     pub fn pb_pin_fetch_original_code(copy_buffer: *mut c_void, address: u64, max_size: u64, exception_info: PbExceptionInfoHandle, out_copied: *mut u64) -> PbStatus;
