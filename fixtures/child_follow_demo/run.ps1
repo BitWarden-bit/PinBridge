@@ -12,12 +12,20 @@ $bundle = Split-Path -Parent $repo
 $target = Join-Path $dir "child_follow_demo_x64.exe"
 $plugin = Join-Path $dir "child_decision.py"
 $badReplacement = Join-Path $dir "bad\child_decision.py"
+$runtimeBadReplacement = Join-Path $dir "bad_runtime\child_decision.py"
+$policyBadReplacement = Join-Path $dir "bad_policy\child_decision.py"
+$goodReplacement = Join-Path $dir "good\child_decision.py"
+$policyGuard = Join-Path $dir "policy_guard.py"
 $childPlugin = Join-Path $dir "child_session.py"
 $cli = Join-Path $repo "bindings\rust\target\release\pinbridge-cli.exe"
 $agent = Join-Path $repo "bindings\rust\target\release\pinbridge_agent.dll"
 $pin = Join-Path $bundle "VMP_Offline_Recovery_Kit_20260803_FINAL\runtime\pin\intel64\bin\pin.exe"
 
-foreach ($path in @($target, $plugin, $badReplacement, $childPlugin, $cli, $agent, $pin)) {
+foreach ($path in @(
+    $target, $plugin, $badReplacement, $runtimeBadReplacement,
+    $policyBadReplacement, $goodReplacement, $policyGuard, $childPlugin,
+    $cli, $agent, $pin
+)) {
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
         throw "required file not found: $path"
     }
@@ -124,6 +132,16 @@ try {
     if (-not $readyOutput.Contains("CHILD_DECISION_READY")) {
         throw "original child decision plugin did not enter running state"
     }
+    [void](Invoke-Cli -Command @("script", "run", $policyGuard))
+    $guardOutput = ""
+    while ([datetime]::UtcNow -lt $deadline -and
+           -not $guardOutput.Contains("CHILD_POLICY_GUARD_READY")) {
+        try { $guardOutput = Invoke-Cli -Command @("script", "output") } catch {}
+        Start-Sleep -Milliseconds 50
+    }
+    if (-not $guardOutput.Contains("CHILD_POLICY_GUARD_READY")) {
+        throw "native policy guard plugin did not enter running state"
+    }
     $badRejected = $false
     try {
         [void](Invoke-Cli -Command @("script", "run", $badReplacement))
@@ -137,6 +155,55 @@ try {
     }).Count -eq 1
     if (-not $originalStillRunning) {
         throw "syntax-invalid update retired the running plugin"
+    }
+
+    [void](Invoke-Cli -Command @("script", "run", $runtimeBadReplacement))
+    $runtimeRollbackOutput = ""
+    while ([datetime]::UtcNow -lt $deadline -and
+           -not $runtimeRollbackOutput.Contains("replacement failed; previous plugin restored")) {
+        try { $runtimeRollbackOutput = Invoke-Cli -Command @("script", "output") } catch {}
+        Start-Sleep -Milliseconds 50
+    }
+    if (-not $runtimeRollbackOutput.Contains("CHILD_RUNTIME_REPLACEMENT_ARMED") -or
+        -not $runtimeRollbackOutput.Contains("replacement failed; previous plugin restored")) {
+        throw "runtime-failed replacement did not roll back cleanly"
+    }
+    $pluginsAfterRollback = Invoke-Cli -Command @("script", "list") | ConvertFrom-Json
+    $originalRestored = @($pluginsAfterRollback.plugins | Where-Object {
+        $_.name -eq "child_decision.py" -and [int]$_.state -eq 1
+    }).Count -eq 1
+    if (-not $originalRestored) { throw "runtime replacement failure lost the old plugin" }
+
+    [void](Invoke-Cli -Command @("script", "run", $policyBadReplacement))
+    $policyRollbackOutput = ""
+    while ([datetime]::UtcNow -lt $deadline -and
+           -not $policyRollbackOutput.Contains("XED decode policy rejected")) {
+        try { $policyRollbackOutput = Invoke-Cli -Command @("script", "output") } catch {}
+        Start-Sleep -Milliseconds 50
+    }
+    if (-not $policyRollbackOutput.Contains("CHILD_POLICY_REPLACEMENT_ARMED") -or
+        -not $policyRollbackOutput.Contains("previous plugin restored")) {
+        throw "native-policy-conflicting replacement did not roll back cleanly"
+    }
+    $pluginsAfterPolicyRollback = Invoke-Cli -Command @("script", "list") | ConvertFrom-Json
+    $originalAfterPolicyConflict = @($pluginsAfterPolicyRollback.plugins | Where-Object {
+        $_.name -eq "child_decision.py" -and [int]$_.state -eq 1
+    }).Count -eq 1
+    if (-not $originalAfterPolicyConflict) {
+        throw "native policy conflict lost the old plugin"
+    }
+
+    [void](Invoke-Cli -Command @("script", "run", $goodReplacement))
+    $replacementOutput = ""
+    while ([datetime]::UtcNow -lt $deadline -and
+           (-not $replacementOutput.Contains("CHILD_REPLACEMENT_READY") -or
+            -not $replacementOutput.Contains("CHILD_ORIGINAL_UNLOAD"))) {
+        try { $replacementOutput = Invoke-Cli -Command @("script", "output") } catch {}
+        Start-Sleep -Milliseconds 50
+    }
+    if (-not $replacementOutput.Contains("CHILD_REPLACEMENT_READY") -or
+        -not $replacementOutput.Contains("CHILD_ORIGINAL_UNLOAD")) {
+        throw "successful transactional replacement did not commit"
     }
 
     $childPort = 0
@@ -227,6 +294,9 @@ try {
         target_exit = $pinProcess.ExitCode
         callback = $true
         bad_replacement_preserved_original = $true
+        runtime_replacement_rolled_back = $true
+        policy_replacement_rolled_back = $true
+        successful_replacement_committed = $true
         child_control_port = $(if ($Follow) { $childPort } else { $null })
         child_python = $(if ($Follow) { $true } else { $false })
         target_output = $targetOutput

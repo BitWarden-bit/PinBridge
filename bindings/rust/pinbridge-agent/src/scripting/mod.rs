@@ -42,6 +42,13 @@ mod xed_decode;
 
 pub const STATE_RUNNING: u8 = 1;
 pub const STATE_ERROR: u8 = 2;
+/// The old version of a plugin is being retired after its replacement passed
+/// initialization and native-policy validation.
+pub const STATE_REPLACING: u8 = 3;
+/// A same-name update is initializing under a private registry key. It may
+/// collect Python handlers and native ownership, but it is not dispatched or
+/// included in published interests/policies until commit.
+pub const STATE_STAGING: u8 = 4;
 
 /// Loopback port of the query server; plugins dial it for every operation.
 pub static RPC_PORT: AtomicU16 = AtomicU16::new(0);
@@ -132,7 +139,7 @@ pub struct Plugin {
     /// callbacks are invoked through the grabbed Py<PyAny> handles below.
     #[allow(dead_code)]
     pub module: Py<PyModule>,
-    pub state: u8, // STATE_RUNNING | STATE_ERROR
+    pub state: u8, // STATE_RUNNING | STATE_ERROR | transactional internal states
     /// Error plugins remain listed for diagnosis, but their Python/native
     /// runtime ownership is drained exactly once.
     pub quarantined: bool,
@@ -222,6 +229,18 @@ pub fn with_registry_mut<R>(f: impl FnOnce(&mut TlsFreeMap<String, Plugin>) -> R
 /// plugin context). Scripting thread only.
 pub fn current_plugin_name() -> Option<String> {
     unsafe { (*core::ptr::addr_of!(CURRENT_PLUGIN)).clone() }
+}
+
+/// User-facing name of the current plugin. During a transactional update the
+/// registry key is private, while Plugin::name remains stable.
+pub fn current_plugin_display_name() -> Option<String> {
+    let key = current_plugin_name()?;
+    with_registry(|registry| {
+        registry
+            .get(&key)
+            .map(|plugin| plugin.name.clone())
+            .or(Some(key))
+    })
 }
 
 /// Mutates the plugin currently executing Python code, if any (scripting

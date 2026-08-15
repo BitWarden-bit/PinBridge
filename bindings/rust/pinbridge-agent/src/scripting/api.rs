@@ -15,7 +15,9 @@ use super::events::{EventSelector, EventSubscription, PUBLIC_EVENT_NAMES};
 use super::host::{connect, mark_native_dirty, BATCH_MAX};
 use super::output;
 use super::subscriptions::{self, BreakpointSubscription};
-use super::{current_plugin_name, with_current_plugin_mut, Watch, RPC_PORT};
+use super::{
+    current_plugin_display_name, current_plugin_name, with_current_plugin_mut, Watch, RPC_PORT,
+};
 use core::sync::atomic::Ordering;
 use pinbridge_client::client::Client;
 use pinbridge_proto::ARCH_X64;
@@ -58,7 +60,7 @@ fn no_plugin() -> PyErr {
 
 #[pyfunction(name = "print")]
 fn pb_print(msg: &str) {
-    let plugin = current_plugin_name().unwrap_or_else(|| "?".to_string());
+    let plugin = current_plugin_display_name().unwrap_or_else(|| "?".to_string());
     output::push(&plugin, msg);
     crate::log::line(&format!("[py:{plugin}] {msg}"));
 }
@@ -66,7 +68,7 @@ fn pb_print(msg: &str) {
 /// Alias of print (old scripts used pb.log).
 #[pyfunction(name = "log")]
 fn pb_log(msg: &str) {
-    let plugin = current_plugin_name().unwrap_or_else(|| "?".to_string());
+    let plugin = current_plugin_display_name().unwrap_or_else(|| "?".to_string());
     output::push(&plugin, msg);
     crate::log::line(&format!("[py:{plugin}] {msg}"));
 }
@@ -191,7 +193,7 @@ fn pb_breakpoint_remove(id: u32) -> PyResult<bool> {
         if rpc(|c| c.bp_remove(id)).is_none() {
             subscriptions::queue_native_removal(id);
             output::push(
-                &current_plugin_name().unwrap_or_else(|| "?".to_string()),
+                &current_plugin_display_name().unwrap_or_else(|| "?".to_string()),
                 &format!("breakpoint {id} handler removed; native removal failed"),
             );
             return Ok(false);

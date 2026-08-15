@@ -1,4 +1,4 @@
-"""Real-Pin child.follow synchronous decision verification."""
+"""Successful same-name replacement used by the transactional-load test."""
 
 import os
 
@@ -28,11 +28,5 @@ def decide_child(event):
 
 
 def pb_init():
-    if "child.follow" not in pb.decision_names():
-        raise RuntimeError("child.follow is not a public decision")
     pb.intercept("child.follow", decide_child, once=True)
-    pb.print("CHILD_DECISION_READY")
-
-
-def on_unload():
-    pb.print("CHILD_ORIGINAL_UNLOAD")
+    pb.print("CHILD_REPLACEMENT_READY")

@@ -18,6 +18,25 @@ pub fn reregister_after_attach() -> PbStatus {
     super::xed_decode::reregister_after_attach()
 }
 
+/// Publishes every Python-owned native policy as one checked commit step.
+/// A caller that receives an error must restore registry states and then call
+/// `refresh_best_effort` to put the previous complete policy set back.
+pub fn publish_checked() -> Result<(), (&'static str, PbStatus)> {
+    for (name, result) in [
+        ("instrumentation", super::instrumentation::publish()),
+        ("memory translation", super::memory_translation::publish()),
+        ("code fetch", super::code_fetch::publish()),
+        ("XED decode", super::xed_decode::publish()),
+    ] {
+        if let Err(status) = result {
+            if status != PB_OK {
+                return Err((name, status));
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn refresh_best_effort(reason: &str) {
     if let Err(status) = super::instrumentation::publish() {
         if status != PB_OK {

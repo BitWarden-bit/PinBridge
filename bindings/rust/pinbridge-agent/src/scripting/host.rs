@@ -15,7 +15,7 @@ use super::subscriptions::{self, merge_action, StopAction};
 use super::{
     agent_dir, python_ready, reply, set_mailbox, set_python_ready, with_plugin_context,
     with_registry, with_registry_mut, Plugin, ScriptCmd, ScriptReply, Watch, RPC_PORT, STATE_ERROR,
-    STATE_RUNNING,
+    STATE_REPLACING, STATE_RUNNING, STATE_STAGING,
 };
 use crate::event::EVENT_OUT_OF_MEMORY;
 use core::ffi::c_void;
@@ -635,13 +635,9 @@ fn cmd_load(
         Ok(unsafe { Py::from_owned_ptr(py, code) })
     })?;
 
-    // A broken update must never destroy the currently running plugin.
-    // Retire only after compilation succeeded. Multiple compile-only loads
-    // for the same name before the next tick collapse to the newest code;
-    // the superseded Py code object is dropped while the GIL is held.
-    if with_registry(|registry| registry.contains_key(name)) {
-        retire_plugin(name, "replaced");
-    }
+    // Multiple compile-only loads for the same name before the next tick
+    // collapse to the newest code. A running plugin stays active until the
+    // new top level and pb_init complete successfully in exec_one.
     Python::with_gil(|_py| {
         pending.retain(|(pending_name, _)| pending_name != name);
         pending.push((name.to_string(), code));
@@ -764,6 +760,13 @@ fn quarantine_error_plugins(reason: &str) {
 /// then drop (Py objects released under the GIL). Lifecycle is recorded in
 /// the output ring and the agent log.
 fn retire_plugin(name: &str, reason: &str) {
+    retire_plugin_impl(name, reason, true);
+}
+
+/// `publish_state=false` is used only while atomically committing a staged
+/// same-name replacement; the caller holds the replacement locally and
+/// publishes after moving it onto the public registry key.
+fn retire_plugin_impl(name: &str, reason: &str, publish_state: bool) {
     let (existed, ownership) = Python::with_gil(|py| {
         let on_unload = with_registry(|r| {
             r.get(name)
@@ -789,12 +792,14 @@ fn retire_plugin(name: &str, reason: &str) {
     });
     if existed {
         release_native_ownership(ownership);
-        super::interceptors::publish_interests();
-        super::native_policies::refresh_best_effort("plugin retired");
         output::push(name, reason);
         crate::log::line(&format!("plugin {reason}: {name}"));
         mark_native_dirty();
-        super::publish_list_snapshot();
+        if publish_state {
+            super::interceptors::publish_interests();
+            super::native_policies::refresh_best_effort("plugin retired");
+            super::publish_list_snapshot();
+        }
     }
 }
 
@@ -843,12 +848,36 @@ fn exec_one(name: &str, code: Py<PyAny>, port: u16) {
             }
         };
         let globals = module.dict();
+        let previous_state = with_registry(|registry| registry.get(name).map(|plugin| plugin.state));
+        let registry_key = previous_state
+            .map(|_| {
+                with_registry(|registry| {
+                    let base = format!("\u{1}replacement:{name}");
+                    if !registry.contains_key(&base) {
+                        return base;
+                    }
+                    let mut suffix = 2u64;
+                    loop {
+                        let candidate = format!("\u{1}replacement:{suffix}:{name}");
+                        if !registry.contains_key(&candidate) {
+                            return candidate;
+                        }
+                        suffix = suffix.saturating_add(1);
+                    }
+                })
+            })
+            .unwrap_or_else(|| name.to_string());
         // Register BEFORE exec so top-level pb.on_*/pb.watch calls mutate
-        // this plugin's filters.
+        // this plugin's filters. A replacement initializes under a private
+        // key while the old plugin retains its leases for rollback.
         let plugin = Plugin {
             name: name.to_string(),
             module: module.clone().unbind(),
-            state: STATE_RUNNING,
+            state: if previous_state.is_some() {
+                STATE_STAGING
+            } else {
+                STATE_RUNNING
+            },
             quarantined: false,
             on_exception: None,
             on_syscall: None,
@@ -881,8 +910,8 @@ fn exec_one(name: &str, code: Py<PyAny>, port: u16) {
             delivered: 0,
             dropped: 0,
         };
-        with_registry_mut(|r| r.insert(name.to_string(), plugin));
-        let outcome: Result<(), PyErr> = with_plugin_context(name, || {
+        with_registry_mut(|r| r.insert(registry_key.clone(), plugin));
+        let outcome: Result<(), PyErr> = with_plugin_context(&registry_key, || {
             let result = unsafe {
                 pyo3::ffi::PyEval_EvalCode(code.as_ptr(), globals.as_ptr(), globals.as_ptr())
             };
@@ -901,11 +930,31 @@ fn exec_one(name: &str, code: Py<PyAny>, port: u16) {
         if let Err(error) = outcome {
             output::push(name, &format!("top-level failed: {error}"));
             crate::log::line(&format!("plugin {name} top-level failed: {error}"));
-            with_registry_mut(|r| {
-                if let Some(p) = r.get_mut(name) {
-                    p.state = STATE_ERROR;
-                }
-            });
+            if previous_state.is_some() {
+                let ownership = with_registry_mut(|registry| {
+                    let ownership = registry
+                        .remove(&registry_key)
+                        .map(|mut plugin| {
+                            let ownership = drain_runtime_ownership(&mut plugin);
+                            drop(plugin);
+                            ownership
+                        })
+                        .unwrap_or_default();
+                    ownership
+                });
+                release_native_ownership(ownership);
+                output::push(name, "replacement failed; previous plugin restored");
+                crate::log::line(&format!(
+                    "plugin replacement rolled back after initialization failure: {name}"
+                ));
+                mark_native_dirty();
+            } else {
+                with_registry_mut(|registry| {
+                    if let Some(plugin) = registry.get_mut(&registry_key) {
+                        plugin.state = STATE_ERROR;
+                    }
+                });
+            }
             super::interceptors::publish_interests();
             super::native_policies::refresh_best_effort("plugin initialization failed");
             super::publish_list_snapshot();
@@ -923,7 +972,7 @@ fn exec_one(name: &str, code: Py<PyAny>, port: u16) {
         // Grab the fixed callbacks, then default-subscribe whatever the
         // plugin defined but did not explicitly register.
         with_registry_mut(|r| {
-            if let Some(p) = r.get_mut(name) {
+            if let Some(p) = r.get_mut(&registry_key) {
                 let grab = |attr: &str| -> Option<Py<PyAny>> {
                     module
                         .getattr(attr)
@@ -948,6 +997,84 @@ fn exec_one(name: &str, code: Py<PyAny>, port: u16) {
                 default_subscribe(p);
             }
         });
+        if let Some(previous_state) = previous_state {
+            // The staged plugin has not affected published interests or
+            // policies. Switch registry visibility, validate all native
+            // policies, and roll back the complete stage if validation fails.
+            with_registry_mut(|registry| {
+                if let Some(previous) = registry.get_mut(name) {
+                    previous.state = STATE_REPLACING;
+                }
+                if let Some(replacement) = registry.get_mut(&registry_key) {
+                    replacement.state = STATE_RUNNING;
+                }
+            });
+            if let Err((policy, status)) = super::native_policies::publish_checked() {
+                let ownership = with_registry_mut(|registry| {
+                    let ownership = registry
+                        .remove(&registry_key)
+                        .map(|mut plugin| {
+                            let ownership = drain_runtime_ownership(&mut plugin);
+                            drop(plugin);
+                            ownership
+                        })
+                        .unwrap_or_default();
+                    if let Some(previous) = registry.get_mut(name) {
+                        previous.state = previous_state;
+                    }
+                    ownership
+                });
+                release_native_ownership(ownership);
+                super::interceptors::publish_interests();
+                super::native_policies::refresh_best_effort(
+                    "replacement policy validation rollback",
+                );
+                output::push(
+                    name,
+                    &format!(
+                        "replacement failed: {policy} policy rejected with status {status}; previous plugin restored"
+                    ),
+                );
+                crate::log::line(&format!(
+                    "plugin replacement rolled back after {policy} policy status {status}: {name}"
+                ));
+                mark_native_dirty();
+                super::publish_list_snapshot();
+                return;
+            }
+            let replacement = with_registry_mut(|registry| registry.remove(&registry_key));
+            let Some(mut replacement) = replacement else {
+                with_registry_mut(|registry| {
+                    if let Some(previous) = registry.get_mut(name) {
+                        previous.state = previous_state;
+                    }
+                });
+                output::push(name, "replacement commit failed: staged plugin disappeared");
+                crate::log::line(&format!(
+                    "plugin replacement commit invariant failed: {name}"
+                ));
+                super::interceptors::publish_interests();
+                super::native_policies::refresh_best_effort(
+                    "replacement commit invariant failure",
+                );
+                mark_native_dirty();
+                super::publish_list_snapshot();
+                return;
+            };
+            // Do not publish the temporary state where neither public version
+            // is in the registry. The staged plugin's native policy snapshot
+            // is already validated and remains live across these moves.
+            retire_plugin_impl(name, "replaced", false);
+            replacement.name = name.to_string();
+            with_registry_mut(|registry| {
+                registry.insert(name.to_string(), replacement);
+            });
+            super::interceptors::publish_interests();
+            // on_unload is allowed to call pb.* and may have republished a
+            // snapshot while the staged plugin was held locally. Reassert the
+            // already validated replacement policy after its public insert.
+            super::native_policies::refresh_best_effort("replacement committed");
+        }
         output::push(name, "loaded");
         crate::log::line(&format!("plugin running: {name}"));
         mark_native_dirty();

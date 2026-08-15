@@ -12,6 +12,11 @@
 
 在子进程创建前，运行器还会尝试加载 `bad/child_decision.py`。它与正在运行的决策插件同名但
 故意包含语法错误；加载必须失败，并且原插件仍保持 running、随后继续完成真实跟随决定。
+随后 `bad_runtime/child_decision.py` 会成功编译、注册一个错误决定，再在 `pb_init()` 抛出
+异常；新插件资源必须被撤销，旧插件恢复 running。`bad_policy/child_decision.py` 则完整执行
+初始化，但其 XED 设置与独立的 `policy_guard.py` 冲突；提交校验必须拒绝它并再次恢复旧版。
+最后加载 `good/child_decision.py`，要求新插件提交为公开版本并调用旧插件的 `on_unload`，
+真实子进程决定由这个新版本完成。
 
 ```powershell
 .\build.ps1
