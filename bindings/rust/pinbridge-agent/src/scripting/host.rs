@@ -10,6 +10,7 @@
 //!   3. the tick's client connection is closed before Python runs.
 
 use super::output;
+use super::subscriptions::{self, merge_action, StopAction};
 use super::{
     agent_dir, python_ready, reply, set_mailbox, set_python_ready, with_plugin_context, Plugin,
     with_registry, with_registry_mut, ScriptCmd, ScriptReply, Watch, RPC_PORT, STATE_ERROR,
@@ -221,6 +222,26 @@ impl TickClient {
             entries.push((r.u32()?, r.u64()?, r.u64()?));
         }
         Some((stopped, hit_tid, hit_addr, stop_gen, entries))
+    }
+
+    fn bp_remove(&mut self, id: u32) -> Option<()> {
+        let mut request = Vec::with_capacity(4);
+        pinbridge_proto::put_u32(&mut request, id);
+        self.request(pinbridge_proto::op::BP_REMOVE, &request)?;
+        Some(())
+    }
+
+    fn context_get(&mut self, thread_id: u32) -> Option<Vec<(u32, u64)>> {
+        let mut request = Vec::with_capacity(4);
+        pinbridge_proto::put_u32(&mut request, thread_id);
+        let body = self.request(pinbridge_proto::op::CONTEXT_GET, &request)?;
+        let mut reader = pinbridge_proto::Reader::new(&body);
+        let count = reader.u32()?;
+        let mut registers = Vec::with_capacity(count as usize);
+        for _ in 0..count {
+            registers.push((reader.u32()?, reader.u64()?));
+        }
+        Some(registers)
     }
 
     /// (missed, next, events) for sequences after `after`.
@@ -623,7 +644,7 @@ fn cmd_unload(name: &str) {
 /// then drop (Py objects released under the GIL). Lifecycle is recorded in
 /// the output ring and the agent log.
 fn retire_plugin(name: &str, reason: &str) {
-    let existed = Python::with_gil(|py| {
+    let (existed, breakpoint_ids) = Python::with_gil(|py| {
         let on_unload = with_registry(|r| {
             r.get(name)
                 .and_then(|p| p.on_unload.as_ref().map(|cb| cb.clone_ref(py)))
@@ -636,9 +657,22 @@ fn retire_plugin(name: &str, reason: &str) {
                 }
             });
         }
-        with_registry_mut(|r| r.remove(name).is_some())
+        with_registry_mut(|r| {
+            let Some(plugin) = r.remove(name) else {
+                return (false, Vec::new());
+            };
+            let ids = plugin.breakpoints.keys().copied().collect();
+            // Drop every Py callback while the GIL is held.
+            drop(plugin);
+            (true, ids)
+        })
     });
     if existed {
+        for id in breakpoint_ids {
+            if subscriptions::release_native(id) {
+                subscriptions::queue_native_removal(id);
+            }
+        }
         output::push(name, reason);
         crate::log::line(&format!("plugin {reason}: {name}"));
         mark_native_dirty();
@@ -684,9 +718,11 @@ fn exec_one(name: &str, code: Py<PyAny>, port: u16) {
             on_event_batch: None,
             on_stop: None,
             on_unload: None,
+            breakpoints: crate::new_map(),
             filters: super::Filters::default(),
             cursor: 0,
             last_stop_gen: 0,
+            last_breakpoint_gen: 0,
             delivered: 0,
             dropped: 0,
         };
@@ -786,6 +822,7 @@ struct TickShared {
     hit_tid: u32,
     hit_addr: u64,
     bp_entries: Vec<(u32, u64, u64)>,
+    context_registers: Vec<(u32, u64)>,
     events: Vec<pinbridge_proto::EventRecord>,
     module_names: crate::TlsFreeMap<u64, String>,
 }
@@ -826,7 +863,7 @@ fn tick(pending: &mut Vec<(String, Py<PyAny>)>, port: u16) {
             if consumes_ring(p) {
                 min_cursor = Some(min_cursor.map(|m: u64| m.min(p.cursor)).unwrap_or(p.cursor));
             }
-            if p.filters.want_bp || p.on_stop.is_some() {
+            if p.filters.want_bp || p.on_stop.is_some() || !p.breakpoints.is_empty() {
                 wants_stop = true;
             }
             if p.on_event_batch.is_some() {
@@ -846,7 +883,8 @@ fn tick(pending: &mut Vec<(String, Py<PyAny>)>, port: u16) {
         (min_cursor, wants_stop, page_limit)
     });
     let knobs_dirty = NATIVE_DIRTY.swap(false, Ordering::AcqRel);
-    if min_cursor.is_none() && !wants_stop && !knobs_dirty {
+    let pending_native_removals = subscriptions::has_native_removals();
+    if min_cursor.is_none() && !wants_stop && !knobs_dirty && !pending_native_removals {
         return;
     }
     diag("tick conn begin");
@@ -859,6 +897,7 @@ fn tick(pending: &mut Vec<(String, Py<PyAny>)>, port: u16) {
         hit_tid: u32::MAX,
         hit_addr: 0,
         bp_entries: Vec::new(),
+        context_registers: Vec::new(),
         events: Vec::new(),
         module_names: crate::new_map(),
     };
@@ -870,6 +909,13 @@ fn tick(pending: &mut Vec<(String, Py<PyAny>)>, port: u16) {
             return; // control plane momentarily unreachable; retry next tick
         };
         diag("tick connected");
+        if pending_native_removals && !send_waiting() {
+            for id in subscriptions::take_native_removals() {
+                if client.bp_remove(id).is_none() {
+                    subscriptions::queue_native_removal(id);
+                }
+            }
+        }
         if knobs_dirty && !send_waiting() {
             recompute_native_knobs(&mut client);
         }
@@ -880,6 +926,9 @@ fn tick(pending: &mut Vec<(String, Py<PyAny>)>, port: u16) {
                 shared.hit_addr = hit_addr;
                 shared.stop_gen = gen;
                 shared.bp_entries = entries;
+                if stopped && hit_tid != u32::MAX {
+                    shared.context_registers = client.context_get(hit_tid).unwrap_or_default();
+                }
             }
         }
         if let Some(after) = min_cursor {
@@ -917,19 +966,22 @@ fn tick(pending: &mut Vec<(String, Py<PyAny>)>, port: u16) {
         return; // free the host for the parked script op
     }
     // Phase 2: per-plugin dispatch (their pb.* RPCs get a free server).
-    Python::with_gil(|py| {
+    let stop_action = Python::with_gil(|py| {
         let names = with_registry(|r| {
             let mut names: Vec<String> = r.keys().cloned().collect();
             names.sort();
             names
         });
-        for name in names {
+        let action = dispatch_bound_breakpoints(py, &names, &shared);
+        for name in &names {
             if send_waiting() {
                 break; // script op parked on the server: stop dialing it
             }
-            dispatch_one(py, &name, &shared);
+            dispatch_one(py, name, &shared);
         }
+        action
     });
+    apply_stop_action(port, stop_action, &shared);
     diag("tick dispatch end");
 }
 
@@ -971,6 +1023,210 @@ fn recompute_native_knobs(client: &mut TickClient) {
     } else {
         let numbers: Vec<u32> = union.into_iter().collect();
         let _ = client.syscall_filter(1, &numbers);
+    }
+}
+
+struct BoundBreakpointSnapshot {
+    plugin: String,
+    id: u32,
+    callback: Py<PyAny>,
+    once: bool,
+    order: u64,
+}
+
+fn parse_stop_action(value: &Bound<'_, PyAny>) -> Result<StopAction, String> {
+    if value.is_none() {
+        return Ok(StopAction::Stay);
+    }
+    if let Ok(name) = value.extract::<String>() {
+        return StopAction::from_name(&name)
+            .ok_or_else(|| format!("unknown breakpoint action: {name}"));
+    }
+    if let Ok(dict) = value.downcast::<PyDict>() {
+        let action = dict
+            .get_item("action")
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "breakpoint result dictionary needs 'action'".to_string())?;
+        let name = action
+            .extract::<String>()
+            .map_err(|_| "breakpoint result 'action' must be a string".to_string())?;
+        return StopAction::from_name(&name)
+            .ok_or_else(|| format!("unknown breakpoint action: {name}"));
+    }
+    Err("breakpoint callback must return None, an action string, or {'action': ...}".to_string())
+}
+
+/// Invokes callbacks explicitly bound with pb.breakpoint().  This is kept
+/// separate from the legacy per-plugin dispatch: bound handlers own a stop
+/// decision, while on_bp_hit/on_stop are compatibility notifications.
+fn dispatch_bound_breakpoints(
+    py: Python<'_>,
+    names: &[String],
+    shared: &TickShared,
+) -> Option<StopAction> {
+    if !shared.stopped || shared.hit_tid == u32::MAX || shared.stop_gen == 0 {
+        return None;
+    }
+    let Some((hit_id, _, hits)) = shared
+        .bp_entries
+        .iter()
+        .find(|(_, address, _)| *address == shared.hit_addr)
+        .copied()
+    else {
+        return None;
+    };
+
+    let mut handlers = with_registry(|registry| {
+        let mut handlers = Vec::new();
+        for name in names {
+            let Some(plugin) = registry.get(name) else {
+                continue;
+            };
+            if plugin.state != STATE_RUNNING || plugin.last_breakpoint_gen >= shared.stop_gen {
+                continue;
+            }
+            let Some(subscription) = plugin.breakpoints.get(&hit_id) else {
+                continue;
+            };
+            if subscription
+                .thread_id
+                .map(|tid| tid != shared.hit_tid)
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            handlers.push(BoundBreakpointSnapshot {
+                plugin: name.clone(),
+                id: hit_id,
+                callback: subscription.callback.clone_ref(py),
+                once: subscription.once,
+                order: subscription.order,
+            });
+        }
+        handlers
+    });
+    handlers.sort_by(|left, right| {
+        left.plugin
+            .cmp(&right.plugin)
+            .then(left.order.cmp(&right.order))
+    });
+    if handlers.is_empty() {
+        return None;
+    }
+
+    let mut merged: Option<StopAction> = None;
+    for handler in handlers {
+        // Give every plugin its own dictionary.  A handler is free to annotate
+        // its event, but those mutations must not leak into another plugin.
+        let registers = PyDict::new_bound(py);
+        for (register, value) in &shared.context_registers {
+            let name = crate::arch::gp_name(*register).unwrap_or("unknown");
+            let _ = registers.set_item(name, *value);
+        }
+        let event = PyDict::new_bound(py);
+        let _ = event.set_item("type", "breakpoint");
+        let _ = event.set_item("id", handler.id);
+        let _ = event.set_item("address", shared.hit_addr);
+        let _ = event.set_item("addr", shared.hit_addr); // legacy-friendly alias
+        let _ = event.set_item("tid", shared.hit_tid);
+        let _ = event.set_item("stop_generation", shared.stop_gen);
+        let _ = event.set_item("hits", hits);
+        let _ = event.set_item("arch", crate::arch::name());
+        let _ = event.set_item("pointer_width", crate::arch::pointer_width());
+        let _ = event.set_item(
+            "context_complete",
+            shared.context_registers.len() == crate::arch::gp_registers().len(),
+        );
+        let _ = event.set_item("registers", &registers);
+
+        let result = with_plugin_context(&handler.plugin, || {
+            handler
+                .callback
+                .call1(py, (event,))
+                .map_err(|error| error.to_string())
+                .and_then(|value| parse_stop_action(value.bind(py)))
+        });
+        let (action, error) = match result {
+            Ok(action) => (action, None),
+            Err(error) => (StopAction::Stay, Some(error)),
+        };
+        merged = Some(merge_action(merged, action));
+
+        let mut released = false;
+        with_registry_mut(|registry| {
+            if let Some(plugin) = registry.get_mut(&handler.plugin) {
+                plugin.last_breakpoint_gen = shared.stop_gen;
+                plugin.delivered = plugin.delivered.saturating_add(1);
+                if error.is_some() {
+                    plugin.state = STATE_ERROR;
+                }
+                if handler.once && plugin.breakpoints.remove(&handler.id).is_some() {
+                    released = true;
+                }
+            }
+        });
+        if released && subscriptions::release_native(handler.id) {
+            subscriptions::queue_native_removal(handler.id);
+        }
+        if let Some(error) = error {
+            output::push(
+                &handler.plugin,
+                &format!("breakpoint {} callback failed: {error}", handler.id),
+            );
+            crate::log::line(&format!(
+                "plugin {} breakpoint {} callback failed: {error}",
+                handler.plugin, handler.id
+            ));
+            super::publish_list_snapshot();
+        }
+    }
+    merged
+}
+
+/// Executes the one merged stop action after every plugin callback has
+/// returned.  The stop generation is checked again so a legacy callback
+/// that already resumed or stepped cannot be followed by a second action.
+fn apply_stop_action(port: u16, action: Option<StopAction>, shared: &TickShared) {
+    let removals = subscriptions::take_native_removals();
+    if action.is_none() && removals.is_empty() {
+        return;
+    }
+    let Some(mut client) = connect(port) else {
+        for id in removals {
+            subscriptions::queue_native_removal(id);
+        }
+        return;
+    };
+    for id in removals {
+        if client.bp_remove(id).is_err() {
+            // It may already be gone (for example a one-shot step landing).
+            crate::log::line(&format!("bound breakpoint native remove skipped id={id}"));
+        }
+    }
+    let Some(action) = action else {
+        return;
+    };
+    if action == StopAction::Stay {
+        return;
+    }
+    let Ok((stopped, hit_tid, hit_addr, generation, _)) = client.bp_list() else {
+        return;
+    };
+    if !stopped
+        || generation != shared.stop_gen
+        || hit_tid != shared.hit_tid
+        || hit_addr != shared.hit_addr
+    {
+        return;
+    }
+    let result = match action {
+        StopAction::Stay => true,
+        StopAction::Resume => client.resume().unwrap_or(false),
+        StopAction::StepInto => client.step(shared.hit_tid, false).unwrap_or(false),
+        StopAction::StepOver => client.step(shared.hit_tid, true).unwrap_or(false),
+    };
+    if !result {
+        crate::log::line(&format!("bound breakpoint action failed: {action:?}"));
     }
 }
 

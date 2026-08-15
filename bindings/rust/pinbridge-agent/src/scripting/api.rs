@@ -12,6 +12,7 @@
 
 use super::host::{connect, mark_native_dirty, BATCH_MAX};
 use super::output;
+use super::subscriptions::{self, BreakpointSubscription};
 use super::{current_plugin_name, with_current_plugin_mut, Watch, RPC_PORT};
 use core::sync::atomic::Ordering;
 use pinbridge_client::client::Client;
@@ -116,6 +117,89 @@ fn pb_bp_set(addr: u64) -> Option<u32> {
 #[pyfunction(name = "bp_remove")]
 fn pb_bp_remove(id: u32) -> bool {
     rpc(|c| c.bp_remove(id)).is_some()
+}
+
+/// Binds one exact native breakpoint to a callback owned by the current
+/// plugin.  Unlike legacy bp_set/on_bp_hit, the callback is stored with this
+/// id and may return stay/resume/step_into/step_over.
+#[pyfunction(name = "breakpoint", signature = (address, callback, *, once=false, thread_id=None))]
+fn pb_breakpoint(
+    py: Python<'_>,
+    address: u64,
+    callback: Py<PyAny>,
+    once: bool,
+    thread_id: Option<u32>,
+) -> PyResult<u32> {
+    if current_plugin_name().is_none() {
+        return Err(no_plugin());
+    }
+    if address == 0 {
+        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+            "breakpoint address must be non-zero",
+        ));
+    }
+    if !callback.bind(py).is_callable() {
+        return Err(PyErr::new::<pyo3::exceptions::PyTypeError, _>(
+            "breakpoint callback must be callable",
+        ));
+    }
+    if thread_id == Some(PB_INVALID_THREAD_ID) {
+        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+            "thread_id uses the reserved invalid-thread sentinel",
+        ));
+    }
+
+    // Determine whether this script layer created the native breakpoint.
+    // Existing CLI/legacy breakpoints remain externally owned and are not
+    // removed when the Python subscription is released.
+    let existed = rpc(|c| c.bp_list())
+        .ok_or_else(|| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                "failed to inspect native breakpoint table",
+            )
+        })?
+        .4
+        .iter()
+        .any(|(_, existing_address, _)| *existing_address == address);
+    let id = rpc(|c| c.bp_set(address)).ok_or_else(|| {
+        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+            "failed to create native breakpoint",
+        )
+    })?;
+
+    let previous = with_current_plugin_mut(|plugin| {
+        plugin.breakpoints.insert(
+            id,
+            BreakpointSubscription::new(callback, once, thread_id),
+        )
+    })
+    .ok_or_else(no_plugin)?;
+    if previous.is_none() {
+        subscriptions::acquire_native(id, !existed);
+    }
+    Ok(id)
+}
+
+/// Removes only the current plugin's bound handler.  The native breakpoint
+/// remains while another plugin or a legacy owner still uses it.
+#[pyfunction(name = "breakpoint_remove")]
+fn pb_breakpoint_remove(id: u32) -> PyResult<bool> {
+    let removed = with_current_plugin_mut(|plugin| plugin.breakpoints.remove(&id))
+        .ok_or_else(no_plugin)?;
+    if removed.is_none() {
+        return Ok(false);
+    }
+    if subscriptions::release_native(id) {
+        if rpc(|c| c.bp_remove(id)).is_none() {
+            subscriptions::queue_native_removal(id);
+            output::push(
+                &current_plugin_name().unwrap_or_else(|| "?".to_string()),
+                &format!("breakpoint {id} handler removed; native removal failed"),
+            );
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 #[pyfunction(name = "hit")]
@@ -498,6 +582,8 @@ fn pb(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(pb_set_reg, m)?)?;
     m.add_function(wrap_pyfunction!(pb_bp_set, m)?)?;
     m.add_function(wrap_pyfunction!(pb_bp_remove, m)?)?;
+    m.add_function(wrap_pyfunction!(pb_breakpoint, m)?)?;
+    m.add_function(wrap_pyfunction!(pb_breakpoint_remove, m)?)?;
     m.add_function(wrap_pyfunction!(pb_hit, m)?)?;
     m.add_function(wrap_pyfunction!(pb_is_stopped, m)?)?;
     m.add_function(wrap_pyfunction!(pb_stop, m)?)?;

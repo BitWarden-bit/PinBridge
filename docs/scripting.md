@@ -121,6 +121,12 @@ service-class 高位会在进入事件和过滤器前移除。entry/exit 通过�
 
 断点（64 槽）与 hook 点（4096 槽，命中产 kind-1 hook_regs 事件）:
 - `pb.bp_set(addr) -> id | None`;`pb.bp_remove(id) -> bool`
+- `pb.breakpoint(addr, callback, once=False, thread_id=None) -> id`：把精确断点绑定到
+  当前插件的 Python 函数。命中时目标保持停止，回调收到 `{type,id,address,addr,tid,
+  stop_generation,hits,arch,pointer_width,context_complete,registers}`；返回 `stay`、`resume`、
+  `step_into` 或 `step_over`。不返回等同于 `stay`，回调异常也保持停止。
+- `pb.breakpoint_remove(id) -> bool`：只删除当前插件对该断点的绑定。插件卸载时自动
+  释放其全部绑定；多个插件可共享同一原生断点。
 - `pb.hook_set(addr) -> bool`(False = 满了);`pb.hook_remove(addr) -> bool`;`pb.hook_clear() -> bool`
 - `pb.hook_rule(addr, set_reg, set_value, match_reg=None, match_mask=0, match_value=0, thread_id=None)`：在 Hook 命中时由原生回调同步修改上下文寄存器；可选条件按寄存器掩码匹配。`stack0`/`stack1` 等虚拟寄存器表示 ABI 栈参数（x86 从 `[ESP+4]` 起，x64 从 `[RSP+0x28]` 起）。
 - `pb.hook_rules_clear()`：清除修改规则但保留 Hook 点。规则执行在 Pin 应用线程，不调用 Python 热路径。

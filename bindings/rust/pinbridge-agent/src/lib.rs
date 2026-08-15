@@ -177,6 +177,10 @@ unsafe extern "C" fn on_img_load(img: PbImgHandle, _user_data: *mut c_void) {
     }
 }
 
+// Rust's lib-test harness supplies its own `main`.  Export the Pin tool entry
+// only for the real cdylib; otherwise `cargo test -p pinbridge-agent --lib`
+// links two main symbols and none of the agent's pure unit tests can run.
+#[cfg(not(test))]
 pinbridge_tool::tool_entry!(agent_main);
 
 unsafe extern "C" fn on_fini(_code: i32, _user_data: *mut c_void) {

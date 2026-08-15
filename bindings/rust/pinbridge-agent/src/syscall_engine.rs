@@ -83,7 +83,11 @@ fn encode_syscall_number(number: u64) -> Option<*const c_void> {
 #[inline]
 fn decode_syscall_number(data: *mut c_void) -> Option<u64> {
     let encoded = data as usize;
-    (encoded != 0).then_some((encoded - 1) as u64)
+    if encoded == 0 {
+        None
+    } else {
+        Some((encoded - 1) as u64)
+    }
 }
 
 #[inline]

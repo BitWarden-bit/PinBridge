@@ -30,6 +30,7 @@ pub mod api;
 mod host;
 pub mod output;
 mod python_data;
+mod subscriptions;
 
 pub const STATE_RUNNING: u8 = 1;
 pub const STATE_ERROR: u8 = 2;
@@ -116,10 +117,17 @@ pub struct Plugin {
     pub on_event_batch: Option<Py<PyAny>>,
     pub on_stop: Option<Py<PyAny>>,
     pub on_unload: Option<Py<PyAny>>,
+    /// New-style callbacks bound to exact native breakpoint ids.  Legacy
+    /// `on_bp_hit` remains separate and receives every stop notification.
+    pub breakpoints: TlsFreeMap<u32, subscriptions::BreakpointSubscription>,
     pub filters: Filters,
     /// Ring cursor: events with sequence <= cursor are consumed already.
     pub cursor: u64,
     pub last_stop_gen: u64,
+    /// Separate edge cursor for bound breakpoint callbacks.  It must not
+    /// share `last_stop_gen`: a plugin may use both the new handler and the
+    /// legacy on_stop/on_bp_hit notifications for the same stop.
+    pub last_breakpoint_gen: u64,
     pub delivered: u64,
     pub dropped: u64,
 }

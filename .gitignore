@@ -26,3 +26,8 @@ script_e2e_*.py
 script_e2e_*.log
 script_e2e_*.txt
 sample_window.pbtr
+
+# Fixture run artifacts (keep them on disk for diagnosis, never commit each run)
+fixtures/**/*.stdout.txt
+fixtures/**/*.stderr.txt
+fixtures/**/*.error.txt
