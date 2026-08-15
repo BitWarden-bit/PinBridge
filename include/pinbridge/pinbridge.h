@@ -551,6 +551,7 @@ typedef void(PB_CALL* PbPrepareForFiniCallback)(void* user_data);
 typedef void(PB_CALL* PbFiniCallback)(int32_t code, void* user_data);
 typedef void(PB_CALL* PbDetachCallback)(void* user_data);
 typedef void(PB_CALL* PbDetachProbedCallback)(void* user_data);
+typedef void(PB_CALL* PbAttachCallback)(void* user_data);
 typedef void(PB_CALL* PbAttachProbedCallback)(void* user_data);
 typedef void(PB_CALL* PbOutOfMemoryCallback)(
     uint64_t requested_size, void* user_data);
@@ -1589,6 +1590,8 @@ PB_API PbStatus PB_CALL pb_pin_detach(void);
 PB_API PbStatus PB_CALL pb_pin_detach_probed(void);
 /* Asynchronous reattach requests. PB_OK reports bridge execution; out_status
    reports whether Pin accepted the request or detach is still completing. */
+PB_API PbStatus PB_CALL pb_pin_attach(
+    PbAttachCallback callback, void* user_data, PbAttachStatus* out_status);
 PB_API PbStatus PB_CALL pb_pin_attach_probed(
     PbAttachProbedCallback callback, void* user_data, PbAttachStatus* out_status);
 

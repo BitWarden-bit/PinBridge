@@ -3,6 +3,8 @@
 
 #include "pinbridge/pinbridge.h"
 
+PbStatus PbBackendAttach(
+    PbAttachCallback callback, void* user_data, PbAttachStatus* out_status);
 PbStatus PbBackendAttachProbed(
     PbAttachProbedCallback callback, void* user_data, PbAttachStatus* out_status);
 

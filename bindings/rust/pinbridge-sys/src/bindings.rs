@@ -1492,6 +1492,7 @@ pub type PbPrepareForFiniCallback = Option<unsafe extern "C" fn(user_data: *mut 
 pub type PbFiniCallback = Option<unsafe extern "C" fn(code: i32, user_data: *mut c_void)>;
 pub type PbDetachCallback = Option<unsafe extern "C" fn(user_data: *mut c_void)>;
 pub type PbDetachProbedCallback = Option<unsafe extern "C" fn(user_data: *mut c_void)>;
+pub type PbAttachCallback = Option<unsafe extern "C" fn(user_data: *mut c_void)>;
 pub type PbAttachProbedCallback = Option<unsafe extern "C" fn(user_data: *mut c_void)>;
 pub type PbOutOfMemoryCallback = Option<unsafe extern "C" fn(requested_size: u64, user_data: *mut c_void)>;
 pub type PbThreadStartCallback = Option<unsafe extern "C" fn(thread_id: PbThreadId, context: PbContextHandle, flags: i32, user_data: *mut c_void)>;
@@ -2166,6 +2167,7 @@ unsafe extern "C" {
     pub fn pb_pin_add_detach_function_probed(callback: PbDetachProbedCallback, user_data: *mut c_void, out_callback: *mut PbCallbackHandle) -> PbStatus;
     pub fn pb_pin_detach() -> PbStatus;
     pub fn pb_pin_detach_probed() -> PbStatus;
+    pub fn pb_pin_attach(callback: PbAttachCallback, user_data: *mut c_void, out_status: *mut PbAttachStatus) -> PbStatus;
     pub fn pb_pin_attach_probed(callback: PbAttachProbedCallback, user_data: *mut c_void, out_status: *mut PbAttachStatus) -> PbStatus;
     pub fn pb_pin_exit_application(status: i32) -> !;
     pub fn pb_pin_exit_process(exit_code: i32) -> !;

@@ -23,6 +23,16 @@ VOID OnAttachProbed(VOID* raw_state)
     callback(user_data);
 }
 
+VOID OnAttach(VOID* raw_state)
+{
+    CallbackState<PbAttachCallback>* state =
+        static_cast<CallbackState<PbAttachCallback>*>(raw_state);
+    PbAttachCallback callback = state->callback;
+    void* user_data = state->user_data;
+    std::free(state);
+    callback(user_data);
+}
+
 template< typename Callback, typename Attach > PbStatus RequestAttach(
     Callback callback, void* user_data, PbAttachStatus* out_status, Attach attach)
 {
@@ -40,6 +50,15 @@ template< typename Callback, typename Attach > PbStatus RequestAttach(
 }
 
 } // namespace
+
+PbStatus PbBackendAttach(
+    PbAttachCallback callback, void* user_data, PbAttachStatus* out_status)
+{
+    if (PIN_IsProbeMode())
+        return PB_ERR_INVALID_STATE;
+    return RequestAttach(callback, user_data, out_status,
+        [](void* state) { return PIN_Attach(OnAttach, state); });
+}
 
 PbStatus PbBackendAttachProbed(
     PbAttachProbedCallback callback, void* user_data, PbAttachStatus* out_status)
