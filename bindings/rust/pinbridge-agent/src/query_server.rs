@@ -810,10 +810,12 @@ unsafe extern "C" fn server_main(argument: *mut c_void) {
 /// an already-bound listener completes client handshakes in the kernel, so
 /// the launcher's wait_for_port succeeds regardless.
 pub fn spawn() -> PbStatus {
-    let port = std::env::var("PINBRIDGE_AGENT_PORT")
-        .ok()
-        .and_then(|v| v.parse::<u16>().ok())
-        .unwrap_or(proto::DEFAULT_PORT);
+    let port = crate::child_process::control_port_override().unwrap_or_else(|| {
+        std::env::var("PINBRIDGE_AGENT_PORT")
+            .ok()
+            .and_then(|v| v.parse::<u16>().ok())
+            .unwrap_or(proto::DEFAULT_PORT)
+    });
     let listener = match TcpListener::bind(("127.0.0.1", port)) {
         Ok(listener) => listener,
         Err(error) => {

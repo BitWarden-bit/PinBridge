@@ -324,6 +324,18 @@ fn pb_counters() -> Option<(u64, u64, u64, Vec<u64>)> {
     Some((total, dropped, capacity, kinds.to_vec()))
 }
 
+/// Control-plane topology for parent/child Pin sessions. A root session has
+/// no parent; followed children receive both ports before their PIN_Init.
+#[pyfunction(name = "control_port")]
+fn pb_control_port() -> u16 {
+    RPC_PORT.load(core::sync::atomic::Ordering::Acquire)
+}
+
+#[pyfunction(name = "parent_control_port")]
+fn pb_parent_control_port() -> Option<u16> {
+    crate::child_process::parent_control_port()
+}
+
 // ---- new actions (prior phases added the wire ops) ----
 
 /// Named exports of a loaded module: (address, name) pairs.
@@ -1437,6 +1449,8 @@ fn pb(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(pb_modules, m)?)?;
     m.add_function(wrap_pyfunction!(pb_threads, m)?)?;
     m.add_function(wrap_pyfunction!(pb_counters, m)?)?;
+    m.add_function(wrap_pyfunction!(pb_control_port, m)?)?;
+    m.add_function(wrap_pyfunction!(pb_parent_control_port, m)?)?;
     m.add_function(wrap_pyfunction!(pb_exports, m)?)?;
     m.add_function(wrap_pyfunction!(pb_hook_set, m)?)?;
     m.add_function(wrap_pyfunction!(pb_hook_rule, m)?)?;

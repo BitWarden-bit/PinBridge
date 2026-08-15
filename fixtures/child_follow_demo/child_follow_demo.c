@@ -5,8 +5,23 @@
 int main(int argc, char** argv)
 {
     if (argc >= 2 && strcmp(argv[1], "--child") == 0) {
+        const DWORD process_id = GetCurrentProcessId();
+        char follow[2] = {0};
+        if (GetEnvironmentVariableA("PINBRIDGE_TEST_FOLLOW_CHILD", follow,
+                (DWORD)sizeof(follow)) != 0 && follow[0] == '1') {
+            char ready_file[64];
+            _snprintf_s(ready_file, sizeof(ready_file), _TRUNCATE,
+                "child_control_%lu.ready", (unsigned long)process_id);
+            const ULONGLONG deadline = GetTickCount64() + 15000;
+            while (GetFileAttributesA(ready_file) == INVALID_FILE_ATTRIBUTES &&
+                   GetTickCount64() < deadline) {
+                Sleep(10);
+            }
+            if (GetFileAttributesA(ready_file) == INVALID_FILE_ATTRIBUTES)
+                return 8;
+        }
         printf("child_follow_demo: child pid=%lu token=%s\n",
-            (unsigned long)GetCurrentProcessId(), argc >= 3 ? argv[2] : "missing");
+            (unsigned long)process_id, argc >= 3 ? argv[2] : "missing");
         return 0;
     }
 
@@ -28,7 +43,10 @@ int main(int argc, char** argv)
             &startup, &process)) {
         return 3;
     }
-    WaitForSingleObject(process.hProcess, 15000);
+    if (WaitForSingleObject(process.hProcess, 20000) == WAIT_TIMEOUT) {
+        TerminateProcess(process.hProcess, 9);
+        WaitForSingleObject(process.hProcess, 5000);
+    }
     DWORD child_exit = 999;
     GetExitCodeProcess(process.hProcess, &child_exit);
     CloseHandle(process.hThread);

@@ -252,7 +252,8 @@ pb.unintercept(decision_id)
 
 `pb.decision_names()` 返回当前支持的同步决定名；第一项是 `child.follow`。事件字典包含
 `type="child.follow"`、`generation`、`process_id`/`pid`、按 UTF-8 宽松解码的 `argv`
-以及保留原始数据的 `argv_bytes`。处理函数必须返回 `bool` 或
+以及保留原始数据的 `argv_bytes`，并提供预分配的 `control_port` 和
+`parent_control_port`。处理函数必须返回 `bool` 或
 `{"follow": bool}`。
 
 Pin 的跟随子进程回调不调用 Python。原生层在 `CHILD_PROCESS` 句柄仍有效时，把 PID 和
@@ -266,9 +267,13 @@ Pin 的跟随子进程回调不调用 Python。原生层在 `CHILD_PROCESS` 句�
 查询服务的 `pb.*` RPC 会快速失败，因为 Pin 回调正在等待决定，此时反向 RPC 可能死锁。
 
 真实 Pin 回归已经覆盖返回 false 和返回 true 两条路径，并在 Fini 日志校验
-`child_decisions`、`child_follow`、`child_reject` 和 `child_decision_timeouts`。当前被跟随的
-子进程会继承父进程固定的 `PINBRIDGE_AGENT_PORT`，因此子 agent 无法绑定同一端口，会继续
-插桩但没有自己的 Python/查询控制面；每个子进程的独立端口和命令行改写仍是后续工作。
+`child_decisions`、`child_follow`、`child_reject`、`child_decision_timeouts` 和
+`child_config_failures`。脚本线程在调用决定处理函数前从回环接口选择子端口；决定为真时，
+它预先构造一份包含子/父端口的 Pin 命令行固定快照。等待中的 Pin 回调只把该快照交给
+`CHILD_PROCESS_SetPinCommandLine`。子 agent 在自己的 `PIN_Init` 前剥离两个内部参数，优先
+使用子端口而不是继承的 `PINBRIDGE_AGENT_PORT`，并派生独立日志名。`pb.control_port()` 返回
+当前会话端口，`pb.parent_control_port()` 在根会话返回 `None`、在跟随子会话返回父端口。
+真实跟随测试会连接子端口、热加载子插件并验证该 Python 拓扑，然后才允许子目标退出。
 
 ### Hook 同步拦截
 
@@ -560,7 +565,7 @@ pb.instrumentation_set(
 | Pin 内部异常 | `pb.on("pin.internal_exception", ...)` | 原生崩溃记录后投递高优先级快照；仅在进程存活时可到达 Python |
 | Pin 分离完成 | `pb.on("pin.detach", ...)` | JIT/Probe 原生接入完成；分离后的即时 Python 调度不承诺 |
 | Pin 重新附加 | `pb.pin_attach_supported/pin_detach/pin_attach` + `pb.on("pin.attach", ...)` | ABI 和统一回调重建链已完成；Windows JIT 由 Pin 3.31 明确不支持并已验证安全拒绝，支持平台的完整往返待验证 |
-| 子进程跟随决策 | `pb.intercept("child.follow", ...)` | 已完成，跟随/不跟随真实 Pin 测试通过；子进程独立控制端口待开发 |
+| 子进程跟随决策 | `pb.intercept("child.follow", ...)` | 已完成；跟随/不跟随、独立子端口、子日志隔离和经子控制面热加载 Python 均通过真实 Pin 测试 |
 | Hook 异步观察 | `pb.on("hook.entry/return", ..., address=...)` | 自动挂载/地址过滤、独立观察环和同步/异步共享租约完成，真实 Pin 的 once/常驻及双向释放测试通过 |
 | Hook 同步决定 | `pb.intercept("hook.entry/return", ..., address=...)` | 已完成，入口跳过/返回值改写真实 Pin 测试通过 |
 | 系统调用观察 | `pb.on("syscall", ..., numbers=...)` / `on_syscall` | 独立原生过滤观察环、兼容双写和逐处理函数去重完成，真实 Pin 测试通过且丢失为 0 |

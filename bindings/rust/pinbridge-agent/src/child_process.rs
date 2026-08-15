@@ -5,14 +5,20 @@
 //! waits on a Pin semaphore for a bounded time, and returns a conservative
 //! "do not follow" decision on every failure path.
 
-use core::ffi::{c_char, c_void};
+use core::ffi::{c_char, c_int, c_void};
 use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use pinbridge_sys::*;
+use std::ffi::{CStr, CString};
+use std::sync::OnceLock;
 
 const MAX_ARGUMENTS: usize = 64;
 const ARGUMENT_BYTES: usize = 8192;
 const DEFAULT_TIMEOUT_MS: u32 = 2000;
 const MAX_TIMEOUT_MS: u32 = 10_000;
+const MAX_PIN_ARGUMENTS: usize = 128;
+const PIN_ARGUMENT_BYTES: usize = 32 * 1024;
+const AGENT_PORT_FLAG: &[u8] = b"-pb_agent_port";
+const PARENT_PORT_FLAG: &[u8] = b"-pb_parent_port";
 
 const IDLE: u32 = 0;
 const WRITING: u32 = 1;
@@ -27,6 +33,39 @@ struct RequestSlot {
     offsets: [u16; MAX_ARGUMENTS],
     lengths: [u16; MAX_ARGUMENTS],
     bytes: [u8; ARGUMENT_BYTES],
+}
+
+struct PinCommandSlot {
+    argc: u32,
+    offsets: [u16; MAX_PIN_ARGUMENTS],
+    bytes: [u8; PIN_ARGUMENT_BYTES],
+}
+
+impl PinCommandSlot {
+    const fn new() -> Self {
+        Self {
+            argc: 0,
+            offsets: [0; MAX_PIN_ARGUMENTS],
+            bytes: [0; PIN_ARGUMENT_BYTES],
+        }
+    }
+}
+
+/// Owns a sanitized argv for the one `pb_pin_init` call. The two private
+/// PinBridge options are removed before Pin parses its own/tool knobs.
+pub struct PreparedToolArguments {
+    strings: Vec<CString>,
+    pointers: Vec<*mut c_char>,
+}
+
+impl PreparedToolArguments {
+    pub fn argc(&self) -> c_int {
+        self.strings.len() as c_int
+    }
+
+    pub fn argv(&mut self) -> *mut *mut c_char {
+        self.pointers.as_mut_ptr()
+    }
 }
 
 impl RequestSlot {
@@ -57,7 +96,164 @@ static TIMEOUTS: AtomicU64 = AtomicU64::new(0);
 static DECISIONS: AtomicU64 = AtomicU64::new(0);
 static FOLLOWED: AtomicU64 = AtomicU64::new(0);
 static REJECTED: AtomicU64 = AtomicU64::new(0);
+static CONFIG_FAILURES: AtomicU64 = AtomicU64::new(0);
+static CONTROL_PORT_OVERRIDE: AtomicU32 = AtomicU32::new(0);
+static PARENT_CONTROL_PORT: AtomicU32 = AtomicU32::new(0);
+static BASE_PIN_ARGUMENTS: OnceLock<Vec<Vec<u8>>> = OnceLock::new();
 static mut REQUEST: RequestSlot = RequestSlot::new();
+static mut CHILD_PIN_COMMAND: PinCommandSlot = PinCommandSlot::new();
+
+fn parse_port(value: &[u8]) -> Result<u16, &'static str> {
+    let text = core::str::from_utf8(value).map_err(|_| "agent port is not ASCII")?;
+    let port = text
+        .parse::<u16>()
+        .map_err(|_| "agent port must be 1..65535")?;
+    if port == 0 {
+        return Err("agent port must be 1..65535");
+    }
+    Ok(port)
+}
+
+fn sanitize_tool_arguments(
+    raw: &[Vec<u8>],
+) -> Result<(Vec<Vec<u8>>, Option<u16>, Option<u16>), &'static str> {
+    let mut sanitized = Vec::with_capacity(raw.len());
+    let mut control_port = None;
+    let mut parent_port = None;
+    let mut index = 0usize;
+    let mut before_application = true;
+    while index < raw.len() {
+        let argument = raw[index].as_slice();
+        if before_application && argument == b"--" {
+            before_application = false;
+            sanitized.push(raw[index].clone());
+            index += 1;
+            continue;
+        }
+        let destination = if before_application && argument == AGENT_PORT_FLAG {
+            &mut control_port
+        } else if before_application && argument == PARENT_PORT_FLAG {
+            &mut parent_port
+        } else {
+            sanitized.push(raw[index].clone());
+            index += 1;
+            continue;
+        };
+        let value = raw.get(index + 1).ok_or("agent port option needs a value")?;
+        *destination = Some(parse_port(value)?);
+        index += 2;
+    }
+    Ok((sanitized, control_port, parent_port))
+}
+
+/// Captures the reusable Pin command line and strips PinBridge-private
+/// child-session options before forwarding argv to PIN_Init.
+pub unsafe fn prepare_tool_arguments(
+    argc: c_int,
+    argv: *mut *mut c_char,
+) -> Result<PreparedToolArguments, &'static str> {
+    if argc <= 0 || argv.is_null() {
+        return Err("Pin tool argv is empty");
+    }
+    let mut raw = Vec::with_capacity(argc as usize);
+    for index in 0..argc as usize {
+        let pointer = *argv.add(index);
+        if pointer.is_null() {
+            return Err("Pin tool argv contains null");
+        }
+        raw.push(CStr::from_ptr(pointer).to_bytes().to_vec());
+    }
+    let (sanitized, control_port, parent_port) = sanitize_tool_arguments(&raw)?;
+    let base_end = sanitized
+        .iter()
+        .position(|argument| argument.as_slice() == b"--")
+        .map(|index| index + 1)
+        .ok_or("Pin tool argv has no -- separator")?;
+    let _ = BASE_PIN_ARGUMENTS.set(sanitized[..base_end].to_vec());
+    CONTROL_PORT_OVERRIDE.store(control_port.unwrap_or(0) as u32, Ordering::Release);
+    PARENT_CONTROL_PORT.store(parent_port.unwrap_or(0) as u32, Ordering::Release);
+
+    let strings: Vec<CString> = sanitized
+        .into_iter()
+        .map(|argument| CString::new(argument).expect("CStr bytes cannot contain NUL"))
+        .collect();
+    let mut pointers: Vec<*mut c_char> = strings
+        .iter()
+        .map(|argument| argument.as_ptr() as *mut c_char)
+        .collect();
+    pointers.push(core::ptr::null_mut());
+    Ok(PreparedToolArguments { strings, pointers })
+}
+
+pub fn control_port_override() -> Option<u16> {
+    let port = CONTROL_PORT_OVERRIDE.load(Ordering::Acquire) as u16;
+    (port != 0).then_some(port)
+}
+
+pub fn parent_control_port() -> Option<u16> {
+    let port = PARENT_CONTROL_PORT.load(Ordering::Acquire) as u16;
+    (port != 0).then_some(port)
+}
+
+fn push_pin_argument(slot: &mut PinCommandSlot, used: &mut usize, argument: &[u8]) -> bool {
+    if slot.argc as usize >= MAX_PIN_ARGUMENTS
+        || argument.len().saturating_add(1) > u16::MAX as usize
+        || used.saturating_add(argument.len()).saturating_add(1) > PIN_ARGUMENT_BYTES
+    {
+        return false;
+    }
+    let index = slot.argc as usize;
+    slot.offsets[index] = *used as u16;
+    slot.bytes[*used..*used + argument.len()].copy_from_slice(argument);
+    *used += argument.len();
+    slot.bytes[*used] = 0;
+    *used += 1;
+    slot.argc += 1;
+    true
+}
+
+/// Runs on the script thread while the Pin callback is waiting. It prepares
+/// a fixed command-line snapshot that the callback can apply without
+/// allocating or retaining the borrowed CHILD_PROCESS handle.
+fn prepare_child_pin_command(control_port: u16, parent_port: u16) -> bool {
+    let Some(base) = BASE_PIN_ARGUMENTS.get() else {
+        return false;
+    };
+    let control_text = control_port.to_string();
+    let parent_text = parent_port.to_string();
+    unsafe {
+        let slot = &mut *core::ptr::addr_of_mut!(CHILD_PIN_COMMAND);
+        slot.argc = 0;
+        let mut used = 0usize;
+        let mut inserted = false;
+        for argument in base {
+            if argument.as_slice() == b"--" {
+                inserted = push_pin_argument(slot, &mut used, AGENT_PORT_FLAG)
+                    && push_pin_argument(slot, &mut used, control_text.as_bytes())
+                    && push_pin_argument(slot, &mut used, PARENT_PORT_FLAG)
+                    && push_pin_argument(slot, &mut used, parent_text.as_bytes())
+                    && push_pin_argument(slot, &mut used, b"--");
+                break;
+            }
+            if !push_pin_argument(slot, &mut used, argument) {
+                return false;
+            }
+        }
+        inserted
+    }
+}
+
+unsafe fn apply_child_pin_command(child: PbChildProcessHandle) -> bool {
+    let slot = &*core::ptr::addr_of!(CHILD_PIN_COMMAND);
+    if slot.argc == 0 || slot.argc as usize > MAX_PIN_ARGUMENTS {
+        return false;
+    }
+    let mut pointers = [core::ptr::null(); MAX_PIN_ARGUMENTS];
+    for index in 0..slot.argc as usize {
+        pointers[index] = slot.bytes.as_ptr().add(slot.offsets[index] as usize) as *const c_char;
+    }
+    pb_child_process_set_pin_command_line(child, slot.argc as i32, pointers.as_ptr()) == PB_OK
+}
 
 unsafe fn capture_request(child: PbChildProcessHandle) -> bool {
     let slot = &mut *core::ptr::addr_of_mut!(REQUEST);
@@ -140,7 +336,11 @@ unsafe extern "C" fn on_follow_child(child: PbChildProcessHandle, _user_data: *m
     loop {
         match STATE.load(Ordering::Acquire) {
             DECIDED => {
-                let follow = RESULT_FOLLOW.load(Ordering::Acquire) != 0;
+                let mut follow = RESULT_FOLLOW.load(Ordering::Acquire) != 0;
+                if follow && !apply_child_pin_command(child) {
+                    CONFIG_FAILURES.fetch_add(1, Ordering::Relaxed);
+                    follow = false;
+                }
                 DECISIONS.fetch_add(1, Ordering::Relaxed);
                 if follow {
                     FOLLOWED.fetch_add(1, Ordering::Relaxed);
@@ -231,10 +431,15 @@ pub fn take_pending() -> Option<ChildRequest> {
 
 /// Publishes the Python decision unless the native callback already timed
 /// out. A cancelled request owns the slot until this function retires it.
-pub fn complete(generation: u64, follow: bool) {
+pub fn complete(generation: u64, follow: bool, control_port: u16, parent_port: u16) {
     if ACTIVE_GENERATION.load(Ordering::Acquire) != generation {
         return;
     }
+    let command_ready = !follow || prepare_child_pin_command(control_port, parent_port);
+    if follow && !command_ready {
+        CONFIG_FAILURES.fetch_add(1, Ordering::Relaxed);
+    }
+    let follow = follow && command_ready;
     RESULT_FOLLOW.store(follow as u32, Ordering::Release);
     if STATE
         .compare_exchange(HANDLING, DECIDED, Ordering::AcqRel, Ordering::Acquire)
@@ -265,4 +470,73 @@ pub fn decision_counts() -> (u64, u64, u64) {
         FOLLOWED.load(Ordering::Relaxed),
         REJECTED.load(Ordering::Relaxed),
     )
+}
+
+pub fn configuration_failure_count() -> u64 {
+    CONFIG_FAILURES.load(Ordering::Relaxed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn arguments(values: &[&str]) -> Vec<Vec<u8>> {
+        values.iter().map(|value| value.as_bytes().to_vec()).collect()
+    }
+
+    #[test]
+    fn private_child_session_options_are_removed_before_pin_init() {
+        let raw = arguments(&[
+            "pin.exe",
+            "-follow_execv",
+            "-t",
+            "agent.dll",
+            "-pb_agent_port",
+            "43123",
+            "-pb_parent_port",
+            "43122",
+            "--",
+            "target.exe",
+            "-pb_agent_port",
+            "not-a-tool-option",
+        ]);
+        let (sanitized, control, parent) = sanitize_tool_arguments(&raw).unwrap();
+        assert_eq!(control, Some(43123));
+        assert_eq!(parent, Some(43122));
+        assert_eq!(
+            sanitized,
+            arguments(&[
+                "pin.exe",
+                "-follow_execv",
+                "-t",
+                "agent.dll",
+                "--",
+                "target.exe",
+                "-pb_agent_port",
+                "not-a-tool-option",
+            ])
+        );
+    }
+
+    #[test]
+    fn private_child_session_ports_must_be_valid() {
+        assert!(sanitize_tool_arguments(&arguments(&[
+            "pin.exe",
+            "-t",
+            "agent.dll",
+            "-pb_agent_port",
+            "0",
+            "--",
+        ]))
+        .is_err());
+        assert!(sanitize_tool_arguments(&arguments(&[
+            "pin.exe",
+            "-t",
+            "agent.dll",
+            "-pb_parent_port",
+            "70000",
+            "--",
+        ]))
+        .is_err());
+    }
 }

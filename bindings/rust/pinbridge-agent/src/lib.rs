@@ -74,7 +74,15 @@ pub fn new_set<K>() -> TlsFreeSet<K> {
 }
 
 fn agent_main(argc: c_int, argv: *mut *mut c_char) -> c_int {
-    log::init();
+    let mut tool_arguments = match unsafe { child_process::prepare_tool_arguments(argc, argv) } {
+        Ok(arguments) => arguments,
+        Err(error) => {
+            log::init(None);
+            log::line(&format!("agent command line rejected: {error}"));
+            return 21;
+        }
+    };
+    log::init(child_process::control_port_override());
     unsafe {
         // Routine-name instrumentation (including the early process-exit
         // edge) requires Pin's symbol manager. Pin requires this before
@@ -84,7 +92,7 @@ fn agent_main(argc: c_int, argv: *mut *mut c_char) -> c_int {
         if symbols_status != PB_OK {
             return 11;
         }
-        if pb_pin_init(argc, argv) != PB_OK {
+        if pb_pin_init(tool_arguments.argc(), tool_arguments.argv()) != PB_OK {
             log::line("pb_pin_init failed");
             return 1;
         }
@@ -229,13 +237,14 @@ unsafe extern "C" fn on_fini(code: i32, _user_data: *mut c_void) {
     let (child_decisions, child_follow, child_reject) = child_process::decision_counts();
     let (sync_decisions, sync_timeouts, sync_busy) = sync_intercept::stats();
     crate::log::line(&format!(
-        "fini code={code} exit_probes={exit_probes} exit_hits={exit_hits} native_prepare={native_prepare} priority_total={} priority_dropped={} observation_total={} observation_dropped={} oom_total={} child_decisions={child_decisions} child_follow={child_follow} child_reject={child_reject} child_decision_timeouts={} sync_decisions={sync_decisions} sync_timeouts={sync_timeouts} sync_busy={sync_busy}",
+        "fini code={code} exit_probes={exit_probes} exit_hits={exit_hits} native_prepare={native_prepare} priority_total={} priority_dropped={} observation_total={} observation_dropped={} oom_total={} child_decisions={child_decisions} child_follow={child_follow} child_reject={child_reject} child_decision_timeouts={} child_config_failures={} sync_decisions={sync_decisions} sync_timeouts={sync_timeouts} sync_busy={sync_busy}",
         priority::total(),
         priority::dropped(),
         observation::total(),
         observation::dropped(),
         high_priority::oom_total(),
         child_process::timeout_count(),
+        child_process::configuration_failure_count(),
     ));
     let (trace_start, trace_end) = engines::trace_range();
     let (hook_start, hook_end) = engines::hook_range();

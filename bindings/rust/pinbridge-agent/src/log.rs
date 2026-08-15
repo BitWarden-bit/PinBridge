@@ -33,11 +33,33 @@ fn timestamp() -> String {
 
 /// Truncates the log and writes the startup header. Call once from the tool
 /// main before anything else that logs.
-pub fn init() {
-    if let Ok(custom) = std::env::var("PINBRIDGE_AGENT_LOG") {
-        if let Ok(mut guard) = PATH.lock() {
-            *guard = custom;
+pub fn init(child_control_port: Option<u16>) {
+    let configured = std::env::var("PINBRIDGE_AGENT_LOG")
+        .unwrap_or_else(|_| "pinbridge-agent.log".to_string());
+    let selected = match child_control_port {
+        Some(port) => {
+            let original = std::path::Path::new(&configured);
+            let parent = original.parent().unwrap_or_else(|| std::path::Path::new(""));
+            let stem = original
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .unwrap_or("pinbridge-agent");
+            let extension = original
+                .extension()
+                .and_then(|value| value.to_str())
+                .unwrap_or("log");
+            parent
+                .join(format!(
+                    "{stem}.child-{}-{port}.{extension}",
+                    std::process::id()
+                ))
+                .to_string_lossy()
+                .into_owned()
         }
+        None => configured,
+    };
+    if let Ok(mut guard) = PATH.lock() {
+        *guard = selected;
     }
     let _ = std::fs::write(path(), format!("{} agent starting\n", timestamp()));
 }

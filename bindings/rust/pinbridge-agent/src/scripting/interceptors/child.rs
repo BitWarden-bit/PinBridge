@@ -8,6 +8,10 @@ use super::{sort_handlers, Handler};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList};
 
+fn reserve_child_control_port() -> Option<std::net::TcpListener> {
+    std::net::TcpListener::bind(("127.0.0.1", 0)).ok()
+}
+
 fn parse_follow(value: &Bound<'_, PyAny>) -> Result<bool, String> {
     if let Ok(follow) = value.extract::<bool>() {
         return Ok(follow);
@@ -32,6 +36,16 @@ pub(super) fn dispatch() {
         return;
     };
     Python::with_gil(|py| {
+        // Retain the listener throughout Python decision handling so another
+        // process cannot claim the suggested port. It is released immediately
+        // before waking the Pin callback; the child cannot start before that
+        // callback returns.
+        let port_reservation = reserve_child_control_port();
+        let control_port = port_reservation
+            .as_ref()
+            .and_then(|listener| listener.local_addr().ok())
+            .map(|address| address.port());
+        let parent_control_port = super::super::RPC_PORT.load(core::sync::atomic::Ordering::Acquire);
         let mut handlers = with_registry(|registry| {
             let mut handlers = Vec::new();
             for (name, plugin) in registry {
@@ -79,6 +93,8 @@ pub(super) fn dispatch() {
                     event.set_item("pid", request.process_id)?;
                     event.set_item("argv", argv)?;
                     event.set_item("argv_bytes", argv_bytes)?;
+                    event.set_item("control_port", control_port)?;
+                    event.set_item("parent_control_port", parent_control_port)?;
                     Ok(())
                 })();
                 if let Err(error) = result {
@@ -135,6 +151,16 @@ pub(super) fn dispatch() {
         if plugin_failed {
             super::super::native_policies::refresh_best_effort("child interceptor failed");
         }
-        crate::child_process::complete(request.generation, follow);
+        if follow && (control_port.is_none() || parent_control_port == 0) {
+            follow = false;
+            crate::log::line("child.follow rejected: independent control port unavailable");
+        }
+        drop(port_reservation);
+        crate::child_process::complete(
+            request.generation,
+            follow,
+            control_port.unwrap_or(0),
+            parent_control_port,
+        );
     });
 }

@@ -124,6 +124,8 @@ service-class 高位会在进入事件和过滤器前移除。entry/exit 通过�
 - `pb.stop() / pb.resume() -> bool`;`pb.step(tid, over=False) -> bool`
 - `pb.is_stopped() -> bool`;`pb.wait_stop(timeout_ms) -> bool`(5ms 轮询);`pb.sleep(ms)`
 - `pb.hit() -> (tid | None, addr)`（造成当前停下的断点命中）
+- `pb.control_port() -> int`：当前 agent 的查询/Python 控制端口；
+  `pb.parent_control_port() -> int | None`：跟随子会话的父端口，根会话为 `None`。
 - `pb.pin_state() -> (state, registration_status)`；状态为 `attached`、`detach_requested`、
   `detached`、`attach_requested`、`attaching` 或 `attach_failed`。
 - `pb.pin_attach_supported() -> bool`：当前 Pin 模式和平台是否支持进程内重新附加。
@@ -437,7 +439,8 @@ def pb_init():
 - `pb.unintercept(decision_id) -> bool`：删除当前插件的同步处理函数；
 - `pb.decision_names() -> list[str]`：返回所有同步决定名；
 - 回调返回 `bool` 或 `{"follow": bool}`；多处理函数采用“全部同意才跟随”；
-- 事件字段为 `type`、`generation`、`process_id`/`pid`、`argv` 和 `argv_bytes`；
+- 事件字段为 `type`、`generation`、`process_id`/`pid`、`argv`、`argv_bytes`、为子会话预分配的
+  `control_port`，以及当前父会话的 `parent_control_port`；
 - 默认等待上限为 2000ms，可用 `PINBRIDGE_SCRIPT_DECISION_TIMEOUT_MS=1..10000` 调整；
 - 无处理函数、Python 未就绪/忙碌、捕获失败、异常、非法返回值和超时都不跟随。
 
@@ -447,8 +450,12 @@ Pin 回调只复制固定上限的 PID/命令行并等待 semaphore，不获取 
 
 真实回归入口是 `fixtures/child_follow_demo/run.ps1`，`-Follow $false` 和
 `-Follow $true` 都必须通过。Fini 日志给出 `child_decisions`、`child_follow`、
-`child_reject`、`child_decision_timeouts`。目前跟随后的子 agent 继承父进程固定端口，端口
-冲突时仍继续插桩，但子进程没有独立 Python/查询控制面；此项仍待独立端口方案。
+`child_reject`、`child_decision_timeouts` 和 `child_config_failures`。跟随决定为真时，脚本线程
+先选择一个空闲回环端口，再把完整 Pin 子命令行写入固定槽；等待中的 Pin 回调只调用
+`CHILD_PROCESS_SetPinCommandLine`，不分配内存。子 agent 在 `PIN_Init` 前读取并剥离内部端口
+参数，以独立端口启动查询服务，同时给继承的日志文件名加入子 PID/端口后缀，避免覆盖父日志。
+子脚本可以用 `pb.control_port()` 和 `pb.parent_control_port()` 查看拓扑。真实跟随回归会连接
+该子端口并热加载第二个 Python 插件，不再只验证“Pin 说它跟随了”。
 
 ### 同步 Hook
 
