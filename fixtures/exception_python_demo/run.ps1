@@ -99,14 +99,15 @@ try {
         "EXCEPTION_HANDLE_PASS",
         "EXCEPTION_OBSERVE_NAMED",
         "EXCEPTION_OBSERVE_CONTEXT",
+        "CONTEXT_APC_OBSERVE",
         "EXCEPTION_OBSERVE_LEGACY",
-        "EXCEPTION_OBSERVE_COUNTS named=1 context=1 legacy=1"
+        "EXCEPTION_OBSERVE_COUNTS named=1 context=1 apc=1 legacy=1"
     )) {
         if (-not $captured.Contains($marker)) { throw "missing callback marker: $marker" }
     }
     $targetOutput = $stdoutTask.Result.Trim()
     $targetError = $stderrTask.Result.Trim()
-    if ($pinProcess.ExitCode -ne 0 -or $targetOutput -notmatch "RECOVERED" -or $targetOutput -match "NATIVE_HANDLER") {
+    if ($pinProcess.ExitCode -ne 0 -or $targetOutput -notmatch "RECOVERED APC=1" -or $targetOutput -match "NATIVE_HANDLER") {
         throw "target failed: exit=$($pinProcess.ExitCode) stdout=$targetOutput stderr=$targetError"
     }
     if (-not $captured.Contains("sync_decisions=1 sync_timeouts=0 sync_busy=0")) {
@@ -118,6 +119,7 @@ try {
         decisions = 1
         named_observer_exact_once = $true
         context_observer_exact_once = $true
+        apc_observer_exact_once = $true
         legacy_observer_exact_once = $true
         native_handler_bypassed = $true
         target_output = $targetOutput

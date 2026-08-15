@@ -6,7 +6,9 @@ import pb
 EXCEPTION_CODE = 0xC0000005
 named_exception_count = 0
 context_exception_count = 0
+context_apc_count = 0
 legacy_exception_count = 0
+context_generations = set()
 
 
 def check_observed_exception(event, source):
@@ -14,6 +16,8 @@ def check_observed_exception(event, source):
         raise RuntimeError("%s saw unexpected exception code 0x%x" % (source, event["code"]))
     if event["exception_generation"] <= 0:
         raise RuntimeError("%s saw no native exception generation" % source)
+    if event["context_generation"] != event["exception_generation"]:
+        raise RuntimeError("%s saw mismatched context generation" % source)
 
 
 def observe_exception(event):
@@ -24,15 +28,32 @@ def observe_exception(event):
 
 
 def observe_context(event):
-    global context_exception_count
+    global context_exception_count, context_apc_count
+    generation = event["context_generation"]
+    if generation <= 0:
+        raise RuntimeError("context observer saw no native context generation")
+    if generation in context_generations:
+        raise RuntimeError("context observer received duplicate generation %d" % generation)
+    context_generations.add(generation)
+    if event["reason_name"] == "apc":
+        if event["reason"] != 3 or event["exception_generation"] != 0:
+            raise RuntimeError("APC context schema is inconsistent")
+        context_apc_count += 1
+        pb.print(
+            "CONTEXT_APC_OBSERVE generation=%d from=0x%x to=0x%x"
+            % (generation, event["from_ip"], event["to_ip"])
+        )
+        return
     if event["reason"] != 4:
         return
+    if event["reason_name"] != "exception":
+        raise RuntimeError("exception context has wrong reason name")
     if (event["info"] & 0xFFFFFFFF) != EXCEPTION_CODE:
         raise RuntimeError("context observer saw unexpected info 0x%x" % event["info"])
-    if event["exception_generation"] <= 0:
-        raise RuntimeError("context observer saw no native exception generation")
+    if event["exception_generation"] != generation:
+        raise RuntimeError("exception context generation mismatch")
     context_exception_count += 1
-    pb.print("EXCEPTION_OBSERVE_CONTEXT generation=%d" % event["exception_generation"])
+    pb.print("EXCEPTION_OBSERVE_CONTEXT generation=%d" % generation)
 
 
 def on_exception(event):
@@ -43,12 +64,22 @@ def on_exception(event):
 
 
 def verify_observers(event):
-    if named_exception_count != 1 or context_exception_count != 1 or legacy_exception_count != 1:
+    if (
+        named_exception_count != 1
+        or context_exception_count != 1
+        or context_apc_count != 1
+        or legacy_exception_count != 1
+    ):
         raise RuntimeError(
-            "exception observers were not exact-once: named=%d context=%d legacy=%d"
-            % (named_exception_count, context_exception_count, legacy_exception_count)
+            "context observers were not exact-once: named=%d context=%d apc=%d legacy=%d"
+            % (
+                named_exception_count,
+                context_exception_count,
+                context_apc_count,
+                legacy_exception_count,
+            )
         )
-    pb.print("EXCEPTION_OBSERVE_COUNTS named=1 context=1 legacy=1")
+    pb.print("EXCEPTION_OBSERVE_COUNTS named=1 context=1 apc=1 legacy=1")
 
 
 def handle_exception(event):

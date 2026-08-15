@@ -170,8 +170,9 @@ pub struct Plugin {
     /// Last module edge delivered to the legacy fixed module callbacks. Named
     /// subscriptions keep their own generation so both APIs may coexist.
     pub module_generation: u64,
-    /// Last mirrored exception delivered to the legacy on_exception callback.
-    pub exception_generation: u64,
+    /// Exact-once state for the legacy on_exception callback. Context edges
+    /// may arrive out of native generation order across application threads.
+    pub exception_generations: events::SharedGenerationWindow,
     /// Exact-once state for the legacy on_syscall callback.
     pub syscall_generations: events::SharedGenerationWindow,
     pub last_stop_gen: u64,

@@ -72,6 +72,18 @@ pub fn shared_generation_window(ignore_through: u64) -> SharedGenerationWindow {
     Rc::new(RefCell::new(GenerationWindow::new(ignore_through)))
 }
 
+pub fn context_reason_name(reason: u64) -> &'static str {
+    match reason {
+        0 => "fatal_signal",
+        1 => "signal",
+        2 => "signal_return",
+        3 => "apc",
+        4 => "exception",
+        5 => "callback",
+        _ => "unknown",
+    }
+}
+
 pub const PUBLIC_EVENT_NAMES: [&str; 27] = [
     "process.start",
     "process.exit",
@@ -282,7 +294,11 @@ pub struct EventSubscription {
     pub syscall_numbers: Option<crate::TlsFreeSet<u32>>,
     /// Exact-once state shared with the current dispatch snapshot. This is
     /// separate per handler so named and legacy APIs may coexist.
-    pub syscall_generations: SharedGenerationWindow,
+    pub syscall_generations: Option<SharedGenerationWindow>,
+    /// Exact-once state for all mirrored context-change reasons. A bitmap is
+    /// required because different application threads may publish native
+    /// generations out of order.
+    pub context_generations: Option<SharedGenerationWindow>,
     /// Sticky process events are replayed once to handlers registered after
     /// the native edge.  This flag is per subscription, so adding a second
     /// handler later still receives the current lifecycle state.
@@ -290,9 +306,8 @@ pub struct EventSubscription {
     /// Latest allocation-failure occurrence delivered from either the
     /// priority ring or the emergency latest-value slot.
     pub oom_generation: u64,
-    /// Latest mirrored module/exception edge delivered from either the
-    /// high-priority or compatibility ring. A selector belongs to at most one
-    /// of these generation domains.
+    /// Latest mirrored module edge delivered from either the high-priority
+    /// or compatibility ring. Context changes use the out-of-order window.
     pub mirror_generation: u64,
 }
 
@@ -317,11 +332,6 @@ impl EventSubscription {
             EventSelector::Kind(EVENT_MODULE_LOAD) | EventSelector::Kind(EVENT_MODULE_UNLOAD)
         ) {
             crate::modules::generation()
-        } else if matches!(
-            selector,
-            EventSelector::Exception | EventSelector::Kind(EVENT_CONTEXT_CHANGE)
-        ) {
-            crate::exception::generation()
         } else {
             0
         };
@@ -334,9 +344,14 @@ impl EventSubscription {
                 order: id,
                 hook_address,
                 syscall_numbers,
-                syscall_generations: shared_generation_window(
-                    crate::syscall_engine::generation(),
-                ),
+                syscall_generations: (selector == EventSelector::Kind(EVENT_SYSCALL)).then(|| {
+                    shared_generation_window(crate::syscall_engine::generation())
+                }),
+                context_generations: matches!(
+                    selector,
+                    EventSelector::Exception | EventSelector::Kind(EVENT_CONTEXT_CHANGE)
+                )
+                .then(|| shared_generation_window(crate::exception::generation())),
                 sticky_delivered: false,
                 oom_generation,
                 mirror_generation,
@@ -368,15 +383,6 @@ pub fn unseen_oom_occurrence(last_delivered: u64, event: &EventRecord) -> Option
 /// consume both copies exactly once per handler.
 pub fn unseen_module_generation(last_delivered: u64, event: &EventRecord) -> Option<u64> {
     (matches!(event.kind, EVENT_MODULE_LOAD | EVENT_MODULE_UNLOAD)
-        && event.arg3 != 0
-        && event.arg3 > last_delivered)
-        .then_some(event.arg3)
-}
-
-/// Returns the generation carried by a new mirrored exception edge.
-pub fn unseen_exception_generation(last_delivered: u64, event: &EventRecord) -> Option<u64> {
-    (event.kind == EVENT_CONTEXT_CHANGE
-        && event.arg0 == CONTEXT_CHANGE_EXCEPTION
         && event.arg3 != 0
         && event.arg3 > last_delivered)
         .then_some(event.arg3)
@@ -448,15 +454,30 @@ pub fn build_event_dict(
         }
         EventSelector::Exception => {
             row.set_item("reason", event.arg0)?;
+            row.set_item("reason_name", context_reason_name(event.arg0))?;
             row.set_item("code", event.arg1)?;
             row.set_item("ip", event.arg2)?;
             row.set_item("exception_generation", event.arg3)?;
+            row.set_item("context_generation", event.arg3)?;
         }
         EventSelector::Kind(EVENT_CONTEXT_CHANGE) => {
             row.set_item("reason", event.arg0)?;
+            row.set_item("reason_name", context_reason_name(event.arg0))?;
             row.set_item("info", event.arg1 as i64)?;
             row.set_item("ip", event.arg2)?;
-            row.set_item("exception_generation", event.arg3)?;
+            row.set_item("from_ip", event.arg2)?;
+            row.set_item("from_ip_known", event.arg6 != 0)?;
+            row.set_item("to_ip", event.arg4)?;
+            row.set_item("to_ip_known", event.arg5 != 0)?;
+            row.set_item("context_generation", event.arg3)?;
+            row.set_item(
+                "exception_generation",
+                if event.arg0 == CONTEXT_CHANGE_EXCEPTION {
+                    event.arg3
+                } else {
+                    0
+                },
+            )?;
         }
         EventSelector::Kind(EVENT_THREAD_START) => {
             row.set_item("ip", event.address)?;
@@ -704,6 +725,17 @@ mod tests {
     }
 
     #[test]
+    fn context_reason_names_cover_the_public_pin_values() {
+        assert_eq!(context_reason_name(0), "fatal_signal");
+        assert_eq!(context_reason_name(1), "signal");
+        assert_eq!(context_reason_name(2), "signal_return");
+        assert_eq!(context_reason_name(3), "apc");
+        assert_eq!(context_reason_name(4), "exception");
+        assert_eq!(context_reason_name(5), "callback");
+        assert_eq!(context_reason_name(6), "unknown");
+    }
+
+    #[test]
     fn process_exit_and_prepare_fini_are_distinct_selectors() {
         let exit_request = EventRecord {
             kind: EVENT_PROCESS_EXIT,
@@ -776,31 +808,6 @@ mod tests {
             ..ring_copy
         };
         assert_eq!(unseen_module_generation(11, &unload), Some(12));
-    }
-
-    #[test]
-    fn exception_generation_deduplicates_priority_and_compatibility_records() {
-        let priority_copy = EventRecord {
-            kind: EVENT_CONTEXT_CHANGE,
-            arg0: CONTEXT_CHANGE_EXCEPTION,
-            arg1: 0xc000_0005,
-            arg3: 21,
-            ..EventRecord::default()
-        };
-        assert_eq!(unseen_exception_generation(20, &priority_copy), Some(21));
-
-        let ring_copy = EventRecord {
-            sequence: 700,
-            ..priority_copy
-        };
-        assert_eq!(unseen_exception_generation(21, &ring_copy), None);
-
-        let non_exception = EventRecord {
-            arg0: 1,
-            arg3: 0,
-            ..ring_copy
-        };
-        assert_eq!(unseen_exception_generation(21, &non_exception), None);
     }
 
     #[test]

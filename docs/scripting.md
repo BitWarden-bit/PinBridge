@@ -84,7 +84,7 @@ kinds 合法值:`hook`/`hook_regs`、`mem`/`memory`、`exec`、`branch`/`branch_
 | 回调 | 触发 | 参数 |
 |---|---|---|
 | `pb_init()` | 顶层跑完之后 | 无 |
-| `on_exception(evt)` | context_change 异常事件 | `{tid, code, rip, reason, exception_generation}` |
+| `on_exception(evt)` | context_change 异常事件 | `{tid, code, rip, reason, exception_generation, context_generation}` |
 | `on_syscall(evt)` | syscall 引擎事件 | `{number, phase, tid, args[6], retval, syscall_generation}`(phase 0=entry 带六参,1=exit 带 retval) |
 | `on_bp_hit(evt)` | 断点命中停下 | `{tid, addr, id}` |
 | `on_module_load(evt)` | 镜像加载 | `{base, end, is_main, name, module_generation}` |
@@ -105,7 +105,7 @@ kinds 合法值:`hook`/`hook_regs`、`mem`/`memory`、`exec`、`branch`/`branch_
 | 3 | exec | 指令地址 | — | — | — | — | — |
 | 4 | branch_edge | 指令地址 | target | taken | — | — | — |
 | 5 | syscall | syscall_generation | number | phase(0=entry,1=exit) | entry:arg0 | entry:arg1 / exit:retval | entry:arg2..arg5 / exit:a4=errno |
-| 6 | context_change | 异常 IP | reason(4=异常) | info(异常码) | ip | exception_generation（非异常为 0） | — |
+| 6 | context_change | 变化前 IP | reason(0..5) | info | from_ip | context_generation | a4=to_ip, a5=to_ip_known, a6=from_ip_known |
 | 7 | module_load | base | base | end | is_main | module_generation | — |
 | 8 | module_unload | base | base | — | — | module_generation | — |
 
@@ -300,15 +300,12 @@ VMP 系保护壳把自己的异常导向 SEH 处理；经典解法是掐 `KiUser
 
 1. **python 就绪竞态**：脚本功能约在端口绑定后 ~1s 才可用（预加载 + 解释器初始化在脚本
    线程上异步完成）;`script run` 报 "python unavailable" 时重试即可。
-2. **部分事件仍只走普通环**：生命周期、模块加载/卸载、异常边沿、SMC、Pin 分离/附加和
-   内存不足使用 4096 槽高优先级环；命名/固定系统调用观察使用经过原生号码过滤的 16384 槽
-   独立环。非异常 context change 仍可能被默认引擎洪流（~100 万 exec/s）挤出普通环。
-3. **异常码符号扩展**:`on_exception` 的 `code` 到达时是符号扩展的 64 位值
+2. **异常码符号扩展**:`on_exception` 的 `code` 到达时是符号扩展的 64 位值
    （如 `0xFFFFFFFFC0000005`)，用前掩到 u32(`code & 0xFFFFFFFF`)。
-4. **间歇性堆损坏崩溃**（历史遗留，排查中）：签名恒定为内部线程在 `ntdll.dll+0x5b897`
+3. **间歇性堆损坏崩溃**（历史遗留，排查中）：签名恒定为内部线程在 `ntdll.dll+0x5b897`
    （堆块头解码）读野指针；脚本负载下的触发率高于旧基线（~1/20)。`diag.rs` 的崩溃捕获器
    对 AV 类故障写 `crash_dump.txt`，复现先拿 dump。
-5. **hook 别名去重**:ntdll 的 `Zw*`/`Nt*` 对共享地址，hook 集合按地址去重——
+4. **hook 别名去重**:ntdll 的 `Zw*`/`Nt*` 对共享地址，hook 集合按地址去重——
    `hooks` 的数量少于 `exports` 数量是去重，不是丢点。
 
 ## 统一事件订阅
@@ -359,8 +356,8 @@ pb.off(subscription_id)
 | `thread.exit` | `ip`, `exit_code` | 退出码按有符号 64 位值提供 |
 | `module.load` | `base`, `end`, `is_main`, `name`, `module_generation` | 高优先级环和兼容普通环双写；同一原生代号对每个处理函数只投递一次 |
 | `module.unload` | `base`, `name`, `module_generation` | 与加载事件共享单调递增的原生代号；真实 DLL 卸载回归已覆盖 |
-| `exception` | `reason`, `code`, `ip`, `exception_generation` | 异常边沿向高优先级环和兼容普通环双写；命名回调与旧固定回调各自去重 |
-| `context.change` | `reason`, `info`, `ip`, `exception_generation` | 异常原因携带非零代号并双写；其他上下文切换仍只走普通环，代号为 0 |
+| `exception` | `reason`, `reason_name`, `code`, `ip`, `exception_generation`, `context_generation` | 异常边沿向高优先级环和兼容普通环双写；两个 generation 在异常事件中相同 |
+| `context.change` | `reason`, `reason_name`, `info`, `from_ip`/`ip`, `from_ip_known`, `to_ip`, `to_ip_known`, `context_generation`, `exception_generation` | 六类 Pin 原因全部双写；只有异常原因的 `exception_generation` 非零 |
 | `syscall` | `number`, `phase`, `args`/`retval`/`errno`, `syscall_generation` | `phase` 为 `enter`/`exit`；原生号码过滤后向 16384 槽观察环和兼容普通环双写并逐处理函数去重 |
 | `hook.entry` | `registers`, `stack_arguments` | 可按绝对地址自动挂载并过滤；快照在同步规则/拦截修改现场前产生 |
 | `hook.return` | `return_value`, `registers`, `stack_arguments` | 地址指向 `ret` 指令；`return_value` 是同步修改前的 `rax/eax` |
@@ -387,14 +384,15 @@ Python；退出交接也只有有界确认等待。Python 处理函数统一在�
 启动前用 `PINBRIDGE_SCRIPT_EXIT_GRACE_MS=0..5000` 调整；正常路径最坏合计为两倍该值。
 超时后原生层无条件继续退出，Python 故障不会把被分析进程永久卡在结束阶段。
 
-上述生命周期、模块加载/卸载、异常边沿、SMC、Pin 分离/附加、内存不足、Pin 内部异常和调试器事件使用独立 4096 槽高优先级环，先于
+上述生命周期、模块加载/卸载、全部上下文变化、SMC、Pin 分离/附加、内存不足、Pin 内部异常和调试器事件使用独立 4096 槽高优先级环，先于
 普通遥测派发。生产回调只执行固定记录和 try-lock，不调用 Python；仅上述退出交接使用
 有上限的确认等待。
 模块事件仍同步写入普通环，保持 CLI/UI 和旧 `on_event_batch` 兼容；两份记录携带同一个
 `module_generation`，命名回调和旧固定回调各自去重，不会因为双写而调用两次 Python。
-异常边沿采用相同的兼容设计，两份记录携带同一个 `exception_generation`。每个
-`pb.on("exception")`、`pb.on("context.change")` 处理函数和旧 `on_exception` 回调分别保存
-自己的已投递代号，所以三种 API 可以同时使用而不会互相吞事件或各自收到双份事件。
+所有上下文变化采用相同的兼容设计，两份记录携带同一个 `context_generation`；异常事件
+同时把该值作为 `exception_generation`。每个 `pb.on("exception")`、
+`pb.on("context.change")` 处理函数和旧 `on_exception` 回调分别使用固定 65536 位窗口去重，
+所以三种 API 可以同时使用，多应用线程乱序也不会误删真实事件或收到双份事件。
 系统调用命名回调和旧 `on_syscall` 使用独立的 16384 槽原生过滤观察环，不与稀有事件共享
 容量，也不会被 instruction/memory 洪流覆盖。兼容普通环仍保留给 CLI/UI 和
 `on_event_batch`；双写记录共享 `syscall_generation`，每个 Python 处理函数各自去重。
@@ -537,7 +535,8 @@ decision_id = pb.intercept(
 直接把 `rip/eip` 改到函数入口不等同于执行一次 `call`，栈布局仍由脚本负责。真实 x64
 回归 `fixtures/exception_python_demo/run.ps1` 触发访问违规，回调根据 `from_registers`
 构造 Win64 栈并改写 `rip/rsp`，目标跳到恢复入口、绕过原生 SEH 处理器并以 0 退出；同一
-回归还验证 `pb.on("exception")`、`pb.on("context.change")` 和旧 `on_exception` 各精确一次。
+回归先投递 Windows APC，验证非异常 `context.change` 精确一次，再验证
+`pb.on("exception")`、`pb.on("context.change")` 和旧 `on_exception` 的异常观察各精确一次。
 
 ### 同步调试器事件
 

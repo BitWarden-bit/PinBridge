@@ -14,8 +14,9 @@ pub const EVENT_EXEC: u32 = 3;
 pub const EVENT_BRANCH_EDGE: u32 = 4;
 /// Syscall entry (number + 6 args) / exit (number + return + errno).
 pub const EVENT_SYSCALL: u32 = 5;
-/// Pin context-change notification (arg0=reason, arg1=info, arg2=ip;
-/// exception edges additionally carry arg3=exception generation).
+/// Pin context-change notification (arg0=reason, arg1=info, arg2=from IP,
+/// arg3=context generation, arg4=to IP, arg5=to-IP-known,
+/// arg6=from-IP-known).
 pub const EVENT_CONTEXT_CHANGE: u32 = 6;
 /// Image loaded (arg0=low, arg1=high, arg2=is_main, arg3=generation;
 /// address=low).
@@ -120,13 +121,15 @@ pub struct Event {
     pub arg1: u64,
     /// hook_regs: r8/eax | memory: access | syscall: arg0 | context_change: ip
     pub arg2: u64,
-    /// hook_regs: r9/ebx | syscall: arg1 (entry) / return value (exit)
+    /// hook_regs: r9/ebx | syscall: arg1 (entry) / return value (exit) |
+    /// context_change: context generation
     pub arg3: u64,
-    /// hook_regs: ABI stack arg0 | syscall: arg2 (entry) / errno (exit)
+    /// hook_regs: ABI stack arg0 | syscall: arg2 (entry) / errno (exit) |
+    /// context_change: destination IP
     pub arg4: u64,
-    /// hook_regs: ABI stack arg1 | syscall: arg3
+    /// hook_regs: ABI stack arg1 | syscall: arg3 | context_change: to-IP-known
     pub arg5: u64,
-    /// hook_regs: ABI stack arg2 | syscall: arg4
+    /// hook_regs: ABI stack arg2 | syscall: arg4 | context_change: from-IP-known
     pub arg6: u64,
     /// hook_regs: ABI stack arg3 | syscall: arg5
     pub arg7: u64,

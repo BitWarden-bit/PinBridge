@@ -1,7 +1,7 @@
 //! Context-change events and the exception pause policy.
-//! Every context change lands in the compatibility ring. True exception
-//! edges are also mirrored into the high-priority ring with one generation
-//! so Python observation survives telemetry floods without duplicate calls.
+//! Every context change is mirrored into both the high-priority and
+//! compatibility rings with one generation. This preserves signal/APC/
+//! callback transitions as well as exceptions during telemetry floods.
 
 use crate::event::{Event, EVENT_CONTEXT_CHANGE};
 use crate::ring::submit;
@@ -12,10 +12,10 @@ use pinbridge_sys::*;
 static POLICY_ENABLED: AtomicBool = AtomicBool::new(false);
 static POLICY_CODE: AtomicU32 = AtomicU32::new(0); // 0 = any exception code
 static PENDING: AtomicBool = AtomicBool::new(false);
-static EXCEPTION_GENERATION: AtomicU64 = AtomicU64::new(0);
+static CONTEXT_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 pub fn generation() -> u64 {
-    EXCEPTION_GENERATION.load(Ordering::Acquire)
+    CONTEXT_GENERATION.load(Ordering::Acquire)
 }
 
 pub fn set_policy(enabled: bool, code: u32) {
@@ -40,26 +40,31 @@ unsafe extern "C" fn on_context_change(
     info: i32,
     _user_data: *mut c_void,
 ) {
-    let mut rip: u64 = 0;
-    pb_pin_get_context_reg(from, crate::arch::instr_ptr_reg(), &mut rip);
-    let exception_generation = if reason == PB_CONTEXT_CHANGE_REASON_EXCEPTION {
-        EXCEPTION_GENERATION.fetch_add(1, Ordering::AcqRel) + 1
-    } else {
-        0
-    };
+    let mut from_ip = 0u64;
+    let from_ip_known = !from.is_null()
+        && pb_pin_get_context_reg(from, crate::arch::instr_ptr_reg(), &mut from_ip) == PB_OK;
+    let mut to_ip = 0u64;
+    let to_ip_known = !to.is_null()
+        && pb_pin_get_context_reg(
+            to as PbConstContextHandle,
+            crate::arch::instr_ptr_reg(),
+            &mut to_ip,
+        ) == PB_OK;
+    let context_generation = CONTEXT_GENERATION.fetch_add(1, Ordering::AcqRel) + 1;
     let event = Event {
         kind: EVENT_CONTEXT_CHANGE,
         thread_id,
-        address: rip,
+        address: from_ip,
         arg0: reason as u64,
         arg1: info as i64 as u64,
-        arg2: rip,
-        arg3: exception_generation,
+        arg2: from_ip,
+        arg3: context_generation,
+        arg4: to_ip,
+        arg5: to_ip_known as u64,
+        arg6: from_ip_known as u64,
         ..Event::EMPTY
     };
-    if exception_generation != 0 {
-        crate::priority::submit(event);
-    }
+    crate::priority::submit(event);
     submit(event);
     crate::record::submit_global(from, event);
 

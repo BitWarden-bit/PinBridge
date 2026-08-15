@@ -5,6 +5,13 @@
 #define PYTHON_EXCEPTION_CODE EXCEPTION_ACCESS_VIOLATION
 
 static jmp_buf g_recovery;
+static volatile LONG g_apc_calls;
+
+static VOID CALLBACK DemoApc(ULONG_PTR value)
+{
+    if (value == (ULONG_PTR)0x50424354)
+        InterlockedIncrement(&g_apc_calls);
+}
 
 __declspec(dllexport) __declspec(noinline) void RecoveryPoint(void)
 {
@@ -14,7 +21,7 @@ __declspec(dllexport) __declspec(noinline) void RecoveryPoint(void)
 int main(void)
 {
     if (setjmp(g_recovery) != 0) {
-        printf("exception_python_demo: RECOVERED\n");
+        printf("exception_python_demo: RECOVERED APC=%ld\n", g_apc_calls);
         fflush(stdout);
         /* Let asynchronous Python observers drain the mirrored exception. */
         Sleep(750);
@@ -22,6 +29,10 @@ int main(void)
     }
     /* Give the runner time to load the Python interceptor. */
     Sleep(4000);
+    if (!QueueUserAPC(DemoApc, GetCurrentThread(), (ULONG_PTR)0x50424354))
+        return 9;
+    if (SleepEx(1000, TRUE) != WAIT_IO_COMPLETION || g_apc_calls != 1)
+        return 10;
     __try {
         volatile int *bad = (volatile int *)(UINT_PTR)1;
         *bad = 0x42;

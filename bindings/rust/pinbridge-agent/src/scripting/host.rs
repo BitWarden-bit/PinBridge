@@ -760,7 +760,9 @@ fn exec_one(name: &str, code: Py<PyAny>, port: u16) {
             priority_cursor: 0,
             observation_cursor: 0,
             module_generation: 0,
-            exception_generation: 0,
+            exception_generations: events::shared_generation_window(
+                crate::exception::generation(),
+            ),
             syscall_generations: events::shared_generation_window(
                 crate::syscall_engine::generation(),
             ),
@@ -837,14 +839,25 @@ fn exec_one(name: &str, code: Py<PyAny>, port: u16) {
                 p.priority_cursor = priority_cursor;
                 p.observation_cursor = observation_cursor;
                 p.module_generation = crate::modules::generation();
-                p.exception_generation = crate::exception::generation();
+                let context_generation = crate::exception::generation();
+                p.exception_generations =
+                    events::shared_generation_window(context_generation);
                 let syscall_generation = crate::syscall_engine::generation();
                 p.syscall_generations = events::shared_generation_window(syscall_generation);
-                for subscription in p.events.values_mut().filter(|subscription| {
-                    subscription.selector == EventSelector::Kind(EVENT_SYSCALL)
-                }) {
-                    subscription.syscall_generations =
-                        events::shared_generation_window(syscall_generation);
+                for subscription in p.events.values_mut() {
+                    if subscription.selector == EventSelector::Kind(EVENT_SYSCALL) {
+                        subscription.syscall_generations = Some(
+                            events::shared_generation_window(syscall_generation),
+                        );
+                    }
+                    if matches!(
+                        subscription.selector,
+                        EventSelector::Exception | EventSelector::Kind(EVENT_CONTEXT_CHANGE)
+                    ) {
+                        subscription.context_generations = Some(
+                            events::shared_generation_window(context_generation),
+                        );
+                    }
                 }
                 p.last_stop_gen = gen;
             }
@@ -1458,7 +1471,8 @@ struct EventHandlerSnapshot {
     order: u64,
     hook_address: Option<u64>,
     syscall_numbers: Option<crate::TlsFreeSet<u32>>,
-    syscall_generations: events::SharedGenerationWindow,
+    syscall_generations: Option<events::SharedGenerationWindow>,
+    context_generations: Option<events::SharedGenerationWindow>,
     sticky_delivered: bool,
     oom_generation: u64,
     mirror_generation: u64,
@@ -1469,7 +1483,7 @@ struct DispatchSnapshot {
     priority_cursor: u64,
     observation_cursor: u64,
     module_generation: u64,
-    exception_generation: u64,
+    exception_generations: events::SharedGenerationWindow,
     syscall_generations: events::SharedGenerationWindow,
     last_stop_gen: u64,
     on_exception: Option<Py<PyAny>>,
@@ -1504,6 +1518,7 @@ fn dispatch_one(py: Python<'_>, name: &str, shared: &TickShared) {
                 hook_address: subscription.hook_address,
                 syscall_numbers: subscription.syscall_numbers.clone(),
                 syscall_generations: subscription.syscall_generations.clone(),
+                context_generations: subscription.context_generations.clone(),
                 sticky_delivered: subscription.sticky_delivered,
                 oom_generation: subscription.oom_generation,
                 mirror_generation: subscription.mirror_generation,
@@ -1515,7 +1530,7 @@ fn dispatch_one(py: Python<'_>, name: &str, shared: &TickShared) {
             priority_cursor: plugin.priority_cursor,
             observation_cursor: plugin.observation_cursor,
             module_generation: plugin.module_generation,
-            exception_generation: plugin.exception_generation,
+            exception_generations: plugin.exception_generations.clone(),
             syscall_generations: plugin.syscall_generations.clone(),
             last_stop_gen: plugin.last_stop_gen,
             on_exception: plugin.on_exception.as_ref().map(|c| c.clone_ref(py)),
@@ -1801,7 +1816,6 @@ fn dispatch_one(py: Python<'_>, name: &str, shared: &TickShared) {
             p.priority_cursor = s.priority_cursor;
             p.observation_cursor = s.observation_cursor;
             p.module_generation = p.module_generation.max(s.module_generation);
-            p.exception_generation = p.exception_generation.max(s.exception_generation);
             p.last_stop_gen = s.last_stop_gen;
             p.delivered += delivered;
             p.dropped += dropped;
@@ -1894,11 +1908,10 @@ fn route_named_handlers(
                 continue;
             }
             if event.address != 0 {
-                if !handler
-                    .syscall_generations
-                    .borrow_mut()
-                    .accept(event.address)
-                {
+                let Some(generations) = &handler.syscall_generations else {
+                    continue;
+                };
+                if !generations.borrow_mut().accept(event.address) {
                     continue;
                 }
             }
@@ -1917,15 +1930,14 @@ fn route_named_handlers(
             handler.selector,
             EventSelector::Exception | EventSelector::Kind(EVENT_CONTEXT_CHANGE)
         ) && event.kind == EVENT_CONTEXT_CHANGE
-            && event.arg0 == CONTEXT_CHANGE_EXCEPTION
             && event.arg3 != 0
         {
-            let Some(generation) =
-                events::unseen_exception_generation(handler.mirror_generation, event)
-            else {
+            let Some(generations) = &handler.context_generations else {
                 continue;
             };
-            handler.mirror_generation = generation;
+            if !generations.borrow_mut().accept(event.arg3) {
+                continue;
+            }
         }
         if matches!(
             handler.selector,
@@ -1990,13 +2002,13 @@ fn route_event(
 ) -> bool {
     let result: Option<Result<(), String>> = match event.kind {
         EVENT_CONTEXT_CHANGE if event.arg0 == CONTEXT_CHANGE_EXCEPTION => {
-            if event.arg3 != 0 {
-                let Some(generation) =
-                    events::unseen_exception_generation(s.exception_generation, event)
-                else {
-                    return false;
-                };
-                s.exception_generation = generation;
+            if event.arg3 != 0
+                && !s
+                    .exception_generations
+                    .borrow_mut()
+                    .accept(event.arg3)
+            {
+                return false;
             }
             let code = event.arg1 as u32;
             match (&s.on_exception, &s.exc_codes) {
@@ -2007,6 +2019,7 @@ fn route_event(
                     let _ = dict.set_item("rip", event.arg2);
                     let _ = dict.set_item("reason", event.arg0);
                     let _ = dict.set_item("exception_generation", event.arg3);
+                    let _ = dict.set_item("context_generation", event.arg3);
                     Some(
                         callback
                             .call1(py, (dict,))
