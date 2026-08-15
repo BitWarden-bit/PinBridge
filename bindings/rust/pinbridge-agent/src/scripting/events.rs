@@ -196,11 +196,21 @@ pub struct EventSubscription {
     /// the native edge.  This flag is per subscription, so adding a second
     /// handler later still receives the current lifecycle state.
     pub sticky_delivered: bool,
+    /// Latest allocation-failure occurrence delivered from either the
+    /// priority ring or the emergency latest-value slot.
+    pub oom_generation: u64,
 }
 
 impl EventSubscription {
     pub fn new(selector: EventSelector, callback: Py<PyAny>, once: bool) -> (u64, Self) {
         let id = NEXT_SUBSCRIPTION_ID.fetch_add(1, Ordering::Relaxed);
+        let oom_generation = if selector == EventSelector::Kind(EVENT_OUT_OF_MEMORY) {
+            crate::high_priority::oom_snapshot()
+                .map(|snapshot| snapshot.0)
+                .unwrap_or(0)
+        } else {
+            0
+        };
         (
             id,
             Self {
@@ -209,6 +219,7 @@ impl EventSubscription {
                 once,
                 order: id,
                 sticky_delivered: false,
+                oom_generation,
             },
         )
     }
@@ -220,6 +231,16 @@ pub fn synthetic_process_event(kind: u32) -> EventRecord {
         thread_id: pinbridge_sys::PB_INVALID_THREAD_ID,
         ..EventRecord::default()
     }
+}
+
+/// Returns the occurrence carried by a new OOM record. The emergency slot
+/// and priority ring can both expose the same native callback, so consumers
+/// use this generation check to invoke Python exactly once.
+pub fn unseen_oom_occurrence(last_delivered: u64, event: &EventRecord) -> Option<u64> {
+    (event.kind == EVENT_OUT_OF_MEMORY
+        && event.arg1 != 0
+        && event.arg1 > last_delivered)
+        .then_some(event.arg1)
 }
 
 /// Builds the public event object.  Stable descriptive fields coexist with
@@ -313,6 +334,8 @@ pub fn build_event_dict(
         }
         EventSelector::Kind(EVENT_OUT_OF_MEMORY) => {
             row.set_item("requested_size", event.arg0)?;
+            row.set_item("occurrence", event.arg1)?;
+            row.set_item("recovered_from_emergency_slot", event.arg2 != 0)?;
         }
         EventSelector::Kind(EVENT_PIN_INTERNAL_EXCEPTION) => {
             row.set_item("ip", event.address)?;
@@ -517,5 +540,25 @@ mod tests {
         };
         assert!(EventSelector::ProcessExit.matches(&prepare_fallback));
         assert!(EventSelector::ProcessPrepareFini.matches(&prepare_fallback));
+    }
+
+    #[test]
+    fn oom_occurrence_deduplicates_emergency_and_ring_records() {
+        let first = EventRecord {
+            kind: EVENT_OUT_OF_MEMORY,
+            arg0: 0x4000,
+            arg1: 7,
+            arg2: 1,
+            ..EventRecord::default()
+        };
+        assert_eq!(unseen_oom_occurrence(6, &first), Some(7));
+        assert_eq!(unseen_oom_occurrence(7, &first), None);
+
+        let newer_ring_record = EventRecord {
+            arg1: 8,
+            arg2: 0,
+            ..first
+        };
+        assert_eq!(unseen_oom_occurrence(7, &newer_ring_record), Some(8));
     }
 }

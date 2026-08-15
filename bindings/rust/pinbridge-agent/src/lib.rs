@@ -12,6 +12,7 @@ mod control;
 mod diag;
 mod disasm;
 mod debugger;
+mod emergency;
 mod engines;
 mod event;
 mod exception;
@@ -91,6 +92,7 @@ fn agent_main(argc: c_int, argv: *mut *mut c_char) -> c_int {
             arch::name(),
             arch::pointer_width()
         ));
+        emergency::initialize();
         diag::install(); // Pin APIs inside: must run after pb_pin_init
         if ring::init() != PB_OK {
             log::line("ring init failed");
@@ -221,9 +223,10 @@ unsafe extern "C" fn on_fini(code: i32, _user_data: *mut c_void) {
     let (child_decisions, child_follow, child_reject) = child_process::decision_counts();
     let (sync_decisions, sync_timeouts, sync_busy) = sync_intercept::stats();
     crate::log::line(&format!(
-        "fini code={code} exit_probes={exit_probes} exit_hits={exit_hits} native_prepare={native_prepare} priority_total={} priority_dropped={} child_decisions={child_decisions} child_follow={child_follow} child_reject={child_reject} child_decision_timeouts={} sync_decisions={sync_decisions} sync_timeouts={sync_timeouts} sync_busy={sync_busy}",
+        "fini code={code} exit_probes={exit_probes} exit_hits={exit_hits} native_prepare={native_prepare} priority_total={} priority_dropped={} oom_total={} child_decisions={child_decisions} child_follow={child_follow} child_reject={child_reject} child_decision_timeouts={} sync_decisions={sync_decisions} sync_timeouts={sync_timeouts} sync_busy={sync_busy}",
         priority::total(),
         priority::dropped(),
+        high_priority::oom_total(),
         child_process::timeout_count(),
     ));
     let (trace_start, trace_end) = engines::trace_range();

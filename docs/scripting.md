@@ -354,7 +354,7 @@ pb.off(subscription_id)
 | `thread.start` | `ip`, `flags` | `tid` 是 Pin 线程号，回调不在该应用线程上运行 |
 | `thread.exit` | `ip`, `exit_code` | 退出码按有符号 64 位值提供 |
 | `code.smc` | `trace_start`, `trace_end` | 第一次订阅时才启用 Pin 的 SMC 跟踪 |
-| `memory.oom` | `requested_size` | 原生分配失败通知；回调自身不分配内存 |
+| `memory.oom` | `requested_size`, `occurrence`, `recovered_from_emergency_slot` | 原生先追加 `pinbridge_oom.log`，存活时再通知 Python；`recovered_from_emergency_slot=True` 表示普通高优先级环未作为唯一投递来源 |
 | `pin.internal_exception` | `ip`, `code`, `exception_address`, `fault_address`, `fault_address_known`, `access_type`, `exception_class` | 先写原生崩溃记录；只有 Pin 仍存活时 Python 才可能收到 |
 | `pin.detach` | `phase="detached"` | 已接入 JIT/Probe 原生完成回调；分离后不承诺 Python 仍被调度 |
 | `pin.attach` | `phase="attached"` | 支持的平台在全部会话回调重建并再次 application-start 后投递；Pin 3.31 Windows JIT 不支持重附加 |
@@ -379,7 +379,13 @@ Python；退出交接也只有有界确认等待。Python 处理函数统一在�
 上述生命周期、SMC、Pin 分离/附加、内存不足、Pin 内部异常和调试器事件使用独立 4096 槽高优先级环，先于
 普通遥测派发。生产回调只执行固定记录和 try-lock，不调用 Python；仅上述退出交接使用
 有上限的确认等待。
-`pinbridge-agent.log` 的 Fini 行提供 `priority_total` 和 `priority_dropped`。
+内存不足另有不分配 Rust 堆、不加锁的紧急路径：先用预先转换好的固定文件名追加
+`pinbridge_oom.log`，再发布一个原子保底槽并尝试写高优先级环。脚本宿主先处理当次可用的
+环记录，缺失时读取保底槽，并按 `occurrence` 去重迟到的环记录，因此同一次原生回调只调用一次 Python。并发 OOM
+回调不会互相等待；保底槽正被写入的事件仍保留独立紧急日志和高优先级环尝试。
+`pinbridge-agent.log` 的 Fini 行提供 `priority_total`、`priority_dropped` 和 `oom_total`。
+自动测试覆盖紧急行格式、保底槽/环去重和事件字段；真实耗尽内存可能破坏测试机稳定性，
+因此不把它列为已强制触发的回归。
 
 ## 同步决定：子进程跟随
 

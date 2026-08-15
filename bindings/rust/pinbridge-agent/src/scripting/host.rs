@@ -17,6 +17,7 @@ use super::{
     with_registry, with_registry_mut, Plugin, ScriptCmd, ScriptReply, Watch, RPC_PORT, STATE_ERROR,
     STATE_RUNNING,
 };
+use crate::event::EVENT_OUT_OF_MEMORY;
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use pinbridge_client::client::Client;
@@ -1380,6 +1381,7 @@ struct EventHandlerSnapshot {
     once: bool,
     order: u64,
     sticky_delivered: bool,
+    oom_generation: u64,
 }
 
 struct DispatchSnapshot {
@@ -1416,6 +1418,7 @@ fn dispatch_one(py: Python<'_>, name: &str, shared: &TickShared) {
                 once: subscription.once,
                 order: subscription.order,
                 sticky_delivered: subscription.sticky_delivered,
+                oom_generation: subscription.oom_generation,
             })
             .collect();
         event_handlers.sort_by_key(|handler| handler.order);
@@ -1532,6 +1535,30 @@ fn dispatch_one(py: Python<'_>, name: &str, shared: &TickShared) {
         }
         dropped += priority_missed;
 
+        // Allocation failure may prevent the priority ring's try-lock from
+        // succeeding. After routing retained records, use the coherent
+        // emergency slot as a fallback. The occurrence generation suppresses
+        // this copy when the ring record was already delivered and suppresses
+        // a late ring copy on a later tick.
+        if failed.is_none() {
+            if let Some((occurrence, requested_size)) = crate::high_priority::oom_snapshot() {
+                let mut event = events::synthetic_process_event(EVENT_OUT_OF_MEMORY);
+                event.arg0 = requested_size;
+                event.arg1 = occurrence;
+                event.arg2 = 1;
+                let _ = route_named_handlers(
+                    py,
+                    &mut s.event_handlers,
+                    &event,
+                    shared,
+                    &mut delivered,
+                    &mut failed,
+                    &mut remove_event_handlers,
+                    &mut delivered_sticky_handlers,
+                );
+            }
+        }
+
         // Stop-gen edge: on_bp_hit first, then on_stop (tid -1 = manual pause).
         if failed.is_none() && shared.stop_gen > s.last_stop_gen {
             s.last_stop_gen = shared.stop_gen;
@@ -1644,6 +1671,13 @@ fn dispatch_one(py: Python<'_>, name: &str, shared: &TickShared) {
                     subscription.sticky_delivered = true;
                 }
             }
+            for handler in &s.event_handlers {
+                if let Some(subscription) = p.events.get_mut(&handler.id) {
+                    subscription.oom_generation = subscription
+                        .oom_generation
+                        .max(handler.oom_generation);
+                }
+            }
             for id in &remove_event_handlers {
                 p.events.remove(id);
             }
@@ -1683,6 +1717,16 @@ fn route_named_handlers(
         }
         if handler.selector.is_sticky() && handler.sticky_delivered {
             continue;
+        }
+        if handler.selector == EventSelector::Kind(EVENT_OUT_OF_MEMORY)
+            && event.kind == EVENT_OUT_OF_MEMORY
+            && event.arg1 != 0
+        {
+            let Some(occurrence) = events::unseen_oom_occurrence(handler.oom_generation, event)
+            else {
+                continue;
+            };
+            handler.oom_generation = occurrence;
         }
 
         if handler.selector.is_sticky() {

@@ -178,6 +178,15 @@ PrepareForFini 确实到达。真正的 PrepareForFini/Fini 只设置原生状�
 记录和 Pin mutex 的 try-lock。锁竞争导致的丢失计入 `priority_dropped`，在 Fini 总结
 日志中可见；环覆盖造成的游标缺口计入插件的 `dropped`。
 
+`memory.oom` 在高优先级环之外还有两层专用保障。原生回调首先以固定栈缓冲和原始 Win32
+写入追加 `pinbridge_oom.log`，这条路径不进行 Rust 堆分配、不获取锁，文件名也已在正常
+初始化阶段转换完成；随后发布包含 `occurrence/requested_size` 的原子保底槽，再以 try-lock
+尝试写高优先级环。进程还能调度脚本线程时，宿主先处理当次可用的环记录，缺失时再读取
+保底槽，并用 `occurrence` 对迟到的同一记录去重。Python 字典中的
+`recovered_from_emergency_slot` 标明当前投递确实来自该保底路径。
+并发 OOM 不在原生回调中等待；保底槽碰到正在写入时，该次事件仍有紧急日志和环写入尝试。
+Fini 总结同时记录 `oom_total`。
+
 `code.smc` 在第一个 Python 订阅出现时才注册，因为 Pin 会从注册后开始维护 SMC 跟踪
 状态，长期全局开启可能无限增长。运行中注册时由宿主持有 Pin client lock。真实 Pin
 测试会执行、修改并再次执行一段动态机器码，验证 Python 收到 `trace_start`/
@@ -196,8 +205,9 @@ Python 插件和不可变策略快照。第二次 application-start 后才产生
 会直接终止目标并报告 “Re-Attach ... is NYI”。C 桥接因此在进入 Pin 前返回
 `PB_ERR_UNSUPPORTED`，Python 可先用 `pb.pin_attach_supported()` 查询。真实 Windows 回归
 已验证安全拒绝且目标正常退出；完整往返只能在支持 JIT reattach 的平台或适用的 Probe
-工具中验证，目前不虚报为已通过。`memory.oom` 也只能用契约测试覆盖注册和字段结构，真实
-耗尽目标内存不是常规回归测试的安全做法。
+工具中验证，目前不虚报为已通过。`memory.oom` 已用单元和契约测试覆盖紧急记录格式、
+保底槽/环去重及公开字段；真实耗尽目标内存不是常规回归测试的安全做法，因此不虚报为
+真实 OOM 回归已通过。
 
 ## 已完成：有返回值的同步决策通道
 
@@ -501,7 +511,7 @@ pb.instrumentation_set(
 | 退出前 Python 清理 | `pb.on("process.exit/process.prepare_fini", ...)` | 已完成，两阶段顺序派发和原生 PrepareForFini 到达均经真实 Pin 验证 |
 | 最终退出记录 | 无 Python 回调；原生 Fini 事件和总结日志 | 已完成；该阶段 Pin 已停止脚本调度，不伪装成可执行 Python 回调 |
 | 动态机器码修改 | `pb.on("code.smc", ...)` | 已完成，真实 Pin 测试通过 |
-| 内存不足 | `pb.on("memory.oom", ...)` | 原生接入和契约测试完成，无法安全强制触发 |
+| 内存不足 | `pb.on("memory.oom", ...)` | 原生紧急日志、原子保底通知和去重完成；单元/契约测试通过，无法安全强制触发真实耗尽 |
 | Pin 内部异常 | `pb.on("pin.internal_exception", ...)` | 原生崩溃记录后投递高优先级快照；仅在进程存活时可到达 Python |
 | Pin 分离完成 | `pb.on("pin.detach", ...)` | JIT/Probe 原生接入完成；分离后的即时 Python 调度不承诺 |
 | Pin 重新附加 | `pb.pin_attach_supported/pin_detach/pin_attach` + `pb.on("pin.attach", ...)` | ABI 和统一回调重建链已完成；Windows JIT 由 Pin 3.31 明确不支持并已验证安全拒绝，支持平台的完整往返待验证 |
