@@ -119,6 +119,8 @@ Python 处理函数不能通过返回值绕过其他插件。旧脚本直接调�
 - `scripting/api.rs`：Python 参数校验和注册入口；
 - `scripting/host.rs`：解释器生命周期、异步事件循环和断点停止快照；
 - `scripting/instrumentation.rs`：合并各插件拥有的高频采集规则并发布原生快照；
+- `scripting/memory_translation.rs`：地址映射所有权、冲突检查和原生转换快照；
+- `scripting/native_policies.rs`：插件失败或卸载时统一刷新全部原生策略；
 - `scripting/interceptors/`：同步决定总调度，以及相互独立的
   `child`、`hook`、`syscall`、`exception` 处理与补丁合并；
 - `context.rs` / 查询协议：提供一次性寄存器快照；
@@ -329,6 +331,39 @@ Pin 热路径不获取 GIL、不调用 Python、不分配规则对象。
 关闭时执行并缓存一个函数，再由 Python 只启用该函数范围，验证动态重新插桩成功且相邻
 排除函数没有泄漏事件。
 
+## 已完成：Python 配置内存地址转换、原生改写访存
+
+地址转换不是逐次回调 Python。插件声明半开源区间、目标起点和选择器：
+
+```python
+generation = pb.memory_translation_set(
+    [(virtual_start, virtual_end, backing_start)],
+    threads=[worker_tid],                 # 省略或 [] 表示全部线程
+    instruction_ranges=[(code_lo, code_hi)],
+    operations=["load", "store"],
+    include_pin=False,
+)
+
+policy = pb.memory_translation_policy()
+pb.memory_translation_clear()
+```
+
+命中后保持区间内偏移：`translated = backing_start + (address - virtual_start)`。一次访问必须
+完整位于源区间内，跨越边界的访问保持原地址。`instruction_ranges` 省略或空列表表示所有
+应用指令；`operations` 可只选读取或写入；`include_pin=False` 默认不改写 Pin 自身访问。
+原子读改写按写入分类。插件自己的映射不得重叠，所有运行插件之间也禁止源区间重叠；
+冲突配置整体失败并恢复旧快照，避免脚本加载顺序暗中决定目标行为。
+
+Pin 的全局内存转换回调用于让 Pin 工具侧取得一致地址，但它本身不会改变应用指令的真实
+访存。因此 C ABI v1.7 增加固定原语 `pb_ins_insert_memory_address_translation`：插桩阶段
+为最多两个普通内存操作数插入转换调用，把返回地址写入预先认领的两个工具寄存器，再用
+`INS_RewriteMemoryOperand` 改写应用操作数。Python 策略变化时，相应指令范围的代码缓存
+失效并重新 JIT；运行时只遍历不可变规则，不调用 Python、不分配、不加锁。
+
+每个插件和所有运行插件合计最多 64 个映射；线程和指令范围各最多 64 项。插件卸载、
+初始化失败或回调异常进入 error 状态时自动移除其映射。真实 Pin 回归把源变量映射到另一
+个 backing 变量，证明指定函数的读取拿到 backing 值，同时未匹配的原子访问仍取得源值。
+
 ### 当前交付状态
 
 | 功能 | Python 入口 | 当前状态 |
@@ -344,5 +379,5 @@ Pin 热路径不获取 GIL、不调用 Python、不分配规则对象。
 | 系统调用同步决定 | `pb.intercept("syscall.entry/exit", ..., numbers=...)` | 已完成，入口参数/出口返回值真实 Pin 测试通过 |
 | 异常同步决定 | `pb.intercept("exception.handle", ..., codes=...)` | 已完成，异常现场读取/目标上下文改写真实 Pin 测试通过 |
 | 指令/内存/分支插桩规则 | `pb.instrumentation_set/clear/policy` | 已完成，动态重新插桩和原生范围过滤真实 Pin 测试通过 |
-| 地址转换 | 尚未发布 | 待开发；必须采用 Python 配置、原生执行 |
+| 地址转换 | `pb.memory_translation_set/clear/policy` | 已完成，真实访存改写和原生选择器真实 Pin 测试通过 |
 | 取机器码 | 尚未发布 | 待开发；必须采用 Python 预置数据、原生快速读取 |

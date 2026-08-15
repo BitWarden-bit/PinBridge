@@ -9,6 +9,9 @@ PbStatus PbBackendInsInsertCaptureRegsCtx(
     PbInsHandle ins, PbInsContextCaptureRegsCallback callback, void* user_data);
 PbStatus PbBackendInsInsertMemoryOperands(
     PbInsHandle ins, PbInsMemoryOperandCallback callback, void* user_data);
+PbStatus PbBackendInsInsertMemoryAddressTranslation(
+    PbInsHandle ins, PbInsMemoryTranslateCallback callback, void* user_data,
+    PbRegId scratch_reg0, PbRegId scratch_reg1);
 PbStatus PbBackendInsInsertExec(
     PbInsHandle ins, PbInsExecCallback callback, void* user_data);
 PbStatus PbBackendInsInsertBranchEdge(

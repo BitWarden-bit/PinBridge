@@ -694,7 +694,7 @@ fn retire_plugin(name: &str, reason: &str) {
             }
         }
         super::interceptors::publish_interests();
-        super::instrumentation::publish_best_effort("plugin retired");
+        super::native_policies::refresh_best_effort("plugin retired");
         output::push(name, reason);
         crate::log::line(&format!("plugin {reason}: {name}"));
         mark_native_dirty();
@@ -743,6 +743,7 @@ fn exec_one(name: &str, code: Py<PyAny>, port: u16) {
             events: crate::new_map(),
             decisions: crate::new_map(),
             instrumentation: None,
+            memory_translation: None,
             breakpoints: crate::new_map(),
             filters: super::Filters::default(),
             cursor: 0,
@@ -778,7 +779,7 @@ fn exec_one(name: &str, code: Py<PyAny>, port: u16) {
                 }
             });
             super::interceptors::publish_interests();
-            super::instrumentation::publish_best_effort("plugin initialization failed");
+            super::native_policies::refresh_best_effort("plugin initialization failed");
             super::publish_list_snapshot();
             return;
         }
@@ -1300,7 +1301,7 @@ fn dispatch_bound_breakpoints(
                 handler.plugin, handler.id
             ));
             super::publish_list_snapshot();
-            super::instrumentation::publish_best_effort("breakpoint callback failed");
+            super::native_policies::refresh_best_effort("breakpoint callback failed");
         }
     }
     merged
@@ -1631,7 +1632,7 @@ fn dispatch_one(py: Python<'_>, name: &str, shared: &TickShared) {
     });
     if failed.is_some() {
         super::publish_list_snapshot();
-        super::instrumentation::publish_best_effort("event callback failed");
+        super::native_policies::refresh_best_effort("event callback failed");
     }
     if let Some(what) = failed {
         output::push(name, &format!("callback failed: {what}"));

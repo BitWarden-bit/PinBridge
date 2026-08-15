@@ -52,3 +52,6 @@ fixtures/exception_python_demo/*.lib
 fixtures/instrumentation_python_demo/*.exe
 fixtures/instrumentation_python_demo/*.exp
 fixtures/instrumentation_python_demo/*.lib
+fixtures/memory_translation_python_demo/*.exe
+fixtures/memory_translation_python_demo/*.exp
+fixtures/memory_translation_python_demo/*.lib

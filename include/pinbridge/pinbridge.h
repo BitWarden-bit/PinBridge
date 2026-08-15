@@ -28,7 +28,7 @@ extern "C" {
 #endif
 
 #define PB_ABI_VERSION_MAJOR 1u
-#define PB_ABI_VERSION_MINOR 6u
+#define PB_ABI_VERSION_MINOR 7u
 #define PB_ABI_VERSION ((PB_ABI_VERSION_MAJOR << 16u) | PB_ABI_VERSION_MINOR)
 
 typedef int32_t PbStatus;
@@ -978,6 +978,10 @@ typedef void (PB_CALL* PbInsContextCaptureRegsCallback)(
 typedef void (PB_CALL* PbInsMemoryOperandCallback)(
     uint64_t instruction_address, uint32_t thread_id,
     uint64_t memory_address, uint32_t size, uint32_t access, void* user_data);
+typedef uint64_t (PB_CALL* PbInsMemoryTranslateCallback)(
+    uint64_t instruction_address, uint32_t thread_id,
+    uint64_t memory_address, uint32_t size, uint32_t memory_operation,
+    void* user_data);
 typedef void (PB_CALL* PbInsExecCallback)(
     uint64_t address, uint32_t thread_id, uint32_t size, void* user_data);
 typedef void (PB_CALL* PbInsBranchEdgeCallback)(
@@ -990,6 +994,14 @@ PB_API PbStatus PB_CALL pb_ins_insert_capture_regs_ctx(
     PbInsHandle ins, PbInsContextCaptureRegsCallback callback, void* user_data);
 PB_API PbStatus PB_CALL pb_ins_insert_memory_operands(
     PbInsHandle ins, PbInsMemoryOperandCallback callback, void* user_data);
+/* ABI v1.7: for each non-scattered memory operand, call the translator at
+   IPOINT_BEFORE, place its returned address in scratch_reg0/1, and rewrite
+   the application operand to that register. memory_operation is
+   PB_PIN_MEMOP_LOAD or PB_PIN_MEMOP_STORE (RMW is classified as STORE).
+   The caller must claim two distinct tool registers before instrumentation. */
+PB_API PbStatus PB_CALL pb_ins_insert_memory_address_translation(
+    PbInsHandle ins, PbInsMemoryTranslateCallback callback, void* user_data,
+    PbRegId scratch_reg0, PbRegId scratch_reg1);
 PB_API PbStatus PB_CALL pb_ins_insert_exec(
     PbInsHandle ins, PbInsExecCallback callback, void* user_data);
 PB_API PbStatus PB_CALL pb_ins_insert_branch_edge(

@@ -123,6 +123,11 @@ fn agent_main(argc: c_int, argv: *mut *mut c_char) -> c_int {
             return 7;
         }
         engines::configure_from_env();
+        let native_policy_status = scripting::initialize_native_policies();
+        log::line(&format!("python native policies init -> {native_policy_status}"));
+        if native_policy_status != PB_OK {
+            return 15;
+        }
         let (trace_start, trace_end) = engines::trace_range();
         let (hook_start, hook_end) = engines::hook_range();
         log::line(&format!(

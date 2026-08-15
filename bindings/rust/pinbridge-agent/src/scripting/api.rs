@@ -804,7 +804,7 @@ fn pb_instrumentation_set(
         Ok(generation) => Ok(generation),
         Err(status) => {
             with_current_plugin_mut(|plugin| plugin.instrumentation = previous);
-            super::instrumentation::publish_best_effort("rollback failed configuration");
+            super::native_policies::refresh_best_effort("rollback failed configuration");
             Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
                 "native instrumentation update failed with status {status}"
             )))
@@ -824,7 +824,7 @@ fn pb_instrumentation_clear() -> PyResult<bool> {
         Ok(_) => Ok(true),
         Err(status) => {
             with_current_plugin_mut(|plugin| plugin.instrumentation = previous);
-            super::instrumentation::publish_best_effort("rollback failed clear");
+            super::native_policies::refresh_best_effort("rollback failed clear");
             Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
                 "native instrumentation clear failed with status {status}"
             )))
@@ -848,6 +848,187 @@ fn pb_instrumentation_policy() -> PyResult<Option<(Vec<String>, Vec<(u64, u64)>,
                 kinds.push("branch.edge".to_string());
             }
             (kinds, spec.ranges.clone(), spec.threads.clone())
+        })
+    })
+    .ok_or_else(no_plugin)
+}
+
+fn translation_operation(name: &str) -> Option<u32> {
+    Some(match name.trim().to_ascii_lowercase().as_str() {
+        "load" | "read" => super::memory_translation::OP_LOAD,
+        "store" | "write" => super::memory_translation::OP_STORE,
+        _ => return None,
+    })
+}
+
+/// Replaces this plugin's address mappings. A mapping tuple is
+/// (source_start, source_end, target_start); the offset inside the source
+/// range is preserved at the target.
+#[pyfunction(
+    name = "memory_translation_set",
+    signature = (mappings, *, threads=None, instruction_ranges=None, operations=None, include_pin=false)
+)]
+fn pb_memory_translation_set(
+    mappings: Vec<(u64, u64, u64)>,
+    threads: Option<Vec<u32>>,
+    instruction_ranges: Option<Vec<(u64, u64)>>,
+    operations: Option<Vec<String>>,
+    include_pin: bool,
+) -> PyResult<u64> {
+    if current_plugin_name().is_none() {
+        return Err(no_plugin());
+    }
+    if mappings.is_empty() || mappings.len() > super::memory_translation::MAX_MAPPINGS {
+        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+            "memory mappings must contain 1..={} entries",
+            super::memory_translation::MAX_MAPPINGS
+        )));
+    }
+    let mut mappings = mappings;
+    mappings.sort_unstable_by_key(|mapping| mapping.0);
+    let mut native_mappings = Vec::with_capacity(mappings.len());
+    let mut previous_end = 0;
+    for (index, (source_start, source_end, target_start)) in mappings.into_iter().enumerate() {
+        if source_start >= source_end
+            || target_start.checked_add(source_end - source_start).is_none()
+            || (index != 0 && source_start < previous_end)
+        {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "memory mappings must be non-overlapping valid ranges and target_start + length must not overflow",
+            ));
+        }
+        previous_end = source_end;
+        native_mappings.push(super::memory_translation::Mapping {
+            source_start,
+            source_end,
+            target_start,
+        });
+    }
+
+    let mut threads = threads.unwrap_or_default();
+    if threads.len() > super::memory_translation::MAX_THREADS
+        || threads.contains(&PB_INVALID_THREAD_ID)
+    {
+        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+            "memory translation threads must contain at most {} valid thread ids",
+            super::memory_translation::MAX_THREADS
+        )));
+    }
+    threads.sort_unstable();
+    threads.dedup();
+
+    let mut instruction_ranges = instruction_ranges.unwrap_or_default();
+    if instruction_ranges.len() > super::memory_translation::MAX_INSTRUCTION_RANGES
+        || instruction_ranges.iter().any(|(start, end)| start >= end)
+    {
+        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+            "instruction_ranges must contain at most {} valid half-open ranges",
+            super::memory_translation::MAX_INSTRUCTION_RANGES
+        )));
+    }
+    instruction_ranges.sort_unstable();
+    let mut merged_instruction_ranges: Vec<(u64, u64)> = Vec::new();
+    for (start, end) in instruction_ranges {
+        if let Some(last) = merged_instruction_ranges.last_mut() {
+            if start <= last.1 {
+                last.1 = last.1.max(end);
+                continue;
+            }
+        }
+        merged_instruction_ranges.push((start, end));
+    }
+
+    let mut operation_mask = 0;
+    for operation in operations.unwrap_or_else(|| vec!["load".to_string(), "store".to_string()]) {
+        operation_mask |= translation_operation(&operation).ok_or_else(|| {
+            PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                "unknown memory operation {operation:?}; expected load or store"
+            ))
+        })?;
+    }
+    if operation_mask == 0 {
+        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+            "memory_translation_set needs at least one operation",
+        ));
+    }
+
+    let spec = super::memory_translation::Spec {
+        mappings: native_mappings,
+        threads,
+        instruction_ranges: merged_instruction_ranges,
+        operations: operation_mask,
+        include_pin,
+    };
+    let previous = with_current_plugin_mut(|plugin| plugin.memory_translation.replace(spec))
+        .ok_or_else(no_plugin)?;
+    match super::memory_translation::publish() {
+        Ok(generation) => Ok(generation),
+        Err(status) => {
+            with_current_plugin_mut(|plugin| plugin.memory_translation = previous);
+            super::native_policies::refresh_best_effort("rollback failed memory translation");
+            Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+                "native memory translation update failed with status {status}; active plugin mappings must not overlap"
+            )))
+        }
+    }
+}
+
+#[pyfunction(name = "memory_translation_clear")]
+fn pb_memory_translation_clear() -> PyResult<bool> {
+    let previous = with_current_plugin_mut(|plugin| plugin.memory_translation.take())
+        .ok_or_else(no_plugin)?;
+    if previous.is_none() {
+        return Ok(false);
+    }
+    match super::memory_translation::publish() {
+        Ok(_) => Ok(true),
+        Err(status) => {
+            with_current_plugin_mut(|plugin| plugin.memory_translation = previous);
+            super::native_policies::refresh_best_effort("rollback failed translation clear");
+            Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+                "native memory translation clear failed with status {status}"
+            )))
+        }
+    }
+}
+
+type MemoryTranslationPolicy = (
+    Vec<(u64, u64, u64)>,
+    Vec<u32>,
+    Vec<(u64, u64)>,
+    Vec<String>,
+    bool,
+);
+
+#[pyfunction(name = "memory_translation_policy")]
+fn pb_memory_translation_policy() -> PyResult<Option<MemoryTranslationPolicy>> {
+    with_current_plugin_mut(|plugin| {
+        plugin.memory_translation.as_ref().map(|spec| {
+            let mappings = spec
+                .mappings
+                .iter()
+                .map(|mapping| {
+                    (
+                        mapping.source_start,
+                        mapping.source_end,
+                        mapping.target_start,
+                    )
+                })
+                .collect();
+            let mut operations = Vec::new();
+            if spec.operations & super::memory_translation::OP_LOAD != 0 {
+                operations.push("load".to_string());
+            }
+            if spec.operations & super::memory_translation::OP_STORE != 0 {
+                operations.push("store".to_string());
+            }
+            (
+                mappings,
+                spec.threads.clone(),
+                spec.instruction_ranges.clone(),
+                operations,
+                spec.include_pin,
+            )
         })
     })
     .ok_or_else(no_plugin)
@@ -964,6 +1145,9 @@ fn pb(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(pb_instrumentation_set, m)?)?;
     m.add_function(wrap_pyfunction!(pb_instrumentation_clear, m)?)?;
     m.add_function(wrap_pyfunction!(pb_instrumentation_policy, m)?)?;
+    m.add_function(wrap_pyfunction!(pb_memory_translation_set, m)?)?;
+    m.add_function(wrap_pyfunction!(pb_memory_translation_clear, m)?)?;
+    m.add_function(wrap_pyfunction!(pb_memory_translation_policy, m)?)?;
     m.add_function(wrap_pyfunction!(pb_watch, m)?)?;
     m.add_function(wrap_pyfunction!(pb_unsubscribe, m)?)?;
     m.add_function(wrap_pyfunction!(pb_subscribe, m)?)?;

@@ -133,7 +133,7 @@ pub(super) fn dispatch() {
             }
         }
         if plugin_failed {
-            super::super::instrumentation::publish_best_effort("child interceptor failed");
+            super::super::native_policies::refresh_best_effort("child interceptor failed");
         }
         crate::child_process::complete(request.generation, follow);
     });

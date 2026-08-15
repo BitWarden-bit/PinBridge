@@ -32,6 +32,8 @@ mod events;
 mod host;
 mod instrumentation;
 mod interceptors;
+mod memory_translation;
+mod native_policies;
 pub mod output;
 mod python_data;
 mod subscriptions;
@@ -48,6 +50,14 @@ static PYTHON_READY: AtomicBool = AtomicBool::new(false);
 
 pub fn python_ready() -> bool {
     PYTHON_READY.load(Ordering::Acquire)
+}
+
+pub fn initialize_native_policies() -> PbStatus {
+    native_policies::initialize()
+}
+
+pub unsafe fn instrument_memory_translation(ins: PbInsHandle, address: u64) {
+    memory_translation::instrument(ins, address);
 }
 
 pub fn set_python_ready(ready: bool) {
@@ -129,6 +139,9 @@ pub struct Plugin {
     /// This plugin's high-frequency capture rules. They are compiled into
     /// one immutable native policy shared by the Pin analysis callbacks.
     pub instrumentation: Option<instrumentation::Spec>,
+    /// Virtual-to-backing memory mappings compiled for Pin's process-global
+    /// memory-address translation callback.
+    pub memory_translation: Option<memory_translation::Spec>,
     /// New-style callbacks bound to exact native breakpoint ids.  Legacy
     /// `on_bp_hit` remains separate and receives every stop notification.
     pub breakpoints: TlsFreeMap<u32, subscriptions::BreakpointSubscription>,

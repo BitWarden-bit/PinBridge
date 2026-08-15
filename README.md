@@ -1,6 +1,6 @@
 # PinBridge
 
-Windows x64 动态二进制分析平台,基于 Intel Pin 3.31:冻结的 **C ABI**(693 个导出)
+Windows x64 动态二进制分析平台,基于 Intel Pin 3.31:冻结的 **C ABI**(694 个导出)
 把 Pin 的 C++ API 暴露给任何语言;其上是用 Rust 写的**调试 agent**(PinTool)——
 事件引擎、断点/单步、异常与 syscall 观测、全速 trace 录制——并**内嵌 CPython**,
 让分析逻辑成为任意时刻可热加载的 Python 插件;重分析(污点、反混淆)以
@@ -21,7 +21,7 @@ Windows x64 动态二进制分析平台,基于 Intel Pin 3.31:冻结的 **C ABI*
 │  trace 录制(独立大 ring + 落盘 .pbtr,ABI v1.5 档2 捕获)       │
 │  内嵌 CPython 3.10 多插件宿主(docs/scripting.md)              │
 ├─────────────────────────────────────────────────────────────┤
-│ pinbridge.dll:冻结 C ABI v1.6(693 个 pb_* 导出)              │
+│ pinbridge.dll:冻结 C ABI v1.7(694 个 pb_* 导出)              │
 │  Pin 3.31 公共 SDK 的 C 包装:无 C++/异常/STL 跨界,opaque     │
 │  handle,(buffer,capacity,required_size*) 三段式,无跨界所有权   │
 └─────────────────────────────────────────────────────────────┘
@@ -107,7 +107,7 @@ python taint.py C:\tmp\win.pbtr slice --at 12345 --operand reg:rdx
 ## 测试
 
 ```powershell
-.\Run-Tests.ps1                    # CMake 契约 60/60 + 绑定生成 + 导出双向校验(689)
+.\Run-Tests.ps1                    # CMake 契约 60/60 + 绑定生成 + 导出双向校验(694)
 $env:PINBRIDGE_PIN_EXE = "<PIN_SDK_ROOT>\intel64\bin\pin.exe"
 python tests\control_e2e.py        # 控制面真机 e2e
 python tests\script_e2e.py         # 多插件脚本真机 e2e(12 步)
@@ -119,6 +119,7 @@ fixtures\hook_python_demo\run.ps1                  # Hook 入口跳过 + 返回�
 fixtures\syscall_python_demo\run.ps1               # syscall 入口参数 + 出口状态同步修改
 fixtures\exception_python_demo\run.ps1             # 异常现场交给 Python 改写后恢复执行
 fixtures\instrumentation_python_demo\run.ps1       # Python 配置范围并动态触发原生重新插桩
+fixtures\memory_translation_python_demo\run.ps1    # Python 映射地址并由原生层改写真实访存
 ```
 
 ## 项目结构
@@ -140,7 +141,7 @@ docs/                 scripting.md / taint-roadmap.md
 - 平台:Windows x64 / Pin 3.31 (build 98869) / Python 3.10;Linux 平台层未做
 - 已知怪癖见 `docs/scripting.md` 末章(稀有类事件在 exec 洪流下会被挤掉——
   等异常/syscall 前先关 exec 类引擎;异常码需 mask 到 u32;……)
-- Backlog:地址转换/取码的 Python 配置层、MCP 服务接入(作为客户端接查询协议)、
+- Backlog:取机器码的 Python 预置数据层、MCP 服务接入(作为客户端接查询协议)、
   runtime parity 编译期对拍、ABI 账本生成器
 
 本仓是早前内部原型的最底层 ABI 抽取 + 重写,当前为独立仓库。

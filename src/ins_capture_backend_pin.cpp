@@ -1,6 +1,7 @@
 #include "pin.H"
 
 #include "ins_capture_backend.h"
+#include "reg_mapping_pin.h"
 
 #include <cstdlib>
 
@@ -22,6 +23,12 @@ struct ContextCaptureRegsState
 struct MemoryOperandState
 {
     PbInsMemoryOperandCallback callback;
+    void* user_data;
+};
+
+struct MemoryTranslateState
+{
+    PbInsMemoryTranslateCallback callback;
     void* user_data;
 };
 
@@ -91,6 +98,18 @@ VOID OnMemoryOperand(
         static_cast<uint64_t>(instruction_address),
         static_cast<uint32_t>(thread_id),
         static_cast<uint64_t>(memory_address), size, access, state->user_data);
+}
+
+ADDRINT OnMemoryTranslate(
+    ADDRINT instruction_address, THREADID thread_id,
+    ADDRINT memory_address, UINT32 size, UINT32 operation, VOID* raw_state)
+{
+    MemoryTranslateState* state = static_cast<MemoryTranslateState*>(raw_state);
+    return static_cast<ADDRINT>(state->callback(
+        static_cast<uint64_t>(instruction_address),
+        static_cast<uint32_t>(thread_id),
+        static_cast<uint64_t>(memory_address), size, operation,
+        state->user_data));
 }
 
 VOID OnExec(ADDRINT address, THREADID thread_id, UINT32 size, VOID* raw_state)
@@ -304,6 +323,43 @@ PbStatus PbBackendInsInsertMemoryOperands(
                 IARG_MEMORYOP_EA, operand, IARG_MEMORYOP_SIZE, operand,
                 IARG_UINT32, PB_MEMORY_TYPE_WRITE, IARG_PTR, state, IARG_END);
         }
+    }
+    return PB_OK;
+}
+
+PbStatus PbBackendInsInsertMemoryAddressTranslation(
+    PbInsHandle ins, PbInsMemoryTranslateCallback callback, void* user_data,
+    PbRegId scratch_reg0, PbRegId scratch_reg1)
+{
+    if (PIN_IsProbeMode())
+        return PB_ERR_INVALID_STATE;
+    REG scratch[2];
+    if (!PbPinRegFromId(scratch_reg0, &scratch[0]) ||
+        !PbPinRegFromId(scratch_reg1, &scratch[1]) || scratch[0] == scratch[1])
+        return PB_ERR_INVALID_ARGUMENT;
+    const INS pins = ToIns(ins);
+    const UINT32 count = INS_MemoryOperandCount(pins);
+    if (count > 2 || INS_HasScatteredMemoryAccess(pins))
+        return PB_ERR_UNSUPPORTED;
+    if (count == 0)
+        return PB_OK;
+    MemoryTranslateState* state =
+        static_cast<MemoryTranslateState*>(std::malloc(sizeof(MemoryTranslateState)));
+    if (!state)
+        return PB_ERR_OUT_OF_MEMORY;
+    state->callback = callback;
+    state->user_data = user_data;
+    for (UINT32 operand = 0; operand < count; ++operand)
+    {
+        const UINT32 operation = INS_MemoryOperandIsWritten(pins, operand)
+            ? PB_PIN_MEMOP_STORE : PB_PIN_MEMOP_LOAD;
+        INS_InsertPredicatedCall(
+            pins, IPOINT_BEFORE, AFUNPTR(OnMemoryTranslate),
+            IARG_INST_PTR, IARG_THREAD_ID,
+            IARG_MEMORYOP_EA, operand, IARG_MEMORYOP_SIZE, operand,
+            IARG_UINT32, operation, IARG_PTR, state,
+            IARG_RETURN_REGS, scratch[operand], IARG_END);
+        INS_RewriteMemoryOperand(pins, operand, scratch[operand]);
     }
     return PB_OK;
 }

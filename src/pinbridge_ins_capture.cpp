@@ -47,4 +47,17 @@ PB_INS_CAPTURE_WRAPPER(pb_ins_insert_capture_exec_bytes, PbInsExecBytesCallback,
 PB_INS_CAPTURE_WRAPPER(pb_ins_insert_memory_operands_values, PbInsMemoryOperandValueCallback,
                        PbBackendInsInsertMemoryOperandsValues)
 
+PbStatus PB_CALL pb_ins_insert_memory_address_translation(
+    PbInsHandle ins, PbInsMemoryTranslateCallback callback, void* user_data,
+    PbRegId scratch_reg0, PbRegId scratch_reg1)
+{
+    const PbStatus valid = Validate(ins, callback);
+    if (valid != PB_OK || scratch_reg0 == scratch_reg1)
+        return PB_ERR_INVALID_ARGUMENT;
+    return Guard([&]() {
+        return PbBackendInsInsertMemoryAddressTranslation(
+            ins, callback, user_data, scratch_reg0, scratch_reg1);
+    });
+}
+
 #undef PB_INS_CAPTURE_WRAPPER

@@ -385,6 +385,11 @@ pub unsafe extern "C" fn on_ins(ins: PbInsHandle, _user_data: *mut c_void) {
         pb_ins_insert_capture_regs_ctx(ins, Some(on_hook_context), core::ptr::null_mut());
     }
 
+    // Python only publishes immutable mapping rules. If this instruction is
+    // in a configured selector range, the fixed ABI primitive rewrites its
+    // application memory operands through native tool-register callbacks.
+    crate::scripting::instrument_memory_translation(ins, address);
+
     // record channel: independent of the main trace range and engine
     // enables; insertions are inert until a session arms (analysis-time
     // re-check inside the record callbacks)

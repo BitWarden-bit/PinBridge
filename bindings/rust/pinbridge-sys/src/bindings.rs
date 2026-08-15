@@ -3,8 +3,8 @@
 use core::ffi::{c_char, c_void};
 
 pub const PB_ABI_VERSION_MAJOR: u32 = 1;
-pub const PB_ABI_VERSION_MINOR: u32 = 6;
-pub const PB_ABI_VERSION: u32 = 65542;
+pub const PB_ABI_VERSION_MINOR: u32 = 7;
+pub const PB_ABI_VERSION: u32 = 65543;
 pub const PB_TRI_YES: PbTri = 0;
 pub const PB_TRI_NO: PbTri = 1;
 pub const PB_TRI_MAYBE: PbTri = 2;
@@ -1510,6 +1510,7 @@ pub type PbSyscallExitCallback = Option<unsafe extern "C" fn(thread_id: PbThread
 pub type PbInsCaptureRegsCallback = Option<unsafe extern "C" fn(address: u64, thread_id: u32, rcx: u64, rdx: u64, r8: u64, r9: u64, user_data: *mut c_void)>;
 pub type PbInsContextCaptureRegsCallback = Option<unsafe extern "C" fn(address: u64, thread_id: u32, context: PbContextHandle, rcx: u64, rdx: u64, r8: u64, r9: u64, user_data: *mut c_void)>;
 pub type PbInsMemoryOperandCallback = Option<unsafe extern "C" fn(instruction_address: u64, thread_id: u32, memory_address: u64, size: u32, access: u32, user_data: *mut c_void)>;
+pub type PbInsMemoryTranslateCallback = Option<unsafe extern "C" fn(instruction_address: u64, thread_id: u32, memory_address: u64, size: u32, memory_operation: u32, user_data: *mut c_void) -> u64>;
 pub type PbInsExecCallback = Option<unsafe extern "C" fn(address: u64, thread_id: u32, size: u32, user_data: *mut c_void)>;
 pub type PbInsBranchEdgeCallback = Option<unsafe extern "C" fn(address: u64, thread_id: u32, target_address: u64, taken: u64, user_data: *mut c_void)>;
 pub type PbInsExecBytesCallback = Option<unsafe extern "C" fn(address: u64, thread_id: u32, size: u32, bytes_lo: u64, bytes_hi: u64, user_data: *mut c_void)>;
@@ -1692,6 +1693,7 @@ unsafe extern "C" {
     pub fn pb_ins_insert_capture_regs(ins: PbInsHandle, callback: PbInsCaptureRegsCallback, user_data: *mut c_void) -> PbStatus;
     pub fn pb_ins_insert_capture_regs_ctx(ins: PbInsHandle, callback: PbInsContextCaptureRegsCallback, user_data: *mut c_void) -> PbStatus;
     pub fn pb_ins_insert_memory_operands(ins: PbInsHandle, callback: PbInsMemoryOperandCallback, user_data: *mut c_void) -> PbStatus;
+    pub fn pb_ins_insert_memory_address_translation(ins: PbInsHandle, callback: PbInsMemoryTranslateCallback, user_data: *mut c_void, scratch_reg0: PbRegId, scratch_reg1: PbRegId) -> PbStatus;
     pub fn pb_ins_insert_exec(ins: PbInsHandle, callback: PbInsExecCallback, user_data: *mut c_void) -> PbStatus;
     pub fn pb_ins_insert_branch_edge(ins: PbInsHandle, callback: PbInsBranchEdgeCallback, user_data: *mut c_void) -> PbStatus;
     pub fn pb_ins_insert_capture_exec_bytes(ins: PbInsHandle, callback: PbInsExecBytesCallback, user_data: *mut c_void) -> PbStatus;

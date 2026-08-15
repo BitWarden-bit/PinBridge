@@ -159,6 +159,18 @@ Pin 插桩回调和分析回调在原生层执行种类、范围和线程过滤�
 缓存失效，因此已运行过的函数也能按新规则重新插桩。各插件规则保持独立的“且”关系后
 再按“或”合并；插件卸载或进入 error 状态时自动撤销其规则。每个插件最多 64 个范围、
 64 个线程号，所有运行插件合计最多 64 个合并前范围。
+- `pb.memory_translation_set(mappings, threads=None, instruction_ranges=None, operations=None,
+  include_pin=False) -> generation`：替换当前插件的地址映射。每项 mapping 是
+  `(source_start, source_end, target_start)`，命中后保持区间偏移；operations 可取 `load`、
+  `store`，其他两个列表省略或为空表示不限制。
+- `pb.memory_translation_policy() -> (mappings, threads, instruction_ranges, operations,
+  include_pin) | None`：读取当前插件自己的地址转换规则。
+- `pb.memory_translation_clear() -> bool`：移除当前插件规则，其他插件不受影响。
+
+地址转换的源区间在当前插件内、以及所有运行插件之间都不得重叠；冲突更新失败并回滚。
+一次访存必须完整落在源区间内才转换，跨界访问保持原地址。默认不转换 Pin 自身访问；
+原子读改写按 `store` 分类。规则发布后，原生层让所选指令范围重新 JIT，并用两个 Pin 工具
+寄存器承接转换结果、改写应用的真实内存操作数。热路径不运行 Python。
 
 轨迹录制（.pbtr，见 docs/taint-roadmap.md 第 2 层；与 64K 主环相互独立）:
 - `pb.trace_start(path, kinds=None, range=None) -> bool`;kinds 名映射到录制档：
@@ -436,3 +448,7 @@ decision_id = pb.intercept(
 `PINBRIDGE_AGENT_ENGINES=none` 下执行并缓存目标函数，再热加载 Python 规则，只允许一个
 函数范围内的 `instruction` 事件；通过第二次调用证明 Pin 已动态重新插桩，并验证旁边的
 排除函数没有事件泄漏。
+
+地址转换真实回归入口为 `fixtures/memory_translation_python_demo/run.ps1`：Python 把源
+变量映射到 backing 变量，只允许指定函数的 `load`；目标输出同时证明映射读取已生效、
+未匹配的物理访问仍留在源地址。

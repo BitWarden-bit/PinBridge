@@ -6,7 +6,7 @@
 //! on either Pin hot path.
 
 use super::{with_registry, STATE_RUNNING};
-use pinbridge_sys::{PbStatus, PB_OK};
+use pinbridge_sys::PbStatus;
 
 #[derive(Clone)]
 pub struct Spec {
@@ -29,14 +29,4 @@ pub fn publish() -> Result<u64, PbStatus> {
             .collect::<Vec<_>>()
     });
     crate::engines::set_instrumentation_policies(&configs)
-}
-
-pub fn publish_best_effort(reason: &str) {
-    if let Err(status) = publish() {
-        if status != PB_OK {
-            crate::log::line(&format!(
-                "instrumentation policy refresh failed ({reason}) -> {status}"
-            ));
-        }
-    }
 }

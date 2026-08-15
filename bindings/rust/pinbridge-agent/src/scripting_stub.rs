@@ -13,6 +13,17 @@ pub fn python_ready() -> bool {
     false
 }
 
+/// No Python-owned hot-path policies exist in the no-scripting build.
+pub fn initialize_native_policies() -> PbStatus {
+    PB_OK
+}
+
+pub unsafe fn instrument_memory_translation(
+    _ins: pinbridge_sys::PbInsHandle,
+    _address: u64,
+) {
+}
+
 /// One SCRIPT_LIST row (shape-compatible with `scripting::PluginInfo`).
 #[derive(Clone)]
 pub struct PluginInfo {

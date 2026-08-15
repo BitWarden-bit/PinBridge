@@ -8,6 +8,7 @@ uint32_t g_exec_calls;
 uint32_t g_branch_edge_calls;
 uint32_t g_exec_bytes_calls;
 uint32_t g_memory_values_calls;
+uint32_t g_memory_translation_calls;
 }
 
 PbStatus PbBackendInsInsertCaptureRegs(
@@ -38,6 +39,17 @@ PbStatus PbBackendInsInsertMemoryOperands(
         return PB_ERR_INVALID_ARGUMENT;
     ++g_memory_operands_calls;
     callback(0x1000, 1, 0x2000, 8, PB_MEMORY_TYPE_READ, user_data);
+    return PB_OK;
+}
+
+PbStatus PbBackendInsInsertMemoryAddressTranslation(
+    PbInsHandle ins, PbInsMemoryTranslateCallback callback, void* user_data,
+    PbRegId scratch_reg0, PbRegId scratch_reg1)
+{
+    if (ins.opaque == 0 || !callback || scratch_reg0 == scratch_reg1)
+        return PB_ERR_INVALID_ARGUMENT;
+    ++g_memory_translation_calls;
+    callback(0x1000, 1, 0x2000, 8, PB_PIN_MEMOP_LOAD, user_data);
     return PB_OK;
 }
 
