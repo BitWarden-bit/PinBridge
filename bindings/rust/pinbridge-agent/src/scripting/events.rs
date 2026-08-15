@@ -171,6 +171,8 @@ impl EventSelector {
                 | Self::Kind(EVENT_THREAD_START)
                 | Self::Kind(EVENT_THREAD_EXIT)
                 | Self::Kind(EVENT_PROCESS_START)
+                | Self::Kind(EVENT_MODULE_LOAD)
+                | Self::Kind(EVENT_MODULE_UNLOAD)
                 | Self::Kind(EVENT_SMC)
                 | Self::Kind(EVENT_PIN_DETACH)
                 | Self::Kind(EVENT_PIN_ATTACH)
@@ -180,6 +182,17 @@ impl EventSelector {
                 | Self::Kind(EVENT_DEBUGGER_SINGLE_STEP)
                 | Self::Kind(EVENT_DEBUGGER_ASYNC_BREAK)
         )
+    }
+
+    /// Module events are intentionally mirrored: Python prefers the
+    /// high-priority copy but must keep a compatibility-ring cursor so that
+    /// either try-lock path can recover the other.
+    pub fn uses_compatibility_ring(self) -> bool {
+        !self.is_priority()
+            || matches!(
+                self,
+                Self::Kind(EVENT_MODULE_LOAD) | Self::Kind(EVENT_MODULE_UNLOAD)
+            )
     }
 
     pub fn requires_smc_registration(self) -> bool {
@@ -199,6 +212,9 @@ pub struct EventSubscription {
     /// Latest allocation-failure occurrence delivered from either the
     /// priority ring or the emergency latest-value slot.
     pub oom_generation: u64,
+    /// Latest native module edge delivered from either the high-priority or
+    /// compatibility ring.
+    pub module_generation: u64,
 }
 
 impl EventSubscription {
@@ -211,6 +227,14 @@ impl EventSubscription {
         } else {
             0
         };
+        let module_generation = if matches!(
+            selector,
+            EventSelector::Kind(EVENT_MODULE_LOAD) | EventSelector::Kind(EVENT_MODULE_UNLOAD)
+        ) {
+            crate::modules::generation()
+        } else {
+            0
+        };
         (
             id,
             Self {
@@ -220,6 +244,7 @@ impl EventSubscription {
                 order: id,
                 sticky_delivered: false,
                 oom_generation,
+                module_generation,
             },
         )
     }
@@ -241,6 +266,16 @@ pub fn unseen_oom_occurrence(last_delivered: u64, event: &EventRecord) -> Option
         && event.arg1 != 0
         && event.arg1 > last_delivered)
         .then_some(event.arg1)
+}
+
+/// Returns the generation carried by a new module edge. Module callbacks are
+/// mirrored into two rings for compatibility and reliability, so Python must
+/// consume both copies exactly once per handler.
+pub fn unseen_module_generation(last_delivered: u64, event: &EventRecord) -> Option<u64> {
+    (matches!(event.kind, EVENT_MODULE_LOAD | EVENT_MODULE_UNLOAD)
+        && event.arg3 != 0
+        && event.arg3 > last_delivered)
+        .then_some(event.arg3)
 }
 
 /// Builds the public event object.  Stable descriptive fields coexist with
@@ -382,12 +417,14 @@ pub fn build_event_dict(
             row.set_item("base", event.arg0)?;
             row.set_item("end", event.arg1)?;
             row.set_item("is_main", event.arg2 != 0)?;
+            row.set_item("module_generation", event.arg3)?;
             if let Some(name) = module_name {
                 row.set_item("name", name)?;
             }
         }
         EventSelector::Kind(EVENT_MODULE_UNLOAD) => {
             row.set_item("base", event.arg0)?;
+            row.set_item("module_generation", event.arg3)?;
             if let Some(name) = module_name {
                 row.set_item("name", name)?;
             }
@@ -467,6 +504,8 @@ mod tests {
             Some(EventSelector::ProcessPrepareFini)
         );
         for name in [
+            "module.load",
+            "module.unload",
             "code.smc",
             "pin.detach",
             "pin.attach",
@@ -484,6 +523,11 @@ mod tests {
         assert!(EventSelector::ProcessPrepareFini.is_priority());
         assert!(EventSelector::ProcessExit.is_sticky());
         assert!(EventSelector::ProcessPrepareFini.is_sticky());
+        for name in ["module.load", "module.unload"] {
+            let selector = EventSelector::parse(name).expect("module selector");
+            assert!(selector.is_priority());
+            assert!(selector.uses_compatibility_ring());
+        }
         assert!(EventSelector::parse("code.smc")
             .expect("SMC selector")
             .requires_smc_registration());
@@ -560,5 +604,31 @@ mod tests {
             ..first
         };
         assert_eq!(unseen_oom_occurrence(7, &newer_ring_record), Some(8));
+    }
+
+    #[test]
+    fn module_generation_deduplicates_priority_and_compatibility_records() {
+        let priority_copy = EventRecord {
+            kind: EVENT_MODULE_LOAD,
+            arg0: 0x1800_0000,
+            arg1: 0x1800_ffff,
+            arg3: 11,
+            ..EventRecord::default()
+        };
+        assert_eq!(unseen_module_generation(10, &priority_copy), Some(11));
+
+        let ring_copy = EventRecord {
+            sequence: 500,
+            ..priority_copy
+        };
+        assert_eq!(unseen_module_generation(11, &ring_copy), None);
+
+        let unload = EventRecord {
+            kind: EVENT_MODULE_UNLOAD,
+            arg1: 0,
+            arg3: 12,
+            ..ring_copy
+        };
+        assert_eq!(unseen_module_generation(11, &unload), Some(12));
     }
 }

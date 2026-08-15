@@ -16,9 +16,10 @@ pub const EVENT_BRANCH_EDGE: u32 = 4;
 pub const EVENT_SYSCALL: u32 = 5;
 /// Pin context-change notification (reason + info + ip).
 pub const EVENT_CONTEXT_CHANGE: u32 = 6;
-/// Image loaded (arg0=low, arg1=high, arg2=is_main; address=low).
+/// Image loaded (arg0=low, arg1=high, arg2=is_main, arg3=generation;
+/// address=low).
 pub const EVENT_MODULE_LOAD: u32 = 7;
-/// Image unloaded (arg0=low; address=low).
+/// Image unloaded (arg0=low, arg3=generation; address=low).
 pub const EVENT_MODULE_UNLOAD: u32 = 8;
 
 // Record-channel-only kinds (never submitted to the main ring; they live in

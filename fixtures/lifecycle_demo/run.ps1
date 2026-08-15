@@ -9,12 +9,13 @@ $dir = $PSScriptRoot
 $repo = (Resolve-Path -LiteralPath (Join-Path $dir "..\..")).Path
 $bundle = Split-Path -Parent $repo
 $target = Join-Path $dir "lifecycle_demo_x64.exe"
+$module = Join-Path $dir "lifecycle_module_x64.dll"
 $plugin = Join-Path $dir "lifecycle_events.py"
 $cli = Join-Path $repo "bindings\rust\target\release\pinbridge-cli.exe"
 $agent = Join-Path $repo "bindings\rust\target\release\pinbridge_agent.dll"
 $pin = Join-Path $bundle "VMP_Offline_Recovery_Kit_20260803_FINAL\runtime\pin\intel64\bin\pin.exe"
 
-foreach ($path in @($target, $plugin, $cli, $agent, $pin)) {
+foreach ($path in @($target, $module, $plugin, $cli, $agent, $pin)) {
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
         throw "required file not found: $path"
     }
@@ -122,6 +123,11 @@ try {
         "LIFECYCLE_PROCESS_START",
         "LIFECYCLE_THREAD_START",
         "LIFECYCLE_THREAD_EXIT",
+        "LIFECYCLE_MODULE_LOAD",
+        "LIFECYCLE_MODULE_UNLOAD",
+        "LIFECYCLE_LEGACY_MODULE_LOAD",
+        "LIFECYCLE_LEGACY_MODULE_UNLOAD",
+        "LIFECYCLE_MODULE_COUNTS named=1/1 legacy=1/1",
         "LIFECYCLE_PROCESS_EXIT",
         "LIFECYCLE_PREPARE_FINI"
     )) {
@@ -150,6 +156,10 @@ try {
         process_start = $true
         thread_start = $true
         thread_exit = $true
+        module_load = $true
+        module_unload = $true
+        module_exact_once = $true
+        legacy_module_exact_once = $true
         process_exit = $true
         process_prepare_fini = $true
         native_prepare_fini = $true

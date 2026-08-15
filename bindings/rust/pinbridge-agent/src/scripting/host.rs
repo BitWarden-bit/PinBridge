@@ -751,6 +751,7 @@ fn exec_one(name: &str, code: Py<PyAny>, port: u16) {
             filters: super::Filters::default(),
             cursor: 0,
             priority_cursor: 0,
+            module_generation: 0,
             last_stop_gen: 0,
             last_breakpoint_gen: 0,
             delivered: 0,
@@ -821,6 +822,7 @@ fn exec_one(name: &str, code: Py<PyAny>, port: u16) {
             if let Some(p) = r.get_mut(name) {
                 p.cursor = cursor;
                 p.priority_cursor = priority_cursor;
+                p.module_generation = crate::modules::generation();
                 p.last_stop_gen = gen;
             }
         });
@@ -869,14 +871,17 @@ fn consumes_ring(p: &Plugin) -> bool {
         || p.on_module_unload.is_some()
         || p.events
             .values()
-            .any(|subscription| !subscription.selector.is_priority())
+            .any(|subscription| subscription.selector.uses_compatibility_ring())
         || (p.on_event_batch.is_some() && p.filters.watch.is_some())
 }
 
 fn consumes_priority(p: &Plugin) -> bool {
-    p.events
-        .values()
-        .any(|subscription| subscription.selector.is_priority())
+    p.on_module_load.is_some()
+        || p.on_module_unload.is_some()
+        || p
+            .events
+            .values()
+            .any(|subscription| subscription.selector.is_priority())
 }
 
 fn event_record(event: &crate::event::Event) -> pinbridge_proto::EventRecord {
@@ -1027,25 +1032,31 @@ fn tick(pending: &mut Vec<(String, Py<PyAny>)>, port: u16) {
             if let Some((missed, _next, events)) = client.ring_page(after, page_limit) {
                 // flood gauge: cursor fell behind, or the page came back full
                 adapt_tick_sleep(missed > 0 || events.len() as u64 >= page_limit);
-                // Resolve module names for kind 7/8 while still connected.
-                let mut bases: Vec<u64> = events
-                    .iter()
-                    .filter(|e| e.kind == EVENT_MODULE_LOAD || e.kind == EVENT_MODULE_UNLOAD)
-                    .map(|e| e.arg0)
-                    .collect();
-                bases.sort_unstable();
-                bases.dedup();
-                if !bases.is_empty() && !send_waiting() {
-                    if let Some(resolutions) = client.resolve(&bases) {
-                        for (base, resolution) in bases.iter().zip(resolutions.iter()) {
-                            let display = resolution
-                                .display()
-                                .unwrap_or_else(|| format!("0x{base:x}"));
-                            shared.module_names.insert(*base, display);
-                        }
-                    }
-                }
                 shared.events = events;
+            }
+        }
+        // Resolve names from both module channels while the control-plane
+        // connection is still open. A plugin with only pb.on("module.load")
+        // has no reason to fetch the compatibility ring.
+        let mut bases: Vec<u64> = shared
+            .priority_events
+            .iter()
+            .chain(shared.events.iter())
+            .filter(|event| {
+                event.kind == EVENT_MODULE_LOAD || event.kind == EVENT_MODULE_UNLOAD
+            })
+            .map(|event| event.arg0)
+            .collect();
+        bases.sort_unstable();
+        bases.dedup();
+        if !bases.is_empty() && !send_waiting() {
+            if let Some(resolutions) = client.resolve(&bases) {
+                for (base, resolution) in bases.iter().zip(resolutions.iter()) {
+                    let display = resolution
+                        .display()
+                        .unwrap_or_else(|| format!("0x{base:x}"));
+                    shared.module_names.insert(*base, display);
+                }
             }
         }
     } // <- the connection is closed here, before Python runs
@@ -1382,11 +1393,13 @@ struct EventHandlerSnapshot {
     order: u64,
     sticky_delivered: bool,
     oom_generation: u64,
+    module_generation: u64,
 }
 
 struct DispatchSnapshot {
     cursor: u64,
     priority_cursor: u64,
+    module_generation: u64,
     last_stop_gen: u64,
     on_exception: Option<Py<PyAny>>,
     on_syscall: Option<Py<PyAny>>,
@@ -1419,12 +1432,14 @@ fn dispatch_one(py: Python<'_>, name: &str, shared: &TickShared) {
                 order: subscription.order,
                 sticky_delivered: subscription.sticky_delivered,
                 oom_generation: subscription.oom_generation,
+                module_generation: subscription.module_generation,
             })
             .collect();
         event_handlers.sort_by_key(|handler| handler.order);
         Some(DispatchSnapshot {
             cursor: plugin.cursor,
             priority_cursor: plugin.priority_cursor,
+            module_generation: plugin.module_generation,
             last_stop_gen: plugin.last_stop_gen,
             on_exception: plugin.on_exception.as_ref().map(|c| c.clone_ref(py)),
             on_syscall: plugin.on_syscall.as_ref().map(|c| c.clone_ref(py)),
@@ -1519,6 +1534,9 @@ fn dispatch_one(py: Python<'_>, name: &str, shared: &TickShared) {
                     priority_missed = event.sequence - s.priority_cursor - 1;
                 }
                 s.priority_cursor = event.sequence;
+                if route_event(py, &mut s, event, shared, &mut delivered, &mut failed) {
+                    break;
+                }
                 if route_named_handlers(
                     py,
                     &mut s.event_handlers,
@@ -1608,7 +1626,7 @@ fn dispatch_one(py: Python<'_>, name: &str, shared: &TickShared) {
                     plugin_missed = event.sequence - s.cursor - 1;
                 }
                 s.cursor = event.sequence;
-                if route_event(py, &s, event, shared, &mut delivered, &mut failed) {
+                if route_event(py, &mut s, event, shared, &mut delivered, &mut failed) {
                     break; // callback failed: plugin marked error below
                 }
                 if route_named_handlers(
@@ -1663,6 +1681,7 @@ fn dispatch_one(py: Python<'_>, name: &str, shared: &TickShared) {
         if let Some(p) = r.get_mut(name) {
             p.cursor = s.cursor;
             p.priority_cursor = s.priority_cursor;
+            p.module_generation = p.module_generation.max(s.module_generation);
             p.last_stop_gen = s.last_stop_gen;
             p.delivered += delivered;
             p.dropped += dropped;
@@ -1676,6 +1695,9 @@ fn dispatch_one(py: Python<'_>, name: &str, shared: &TickShared) {
                     subscription.oom_generation = subscription
                         .oom_generation
                         .max(handler.oom_generation);
+                    subscription.module_generation = subscription
+                        .module_generation
+                        .max(handler.module_generation);
                 }
             }
             for id in &remove_event_handlers {
@@ -1728,6 +1750,19 @@ fn route_named_handlers(
             };
             handler.oom_generation = occurrence;
         }
+        if matches!(
+            handler.selector,
+            EventSelector::Kind(EVENT_MODULE_LOAD) | EventSelector::Kind(EVENT_MODULE_UNLOAD)
+        ) && matches!(event.kind, EVENT_MODULE_LOAD | EVENT_MODULE_UNLOAD)
+            && event.arg3 != 0
+        {
+            let Some(generation) =
+                events::unseen_module_generation(handler.module_generation, event)
+            else {
+                continue;
+            };
+            handler.module_generation = generation;
+        }
 
         if handler.selector.is_sticky() {
             handler.sticky_delivered = true;
@@ -1766,11 +1801,11 @@ fn route_named_handlers(
     false
 }
 
-/// Routes one ring event to its dedicated callback. Returns true when a
-/// callback failed (caller stops dispatching this plugin).
+/// Routes one priority or compatibility-ring event to its legacy dedicated
+/// callback. Returns true when a callback failed.
 fn route_event(
     py: Python<'_>,
-    s: &DispatchSnapshot,
+    s: &mut DispatchSnapshot,
     event: &pinbridge_proto::EventRecord,
     shared: &TickShared,
     delivered: &mut u64,
@@ -1827,6 +1862,14 @@ fn route_event(
             }
         }
         EVENT_MODULE_LOAD | EVENT_MODULE_UNLOAD => {
+            if event.arg3 != 0 {
+                let Some(generation) =
+                    events::unseen_module_generation(s.module_generation, event)
+                else {
+                    return false;
+                };
+                s.module_generation = generation;
+            }
             let is_load = event.kind == EVENT_MODULE_LOAD;
             let callback = if is_load {
                 &s.on_module_load
@@ -1850,6 +1893,7 @@ fn route_event(
                     let _ = dict.set_item("base", base);
                     let _ = dict.set_item("end", if is_load { event.arg1 } else { 0 });
                     let _ = dict.set_item("is_main", event.arg2 != 0);
+                    let _ = dict.set_item("module_generation", event.arg3);
                     let _ = dict.set_item("name", module_name);
                     Some(
                         callback

@@ -165,6 +165,9 @@ pub struct Plugin {
     pub cursor: u64,
     /// Independent cursor in the rare/high-priority event queue.
     pub priority_cursor: u64,
+    /// Last module edge delivered to the legacy fixed module callbacks. Named
+    /// subscriptions keep their own generation so both APIs may coexist.
+    pub module_generation: u64,
     pub last_stop_gen: u64,
     /// Separate edge cursor for bound breakpoint callbacks.  It must not
     /// share `last_stop_gen`: a plugin may use both the new handler and the
