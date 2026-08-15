@@ -250,6 +250,43 @@ fn pb_sleep(ms: u64) {
     pin_sleep(ms.min(3_600_000) as u32);
 }
 
+#[pyfunction(name = "pin_state")]
+fn pb_pin_state() -> (String, i32) {
+    (
+        crate::pin_session::state_name().to_string(),
+        crate::pin_session::last_registration_status(),
+    )
+}
+
+#[pyfunction(name = "pin_attach_supported")]
+fn pb_pin_attach_supported() -> bool {
+    crate::pin_session::attach_supported()
+}
+
+#[pyfunction(name = "pin_detach")]
+fn pb_pin_detach() -> PyResult<bool> {
+    let status = crate::pin_session::request_detach();
+    if status == PB_OK {
+        Ok(true)
+    } else {
+        Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+            "Pin detach request failed with status {status}; state={}",
+            crate::pin_session::state_name()
+        )))
+    }
+}
+
+#[pyfunction(name = "pin_attach")]
+fn pb_pin_attach() -> PyResult<bool> {
+    match crate::pin_session::request_attach() {
+        Ok(status) => Ok(status == pinbridge_sys::PB_ATTACH_INITIATED),
+        Err(status) => Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+            "Pin attach request failed with status {status}; state={}",
+            crate::pin_session::state_name()
+        ))),
+    }
+}
+
 #[pyfunction(name = "resolve")]
 fn pb_resolve(addr: u64) -> Option<String> {
     rpc(|c| c.resolve(&[addr]))?.pop()?.display()
@@ -1311,6 +1348,10 @@ fn pb(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(pb_step, m)?)?;
     m.add_function(wrap_pyfunction!(pb_wait_stop, m)?)?;
     m.add_function(wrap_pyfunction!(pb_sleep, m)?)?;
+    m.add_function(wrap_pyfunction!(pb_pin_state, m)?)?;
+    m.add_function(wrap_pyfunction!(pb_pin_attach_supported, m)?)?;
+    m.add_function(wrap_pyfunction!(pb_pin_detach, m)?)?;
+    m.add_function(wrap_pyfunction!(pb_pin_attach, m)?)?;
     m.add_function(wrap_pyfunction!(pb_resolve, m)?)?;
     m.add_function(wrap_pyfunction!(pb_resolve_name, m)?)?;
     m.add_function(wrap_pyfunction!(pb_disasm, m)?)?;

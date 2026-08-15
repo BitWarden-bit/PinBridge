@@ -84,11 +84,19 @@ unsafe extern "C" fn on_xed_decode(
     let _ = pb_xed_decoded_inst_set_features(decoded_instruction, selected, enabled);
 }
 
+fn register_callback() -> PbStatus {
+    unsafe { pb_pin_add_xed_decode_callback_function(Some(on_xed_decode), core::ptr::null_mut()) }
+}
+
 /// Registers Pin's one pre-decode callback before application execution.
 /// With no plugin policy the callback is one atomic load and a return.
 pub fn initialize() -> PbStatus {
     ACTIVE.store(0, Ordering::Release);
-    unsafe { pb_pin_add_xed_decode_callback_function(Some(on_xed_decode), core::ptr::null_mut()) }
+    register_callback()
+}
+
+pub fn reregister_after_attach() -> PbStatus {
+    register_callback()
 }
 
 /// Publishes the agreement of all live plugins. Conflicting explicit values

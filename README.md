@@ -1,6 +1,6 @@
 # PinBridge
 
-Windows x64 动态二进制分析平台,基于 Intel Pin 3.31:冻结的 **C ABI**(696 个导出)
+Windows x64 动态二进制分析平台,基于 Intel Pin 3.31:冻结的 **C ABI**(697 个导出)
 把 Pin 的 C++ API 暴露给任何语言;其上是用 Rust 写的**调试 agent**(PinTool)——
 事件引擎、断点/单步、异常与 syscall 观测、全速 trace 录制——并**内嵌 CPython**,
 让分析逻辑成为任意时刻可热加载的 Python 插件;重分析(污点、反混淆)以
@@ -21,7 +21,7 @@ Windows x64 动态二进制分析平台,基于 Intel Pin 3.31:冻结的 **C ABI*
 │  trace 录制(独立大 ring + 落盘 .pbtr,ABI v1.5 档2 捕获)       │
 │  内嵌 CPython 3.10 多插件宿主(docs/scripting.md)              │
 ├─────────────────────────────────────────────────────────────┤
-│ pinbridge.dll:冻结 C ABI v1.9(696 个 pb_* 导出)              │
+│ pinbridge.dll:冻结 C ABI v1.10(697 个 pb_* 导出)             │
 │  Pin 3.31 公共 SDK 的 C 包装:无 C++/异常/STL 跨界,opaque     │
 │  handle,(buffer,capacity,required_size*) 三段式,无跨界所有权   │
 └─────────────────────────────────────────────────────────────┘
@@ -107,7 +107,7 @@ python taint.py C:\tmp\win.pbtr slice --at 12345 --operand reg:rdx
 ## 测试
 
 ```powershell
-.\Run-Tests.ps1                    # CMake 契约 60/60 + 绑定生成 + 导出双向校验(696)
+.\Run-Tests.ps1                    # CMake 契约 60/60 + 绑定生成 + 导出双向校验(697)
 $env:PINBRIDGE_PIN_EXE = "<PIN_SDK_ROOT>\intel64\bin\pin.exe"
 python tests\control_e2e.py        # 控制面真机 e2e
 python tests\script_e2e.py         # 多插件脚本真机 e2e(12 步)
@@ -122,6 +122,7 @@ fixtures\instrumentation_python_demo\run.ps1       # 动态重新插桩 + 指令
 fixtures\memory_translation_python_demo\run.ps1    # Python 映射地址并由原生层改写真实访存
 fixtures\code_fetch_python_demo\run.ps1            # Python 预置机器码并触发原生重新取码
 fixtures\xed_decode_python_demo\run.ps1             # XED 预解码策略 + 已解码命名/批量事件
+fixtures\pin_reattach_python_demo\run.ps1           # 重附加能力探测；Windows JIT 安全拒绝而不杀目标
 ```
 
 ## 项目结构

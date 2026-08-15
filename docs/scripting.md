@@ -118,6 +118,12 @@ service-class 高位会在进入事件和过滤器前移除。entry/exit 通过�
 - `pb.stop() / pb.resume() -> bool`;`pb.step(tid, over=False) -> bool`
 - `pb.is_stopped() -> bool`;`pb.wait_stop(timeout_ms) -> bool`(5ms 轮询);`pb.sleep(ms)`
 - `pb.hit() -> (tid | None, addr)`（造成当前停下的断点命中）
+- `pb.pin_state() -> (state, registration_status)`；状态为 `attached`、`detach_requested`、
+  `detached`、`attach_requested`、`attaching` 或 `attach_failed`。
+- `pb.pin_attach_supported() -> bool`：当前 Pin 模式和平台是否支持进程内重新附加。
+- `pb.pin_detach() -> bool`：异步请求 JIT/Probe 分离；完成后产生 `pin.detach`。
+- `pb.pin_attach() -> bool`：从 `pin.detach` 处理函数请求重新附加；`True` 表示 Pin 已接受，
+  `False` 表示分离尚未完成，需要稍后重试。桥接/状态错误抛出 `RuntimeError`。
 
 断点（64 槽）与 hook 点（4096 槽，命中产 kind-1 hook_regs 事件）:
 - `pb.bp_set(addr) -> id | None`;`pb.bp_remove(id) -> bool`
@@ -350,7 +356,7 @@ pb.off(subscription_id)
 | `memory.oom` | `requested_size` | 原生分配失败通知；回调自身不分配内存 |
 | `pin.internal_exception` | `ip`, `code`, `exception_address`, `fault_address`, `fault_address_known`, `access_type`, `exception_class` | 先写原生崩溃记录；只有 Pin 仍存活时 Python 才可能收到 |
 | `pin.detach` | `phase="detached"` | 已接入 JIT/Probe 原生完成回调；分离后不承诺 Python 仍被调度 |
-| `pin.attach` | `phase="attached"` | 字段已固定；完整重新附加控制链仍在开发 |
+| `pin.attach` | `phase="attached"` | 支持的平台在全部会话回调重建并再次 application-start 后投递；Pin 3.31 Windows JIT 不支持重附加 |
 | `debugger.breakpoint` / `debugger.single_step` / `debugger.async_break` | `ip`, `debugging_event`, `stack_pointer`, `flags`, `return_value` | Pin 准备把停止事件报告给应用调试器时产生；这里只观察，不改变处理结果 |
 | `trace.instrument` | `size`, `basic_block_count`, `instruction_count`, `has_fall_through`, `routine_address`, `policy_generation` | Pin 为执行路径创建动态 Trace 时产生 |
 | `routine.instrument` | `size`, `instruction_count`, `routine_id`, `is_dynamic`, `is_artificial`, `policy_generation` | 策略启用时补当前函数快照，随后接收 Pin 新发现函数 |

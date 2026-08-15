@@ -18,6 +18,10 @@ pub fn initialize_native_policies() -> PbStatus {
     PB_OK
 }
 
+pub fn reregister_after_attach() -> PbStatus {
+    PB_OK
+}
+
 pub unsafe fn instrument_memory_translation(
     _ins: pinbridge_sys::PbInsHandle,
     _address: u64,

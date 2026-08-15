@@ -39,6 +39,7 @@ unsafe fn context_ip(context: PbConstContextHandle) -> u64 {
 }
 
 unsafe extern "C" fn on_application_start(_user_data: *mut c_void) {
+    crate::pin_session::note_application_started();
     if PROCESS_STARTED.swap(true, Ordering::AcqRel) {
         // Pin documents another application-start notification after a
         // successful reattach, following image initialization.

@@ -175,10 +175,7 @@ pub unsafe fn instrument(ins: PbInsHandle, address: u64) {
     );
 }
 
-/// Installs Pin's one process-global callback before the application starts.
-/// With no Python rules the callback is an identity mapping.
-pub fn initialize() -> PbStatus {
-    publish_native(NativePolicy { rules: Vec::new() });
+fn register_callback() -> PbStatus {
     unsafe {
         let mut reg0 = PB_REG_INVALID_;
         let mut reg1 = PB_REG_INVALID_;
@@ -197,6 +194,19 @@ pub fn initialize() -> PbStatus {
         SCRATCH_REG1.store(reg1, Ordering::Release);
         pb_pin_add_memory_address_trans_function(Some(on_translate), core::ptr::null_mut())
     }
+}
+
+/// Installs Pin's one process-global callback before the application starts.
+/// With no Python rules the callback is an identity mapping.
+pub fn initialize() -> PbStatus {
+    publish_native(NativePolicy { rules: Vec::new() });
+    register_callback()
+}
+
+/// Detach clears Pin callbacks and tool-register claims but not the Rust
+/// policy snapshot. Claim fresh registers and reconnect the existing rules.
+pub fn reregister_after_attach() -> PbStatus {
+    register_callback()
 }
 
 fn instrumentation_scope(policy: &NativePolicy) -> (bool, Vec<(u64, u64)>) {

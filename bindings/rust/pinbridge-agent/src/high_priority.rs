@@ -24,6 +24,7 @@ unsafe extern "C" fn on_smc(trace_start: u64, trace_end: u64, _user_data: *mut c
 }
 
 unsafe extern "C" fn on_detach(_user_data: *mut c_void) {
+    crate::pin_session::note_detached();
     submit(Event {
         kind: EVENT_PIN_DETACH,
         thread_id: PB_INVALID_THREAD_ID,
@@ -63,6 +64,16 @@ pub fn enable_smc() -> PbStatus {
         return unlock_status;
     }
     status
+}
+
+/// Detach removes callback registrations while the subscription interest
+/// flag remains valid in Rust memory. Attach callbacks already hold Pin's
+/// client/vm locks, so re-register directly without recursive locking.
+pub fn reregister_smc_after_attach() -> PbStatus {
+    if !SMC_REGISTERED.load(Ordering::Acquire) {
+        return PB_OK;
+    }
+    unsafe { pb_trace_add_smc_detected_function(Some(on_smc), core::ptr::null_mut()) }
 }
 
 /// Registers always-on emergency/detach sources. JIT and Probe use distinct

@@ -21,6 +21,7 @@ mod instrumentation_lifecycle;
 mod lifecycle;
 mod log;
 mod modules;
+mod pin_session;
 mod priority;
 mod query_server;
 mod record;
@@ -130,6 +131,37 @@ fn agent_main(argc: c_int, argv: *mut *mut c_char) -> c_int {
         if native_policy_status != PB_OK {
             return 15;
         }
+
+        // Finish native session setup before starting the Python host. A user
+        // script may call pin_detach() as soon as its top level runs, so no
+        // session-scoped callback can be registered after scripting::spawn.
+        let session_status = pin_session::initialize();
+        log::line(&format!("Pin session initialize -> {session_status}"));
+        if session_status != PB_OK {
+            return 18;
+        }
+        if let Err(failure) = pin_session::register_callbacks(false) {
+            log::line(&format!(
+                "initial Pin session registration failed at {} -> {}",
+                failure.component, failure.status
+            ));
+            return 19;
+        }
+        if std::env::var("PINBRIDGE_ENTRY_BP").ok().as_deref() == Some("1") {
+            // The main image is not in the image list at tool-init time, so
+            // plant the one-shot entry breakpoint from the image-load
+            // callback instead (still before the first instruction runs).
+            let mut img_handle = PbCallbackHandle { opaque: 0 };
+            if pb_img_add_instrument_function(
+                Some(on_img_load),
+                core::ptr::null_mut(),
+                &mut img_handle,
+            ) != PB_OK
+            {
+                log::line("entry bp: img callback registration failed");
+            }
+        }
+
         let (trace_start, trace_end) = engines::trace_range();
         let (hook_start, hook_end) = engines::hook_range();
         log::line(&format!(
@@ -148,55 +180,6 @@ fn agent_main(argc: c_int, argv: *mut *mut c_char) -> c_int {
             return 8;
         }
 
-        let mut instrument_handle = PbCallbackHandle { opaque: 0 };
-        if pb_ins_add_instrument_function(
-            Some(engines::on_ins),
-            core::ptr::null_mut(),
-            &mut instrument_handle,
-        ) != PB_OK
-        {
-            log::line("pb_ins_add_instrument_function failed");
-            return 2;
-        }
-        let mut fini_handle = PbCallbackHandle { opaque: 0 };
-        pb_pin_add_fini_function(Some(on_fini), core::ptr::null_mut(), &mut fini_handle);
-        let instrumentation_lifecycle_status = instrumentation_lifecycle::register();
-        let syscall_status = syscall_engine::register();
-        let exception_status = exception::register();
-        let modules_status = modules::register();
-        let lifecycle_status = lifecycle::register();
-        let (oom_status, detach_status) = high_priority::register();
-        let child_status = child_process::init_and_register();
-        let debugger_status = debugger::register();
-        log::line(&format!(
-            "engines: instrumentation.lifecycle -> {instrumentation_lifecycle_status}, syscall -> {syscall_status}, exception -> {exception_status}, modules -> {modules_status}, lifecycle -> {lifecycle_status}, oom -> {oom_status}, detach -> {detach_status}, child.follow -> {child_status}, debugger.events -> {debugger_status}"
-        ));
-        if instrumentation_lifecycle_status != PB_OK {
-            return 17;
-        }
-        if lifecycle_status != PB_OK {
-            return 10;
-        }
-        if child_status != PB_OK {
-            return 13;
-        }
-        if debugger_status != PB_OK {
-            return 16;
-        }
-        if std::env::var("PINBRIDGE_ENTRY_BP").ok().as_deref() == Some("1") {
-            // The main image is not in the image list at tool-init time, so
-            // plant the one-shot entry breakpoint from the image-load
-            // callback instead (still before the first instruction runs).
-            let mut img_handle = PbCallbackHandle { opaque: 0 };
-            if pb_img_add_instrument_function(
-                Some(on_img_load),
-                core::ptr::null_mut(),
-                &mut img_handle,
-            ) != PB_OK
-            {
-                log::line("entry bp: img callback registration failed");
-            }
-        }
         log::line("start program");
 
         pb_pin_start_program_default()

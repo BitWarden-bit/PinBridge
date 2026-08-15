@@ -28,7 +28,7 @@ extern "C" {
 #endif
 
 #define PB_ABI_VERSION_MAJOR 1u
-#define PB_ABI_VERSION_MINOR 9u
+#define PB_ABI_VERSION_MINOR 10u
 #define PB_ABI_VERSION ((PB_ABI_VERSION_MAJOR << 16u) | PB_ABI_VERSION_MINOR)
 
 typedef int32_t PbStatus;
@@ -1588,8 +1588,10 @@ PB_API PbStatus PB_CALL pb_pin_add_detach_function_probed(
     PbCallbackHandle* out_callback);
 PB_API PbStatus PB_CALL pb_pin_detach(void);
 PB_API PbStatus PB_CALL pb_pin_detach_probed(void);
-/* Asynchronous reattach requests. PB_OK reports bridge execution; out_status
-   reports whether Pin accepted the request or detach is still completing. */
+/* ABI v1.10 asynchronous reattach requests. PB_OK reports bridge execution; out_status
+   reports whether Pin accepted the request or detach is still completing.
+   Intel Pin 3.31 does not implement JIT reattach on Windows, so pb_pin_attach
+   returns PB_ERR_UNSUPPORTED there instead of allowing Pin to kill the app. */
 PB_API PbStatus PB_CALL pb_pin_attach(
     PbAttachCallback callback, void* user_data, PbAttachStatus* out_status);
 PB_API PbStatus PB_CALL pb_pin_attach_probed(

@@ -186,6 +186,20 @@ fn ensure_registered() -> PbStatus {
     status
 }
 
+/// Reconnects an active byte provider in a new Pin attach session. Attach
+/// callbacks already execute under Pin's client/vm locks, so this path must
+/// not try to acquire the client lock again.
+pub fn reregister_after_attach() -> PbStatus {
+    let snapshot = POLICY.load(Ordering::Acquire);
+    let active = !snapshot.is_null() && !unsafe { &*snapshot }.segments.is_empty();
+    REGISTERED.store(active, Ordering::Release);
+    if active {
+        unsafe { pb_pin_add_fetch_function(Some(on_fetch), core::ptr::null_mut()) }
+    } else {
+        PB_OK
+    }
+}
+
 fn ranges(policy: &NativePolicy) -> Vec<(u64, u64)> {
     policy
         .segments

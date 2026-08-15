@@ -3,8 +3,8 @@
 use core::ffi::{c_char, c_void};
 
 pub const PB_ABI_VERSION_MAJOR: u32 = 1;
-pub const PB_ABI_VERSION_MINOR: u32 = 9;
-pub const PB_ABI_VERSION: u32 = 65545;
+pub const PB_ABI_VERSION_MINOR: u32 = 10;
+pub const PB_ABI_VERSION: u32 = 65546;
 pub const PB_TRI_YES: PbTri = 0;
 pub const PB_TRI_NO: PbTri = 1;
 pub const PB_TRI_MAYBE: PbTri = 2;

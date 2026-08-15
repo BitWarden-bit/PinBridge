@@ -10,6 +10,14 @@ pub fn initialize() -> PbStatus {
     super::xed_decode::initialize()
 }
 
+pub fn reregister_after_attach() -> PbStatus {
+    let status = super::memory_translation::reregister_after_attach();
+    if status != PB_OK {
+        return status;
+    }
+    super::xed_decode::reregister_after_attach()
+}
+
 pub fn refresh_best_effort(reason: &str) {
     if let Err(status) = super::instrumentation::publish() {
         if status != PB_OK {

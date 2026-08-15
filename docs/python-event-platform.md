@@ -184,10 +184,17 @@ JIT 和 Probe 的分离完成回调在 C ABI v1.6 中严格分开：
 `pb_pin_add_detach_function` 对应 JIT，`pb_pin_add_detach_function_probed` 对应 Probe；
 C 后端和 agent 都按当前模式选择，避免把 Probe 回调注册到 JIT 启动路径。
 
-`pin.attach` 的公开事件结构已经固定，但完整的“Python 发起分离后持续驻留、重新附加、
-重建内部线程和回调”尚未完成，不能把第二次 application-start 的检测代码等同于已经
-交付了整套重新附加控制链。`memory.oom` 也只能用契约测试覆盖注册和字段结构，真实耗尽
-目标内存不是常规回归测试的安全做法。
+平台现在提供 `pb.pin_state/pin_attach_supported/pin_detach/pin_attach`。初始会话和重新附加
+共用同一份注册清单；支持重新附加的平台会重新注册指令、函数/Trace/基本块、异常、系统
+调用、模块、线程、调试器、子进程、内存转换、取码、XED 和已启用的 SMC 回调，同时保留
+Python 插件和不可变策略快照。第二次 application-start 后才产生 `pin.attach`。
+
+这里有不能隐藏的 Intel Pin 运行时限制：Pin 3.31 在 Windows JIT 模式调用 `PIN_Attach`
+会直接终止目标并报告 “Re-Attach ... is NYI”。C 桥接因此在进入 Pin 前返回
+`PB_ERR_UNSUPPORTED`，Python 可先用 `pb.pin_attach_supported()` 查询。真实 Windows 回归
+已验证安全拒绝且目标正常退出；完整往返只能在支持 JIT reattach 的平台或适用的 Probe
+工具中验证，目前不虚报为已通过。`memory.oom` 也只能用契约测试覆盖注册和字段结构，真实
+耗尽目标内存不是常规回归测试的安全做法。
 
 ## 已完成：有返回值的同步决策通道
 
@@ -492,7 +499,7 @@ pb.instrumentation_set(
 | 内存不足 | `pb.on("memory.oom", ...)` | 原生接入和契约测试完成，无法安全强制触发 |
 | Pin 内部异常 | `pb.on("pin.internal_exception", ...)` | 原生崩溃记录后投递高优先级快照；仅在进程存活时可到达 Python |
 | Pin 分离完成 | `pb.on("pin.detach", ...)` | JIT/Probe 原生接入完成；分离后的即时 Python 调度不承诺 |
-| Pin 重新附加 | `pb.on("pin.attach", ...)` | 事件结构已完成，重新附加控制链待开发 |
+| Pin 重新附加 | `pb.pin_attach_supported/pin_detach/pin_attach` + `pb.on("pin.attach", ...)` | ABI 和统一回调重建链已完成；Windows JIT 由 Pin 3.31 明确不支持并已验证安全拒绝，支持平台的完整往返待验证 |
 | 子进程跟随决策 | `pb.intercept("child.follow", ...)` | 已完成，跟随/不跟随真实 Pin 测试通过；子进程独立控制端口待开发 |
 | Hook 同步决定 | `pb.intercept("hook.entry/return", ..., address=...)` | 已完成，入口跳过/返回值改写真实 Pin 测试通过 |
 | 系统调用同步决定 | `pb.intercept("syscall.entry/exit", ..., numbers=...)` | 已完成，入口参数/出口返回值真实 Pin 测试通过 |

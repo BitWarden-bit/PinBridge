@@ -58,6 +58,14 @@ pub fn initialize_native_policies() -> PbStatus {
     native_policies::initialize()
 }
 
+pub fn reregister_after_attach() -> PbStatus {
+    let status = native_policies::reregister_after_attach();
+    if status != PB_OK {
+        return status;
+    }
+    code_fetch::reregister_after_attach()
+}
+
 pub unsafe fn instrument_memory_translation(ins: PbInsHandle, address: u64) {
     memory_translation::instrument(ins, address);
 }

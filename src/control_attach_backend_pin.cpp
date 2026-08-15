@@ -56,8 +56,18 @@ PbStatus PbBackendAttach(
 {
     if (PIN_IsProbeMode())
         return PB_ERR_INVALID_STATE;
+#if defined(TARGET_WINDOWS)
+    // Pin 3.31 exports PIN_Attach on Windows but terminates the target with
+    // "Re-Attach ... is NYI" when it is called in JIT mode. Reject at the
+    // bridge boundary so a capability mistake cannot kill the application.
+    (void)callback;
+    (void)user_data;
+    (void)out_status;
+    return PB_ERR_UNSUPPORTED;
+#else
     return RequestAttach(callback, user_data, out_status,
         [](void* state) { return PIN_Attach(OnAttach, state); });
+#endif
 }
 
 PbStatus PbBackendAttachProbed(
