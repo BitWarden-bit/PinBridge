@@ -318,7 +318,29 @@ unsafe extern "C" fn on_hook_context(
             ..Event::EMPTY
         });
     }
-    if crate::hooks::apply_rules(address, thread_id, context, [rcx, rdx, r8, r9]) > 0 {
+    let mut changed =
+        crate::hooks::apply_rules(address, thread_id, context, [rcx, rdx, r8, r9]) > 0;
+    if let Some(response) = crate::sync_intercept::decide_hook(
+        address,
+        thread_id,
+        is_return,
+        context,
+        stack_args,
+    ) {
+        changed |= crate::sync_intercept::apply_hook_response(context, &response, is_return);
+        if response.action == crate::sync_intercept::HOOK_ACTION_RETURN
+            && !is_return
+            && crate::sync_intercept::return_from_hook(context)
+        {
+            let _ = pb_pin_execute_at(context as PbConstContextHandle);
+            return;
+        }
+        if crate::sync_intercept::response_changes_instruction_pointer(&response) && changed {
+            let _ = pb_pin_execute_at(context as PbConstContextHandle);
+            return;
+        }
+    }
+    if changed {
         let _ = crate::hooks::execute_modified_context(thread_id, address, context);
     }
 }

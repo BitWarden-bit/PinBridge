@@ -217,6 +217,32 @@ Pin 的跟随子进程回调不调用 Python。原生层在 `CHILD_PROCESS` 句�
 子进程会继承父进程固定的 `PINBRIDGE_AGENT_PORT`，因此子 agent 无法绑定同一端口，会继续
 插桩但没有自己的 Python/查询控制面；每个子进程的独立端口和命令行改写仍是后续工作。
 
+### Hook 同步拦截
+
+Hook 的异步观察继续使用 `pb.on("hook.entry", ...)` / `pb.on("hook.return", ...)`；需要
+在原指令执行前取得 Python 返回值时使用：
+
+```python
+pb.intercept("hook.entry", on_entry, address=entry_address, once=False)
+pb.intercept("hook.return", on_return, address=return_instruction)
+```
+
+同步 Hook 使用独立的 16 槽固定 rendezvous，不占用 64 个断点槽。Hook 分析回调复制通用
+寄存器和前四个 ABI 栈参数，脚本线程执行回调，原生层最后一次性应用返回补丁。返回值为
+`None` 或字典；字典可包含 `registers={...}`、`arguments=[...]`、`return_value=...`。
+`hook.entry` 还接受 `action="return"`：原生层从栈顶取得返回地址、弹出返回地址并跳回
+调用者，因此可以跳过原函数；`hook.return` 的 `return_value` 在 `ret` 执行前修改返回
+寄存器。
+
+同一地址可以有多个插件处理函数。补丁字段相同且值一致时合并；同一字段出现不同值、
+回调异常或非法返回结构时，本次拦截不应用任何 Python 补丁并继续原上下文。处理期间
+目标线程在 Pin 回调中限时等待，所以回调只能计算、使用 `pb.print` 并返回补丁，普通
+目标 RPC 快速失败。插件卸载、替换、`once` 完成或 `pb.unintercept` 会释放该插件的
+所有权；若注册前 Hook 点不存在，并且全部脚本订阅都已释放，则延迟移除该原生点。
+
+真实 Pin 测试同时覆盖入口直接返回（证明原函数未执行）和返回指令改写返回值；Fini
+日志使用 `sync_decisions`、`sync_timeouts`、`sync_busy` 证明原生采用了两次 Python 决定。
+
 ### 当前交付状态
 
 | 功能 | Python 入口 | 当前状态 |
@@ -228,5 +254,6 @@ Pin 的跟随子进程回调不调用 Python。原生层在 `CHILD_PROCESS` 句�
 | Pin 分离完成 | `pb.on("pin.detach", ...)` | JIT/Probe 原生接入完成；分离后的即时 Python 调度不承诺 |
 | Pin 重新附加 | `pb.on("pin.attach", ...)` | 事件结构已完成，重新附加控制链待开发 |
 | 子进程跟随决策 | `pb.intercept("child.follow", ...)` | 已完成，跟随/不跟随真实 Pin 测试通过；子进程独立控制端口待开发 |
-| Hook/系统调用/异常同步决定 | 尚未发布 | 待开发；现有命名事件仅观察 |
+| Hook 同步决定 | `pb.intercept("hook.entry/return", ..., address=...)` | 已完成，入口跳过/返回值改写真实 Pin 测试通过 |
+| 系统调用/异常同步决定 | 尚未发布 | 待开发；现有命名事件仅观察 |
 | 地址转换/取码/插桩规则 | 尚未发布 | 待开发；必须采用 Python 配置、原生执行 |

@@ -330,3 +330,34 @@ Pin 回调只复制固定上限的 PID/命令行并等待 semaphore，不获取 
 `-Follow $true` 都必须通过。Fini 日志给出 `child_decisions`、`child_follow`、
 `child_reject`、`child_decision_timeouts`。目前跟随后的子 agent 继承父进程固定端口，端口
 冲突时仍继续插桩，但子进程没有独立 Python/查询控制面；此项仍待独立端口方案。
+
+### 同步 Hook
+
+```python
+def entry(event):
+    # event: type/id/generation/tid/address/registers/arguments
+    if event["registers"]["rcx"] == 5:
+        return {"action": "return", "return_value": 0x1234}
+    return None
+
+entry_id = pb.intercept("hook.entry", entry, address=api_address, once=True)
+
+def returned(event):
+    return {"return_value": 0x5678}
+
+return_id = pb.intercept("hook.return", returned, address=ret_address)
+```
+
+`address` 是必填的非零绝对地址，`thread_id` 可选。注册会自动复用或创建 4096 点原生
+Hook 集合中的对应点；订阅卸载时按所有权计数释放。返回字典支持：
+
+- `registers={"rax": value, ...}`：按当前 x86/x64 架构名修改通用寄存器；
+- `arguments=[a0, ... a3]`：只在 `hook.entry` 修改前四个 ABI 栈参数；Win64 的前四个
+  寄存器参数直接通过 `registers` 的 `rcx/rdx/r8/r9` 修改；
+- `return_value=value`：修改 `rax`/`eax`；
+- `action="continue"`（默认）或仅入口可用的 `action="return"`/`"skip"`。
+
+同步 Hook 不停止整个进程，也不占断点槽；命中的应用线程在 16 槽固定通道上限时等待
+脚本线程。槽满、超时、Python 不可用、返回结构错误或多插件补丁冲突时继续原上下文。
+决定回调里 `pb.print` 可用，普通 `pb.*` 目标 RPC 会快速失败。真实回归入口为
+`fixtures/hook_python_demo/run.ps1`，同时验证入口跳过和返回值修改。

@@ -24,6 +24,7 @@ mod query_server;
 mod record;
 mod resolve;
 mod ring;
+mod sync_intercept;
 #[cfg(feature = "scripting")]
 mod scripting;
 #[cfg(not(feature = "scripting"))]
@@ -105,6 +106,13 @@ fn agent_main(argc: c_int, argv: *mut *mut c_char) -> c_int {
         log::line(&format!("hook action engine init -> {hook_status}"));
         if hook_status != PB_OK {
             return 9;
+        }
+        let sync_intercept_status = sync_intercept::init();
+        log::line(&format!(
+            "synchronous interceptor init -> {sync_intercept_status}"
+        ));
+        if sync_intercept_status != PB_OK {
+            return 14;
         }
         if engines::meta_init() != PB_OK {
             log::line("meta init failed");
@@ -212,8 +220,9 @@ unsafe extern "C" fn on_fini(code: i32, _user_data: *mut c_void) {
     lifecycle::record_fini(code);
     let (exit_probes, exit_hits) = lifecycle::exit_probe_counts();
     let (child_decisions, child_follow, child_reject) = child_process::decision_counts();
+    let (sync_decisions, sync_timeouts, sync_busy) = sync_intercept::stats();
     crate::log::line(&format!(
-        "fini code={code} exit_probes={exit_probes} exit_hits={exit_hits} priority_total={} priority_dropped={} child_decisions={child_decisions} child_follow={child_follow} child_reject={child_reject} child_decision_timeouts={}",
+        "fini code={code} exit_probes={exit_probes} exit_hits={exit_hits} priority_total={} priority_dropped={} child_decisions={child_decisions} child_follow={child_follow} child_reject={child_reject} child_decision_timeouts={} sync_decisions={sync_decisions} sync_timeouts={sync_timeouts} sync_busy={sync_busy}",
         priority::total(),
         priority::dropped(),
         child_process::timeout_count(),

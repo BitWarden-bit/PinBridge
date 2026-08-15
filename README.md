@@ -115,6 +115,7 @@ python tests\stress_control.py     # 防卡死 200 循环(+ VMP 目标 30 循环
 python examples\python\replay\test_taint.py   # 重放单测 16/16
 fixtures\child_follow_demo\run.ps1 -Follow $false  # 子进程不跟随决定
 fixtures\child_follow_demo\run.ps1 -Follow $true   # 子进程跟随决定
+fixtures\hook_python_demo\run.ps1                  # Hook 入口跳过 + 返回值同步修改
 ```
 
 ## 项目结构

@@ -526,8 +526,18 @@ fn pb_event_names() -> Vec<&'static str> {
 
 /// Registers a return-valued synchronous interceptor. Unlike pb.on(), the
 /// native event waits for a bounded time and consumes the callback result.
-#[pyfunction(name = "intercept", signature = (event, callback, *, once=false))]
-fn pb_intercept(py: Python<'_>, event: &str, callback: Py<PyAny>, once: bool) -> PyResult<u64> {
+#[pyfunction(
+    name = "intercept",
+    signature = (event, callback, *, once=false, address=None, thread_id=None)
+)]
+fn pb_intercept(
+    py: Python<'_>,
+    event: &str,
+    callback: Py<PyAny>,
+    once: bool,
+    address: Option<u64>,
+    thread_id: Option<u32>,
+) -> PyResult<u64> {
     if current_plugin_name().is_none() {
         return Err(no_plugin());
     }
@@ -541,15 +551,58 @@ fn pb_intercept(py: Python<'_>, event: &str, callback: Py<PyAny>, once: bool) ->
             "unknown interceptor {event:?}; use pb.decision_names() to list supported names"
         ))
     })?;
-    let (id, subscription) = DecisionSubscription::new(selector, callback, once);
+    let created_hook = if selector.is_hook() {
+        let address = address.filter(|address| *address != 0).ok_or_else(|| {
+            PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "hook interceptor requires a non-zero address",
+            )
+        })?;
+        let existing = rpc(|client| client.hook_list()).ok_or_else(|| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                "hook interceptor could not query native Hook points",
+            )
+        })?;
+        Some((address, !existing.contains(&address)))
+    } else {
+        if address.is_some() || thread_id.is_some() {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "child.follow does not accept address or thread_id",
+            ));
+        }
+        None
+    };
+    let (id, subscription) =
+        DecisionSubscription::new(selector, callback, once, address, thread_id);
     with_current_plugin_mut(|plugin| plugin.decisions.insert(id, subscription))
         .ok_or_else(no_plugin)?;
+    super::host::publish_decision_interests();
+    if let Some((address, created_by_scripts)) = created_hook {
+        if !rpc(|client| client.hook_set(address)).unwrap_or(false) {
+            let _ = with_current_plugin_mut(|plugin| plugin.decisions.remove(&id));
+            super::host::publish_decision_interests();
+            return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                "hook interceptor could not arm the native Hook point",
+            ));
+        }
+        decisions::acquire_hook(address, created_by_scripts);
+    }
     Ok(id)
 }
 
 #[pyfunction(name = "unintercept")]
 fn pb_unintercept(id: u64) -> PyResult<bool> {
-    with_current_plugin_mut(|plugin| plugin.decisions.remove(&id).is_some()).ok_or_else(no_plugin)
+    let removed = with_current_plugin_mut(|plugin| plugin.decisions.remove(&id))
+        .ok_or_else(no_plugin)?;
+    let Some(subscription) = removed else {
+        return Ok(false);
+    };
+    if let Some(address) = subscription.address {
+        if decisions::release_hook(address) {
+            decisions::queue_hook_removal(address);
+        }
+    }
+    super::host::publish_decision_interests();
+    Ok(true)
 }
 
 #[pyfunction(name = "decision_names")]
