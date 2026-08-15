@@ -37,3 +37,6 @@ fixtures/lifecycle_demo/*.lib
 fixtures/smc_demo/*.exe
 fixtures/smc_demo/*.exp
 fixtures/smc_demo/*.lib
+fixtures/child_follow_demo/*.exe
+fixtures/child_follow_demo/*.exp
+fixtures/child_follow_demo/*.lib

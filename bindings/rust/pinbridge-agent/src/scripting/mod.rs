@@ -27,6 +27,7 @@ use std::sync::mpsc::Sender;
 use crate::{new_map, TlsFreeMap, TlsFreeSet};
 
 pub mod api;
+mod decisions;
 mod events;
 mod host;
 pub mod output;
@@ -121,6 +122,8 @@ pub struct Plugin {
     /// Named `pb.on(...)` subscriptions. Multiple handlers may observe the
     /// same event without creating more native Pin callbacks.
     pub events: TlsFreeMap<u64, events::EventSubscription>,
+    /// Return-valued synchronous interceptors (`pb.intercept`).
+    pub decisions: TlsFreeMap<u64, decisions::DecisionSubscription>,
     /// New-style callbacks bound to exact native breakpoint ids.  Legacy
     /// `on_bp_hit` remains separate and receives every stop notification.
     pub breakpoints: TlsFreeMap<u32, subscriptions::BreakpointSubscription>,

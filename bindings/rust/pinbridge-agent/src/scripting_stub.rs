@@ -9,6 +9,10 @@
 
 use pinbridge_sys::{PbStatus, PB_OK};
 
+pub fn python_ready() -> bool {
+    false
+}
+
 /// One SCRIPT_LIST row (shape-compatible with `scripting::PluginInfo`).
 #[derive(Clone)]
 pub struct PluginInfo {

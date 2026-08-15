@@ -184,6 +184,39 @@ C 后端和 agent 都按当前模式选择，避免把 Probe 回调注册到 JIT
 交付了整套重新附加控制链。`memory.oom` 也只能用契约测试覆盖注册和字段结构，真实耗尽
 目标内存不是常规回归测试的安全做法。
 
+## 已完成：有返回值的同步决策通道
+
+`pb.on` 只负责异步通知，返回值不会改变目标行为。必须由 Python 决定原生控制流的事件
+使用独立接口，避免把“看见事件”和“接管事件”混在一起：
+
+```python
+def follow_child(event):
+    return event["argv"][-1] == "instrument-me"
+
+decision_id = pb.intercept("child.follow", follow_child, once=False)
+pb.unintercept(decision_id)
+```
+
+`pb.decision_names()` 返回当前支持的同步决定名；第一项是 `child.follow`。事件字典包含
+`type="child.follow"`、`generation`、`process_id`/`pid`、按 UTF-8 宽松解码的 `argv`
+以及保留原始数据的 `argv_bytes`。处理函数必须返回 `bool` 或
+`{"follow": bool}`。
+
+Pin 的跟随子进程回调不调用 Python。原生层在 `CHILD_PROCESS` 句柄仍有效时，把 PID 和
+命令行复制到一个固定槽（最多 64 个参数、总计 8192 字节），然后使用 Pin semaphore
+最多等待 2000ms。脚本线程领取副本、调用 Python、发布决定；Pin 回调只读取最终布尔值。
+可在启动前用 `PINBRIDGE_SCRIPT_DECISION_TIMEOUT_MS=1..10000` 调整等待上限。
+
+失败策略固定为“不跟随”：Python 未就绪、已有决定正在处理、参数超限、没有处理函数、
+返回类型错误、处理函数异常或超时都返回 false。多个插件同时匹配时按插件名和注册顺序
+调用，只有全部明确返回 true 才跟随。处理同步决定期间，`pb.print` 可用；会访问目标或
+查询服务的 `pb.*` RPC 会快速失败，因为 Pin 回调正在等待决定，此时反向 RPC 可能死锁。
+
+真实 Pin 回归已经覆盖返回 false 和返回 true 两条路径，并在 Fini 日志校验
+`child_decisions`、`child_follow`、`child_reject` 和 `child_decision_timeouts`。当前被跟随的
+子进程会继承父进程固定的 `PINBRIDGE_AGENT_PORT`，因此子 agent 无法绑定同一端口，会继续
+插桩但没有自己的 Python/查询控制面；每个子进程的独立端口和命令行改写仍是后续工作。
+
 ### 当前交付状态
 
 | 功能 | Python 入口 | 当前状态 |
@@ -194,6 +227,6 @@ C 后端和 agent 都按当前模式选择，避免把 Probe 回调注册到 JIT
 | 内存不足 | `pb.on("memory.oom", ...)` | 原生接入和契约测试完成，无法安全强制触发 |
 | Pin 分离完成 | `pb.on("pin.detach", ...)` | JIT/Probe 原生接入完成；分离后的即时 Python 调度不承诺 |
 | Pin 重新附加 | `pb.on("pin.attach", ...)` | 事件结构已完成，重新附加控制链待开发 |
-| 子进程跟随决策 | 尚未发布 | 待开发 |
+| 子进程跟随决策 | `pb.intercept("child.follow", ...)` | 已完成，跟随/不跟随真实 Pin 测试通过；子进程独立控制端口待开发 |
 | Hook/系统调用/异常同步决定 | 尚未发布 | 待开发；现有命名事件仅观察 |
 | 地址转换/取码/插桩规则 | 尚未发布 | 待开发；必须采用 Python 配置、原生执行 |

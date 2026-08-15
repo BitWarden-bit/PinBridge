@@ -6,6 +6,7 @@
 
 mod arch;
 mod bp;
+mod child_process;
 mod context;
 mod control;
 mod diag;
@@ -149,11 +150,15 @@ fn agent_main(argc: c_int, argv: *mut *mut c_char) -> c_int {
         let modules_status = modules::register();
         let lifecycle_status = lifecycle::register();
         let (oom_status, detach_status) = high_priority::register();
+        let child_status = child_process::init_and_register();
         log::line(&format!(
-            "engines: syscall -> {syscall_status}, exception -> {exception_status}, modules -> {modules_status}, lifecycle -> {lifecycle_status}, oom -> {oom_status}, detach -> {detach_status}"
+            "engines: syscall -> {syscall_status}, exception -> {exception_status}, modules -> {modules_status}, lifecycle -> {lifecycle_status}, oom -> {oom_status}, detach -> {detach_status}, child.follow -> {child_status}"
         ));
         if lifecycle_status != PB_OK {
             return 10;
+        }
+        if child_status != PB_OK {
+            return 13;
         }
         if std::env::var("PINBRIDGE_ENTRY_BP").ok().as_deref() == Some("1") {
             // The main image is not in the image list at tool-init time, so
@@ -206,10 +211,12 @@ pinbridge_tool::tool_entry!(agent_main);
 unsafe extern "C" fn on_fini(code: i32, _user_data: *mut c_void) {
     lifecycle::record_fini(code);
     let (exit_probes, exit_hits) = lifecycle::exit_probe_counts();
+    let (child_decisions, child_follow, child_reject) = child_process::decision_counts();
     crate::log::line(&format!(
-        "fini code={code} exit_probes={exit_probes} exit_hits={exit_hits} priority_total={} priority_dropped={}",
+        "fini code={code} exit_probes={exit_probes} exit_hits={exit_hits} priority_total={} priority_dropped={} child_decisions={child_decisions} child_follow={child_follow} child_reject={child_reject} child_decision_timeouts={}",
         priority::total(),
         priority::dropped(),
+        child_process::timeout_count(),
     ));
     let (trace_start, trace_end) = engines::trace_range();
     let (hook_start, hook_end) = engines::hook_range();

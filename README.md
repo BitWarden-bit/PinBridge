@@ -37,8 +37,8 @@ Windows x64 动态二进制分析平台,基于 Intel Pin 3.31:冻结的 **C ABI*
   context_change / module_load/unload;运行时引擎开关、地址范围过滤、
   syscall 号码位图过滤、4096 点运行时 hook(不吃断点槽,"hook 全部 ntdll 导出")
 - **Python 插件**(核心):任意时刻热加载/卸载/同名替换(目标停在断点上也行);
-  `pb_init` 注册 + 固定回调(on_exception / on_syscall / on_bp_hit / on_module_load /
-  on_event_batch …)事件驱动;完整动作 API;`pb.print` 输出直达 CLI/TUI
+  `pb.on` 统一异步事件、`pb.breakpoint` 精确停点处理、`pb.intercept` 同步原生决定
+  （已支持子进程跟随）;完整动作 API;`pb.print` 输出直达 CLI/TUI
 - **录制与离线重放**:`trace start/stop` 录窗口(档2:指令字节 + 内存读写值),
   `.pbtr` 落盘;`examples/python/replay/` 纯 Python 重放库:capstone 解码、
   字节级影子内存、**前向污点 + 反向切片**(具体 EA 消别名)
@@ -113,6 +113,8 @@ python tests\control_e2e.py        # 控制面真机 e2e
 python tests\script_e2e.py         # 多插件脚本真机 e2e(12 步)
 python tests\stress_control.py     # 防卡死 200 循环(+ VMP 目标 30 循环)
 python examples\python\replay\test_taint.py   # 重放单测 16/16
+fixtures\child_follow_demo\run.ps1 -Follow $false  # 子进程不跟随决定
+fixtures\child_follow_demo\run.ps1 -Follow $true   # 子进程跟随决定
 ```
 
 ## 项目结构

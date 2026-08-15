@@ -10,6 +10,7 @@
 //! handled explicitly (panic="abort" would turn any panic into a process
 //! abort inside the target).
 
+use super::decisions::{self, DecisionSelector, DecisionSubscription, PUBLIC_DECISION_NAMES};
 use super::events::{EventSelector, EventSubscription, PUBLIC_EVENT_NAMES};
 use super::host::{connect, mark_native_dirty, BATCH_MAX};
 use super::output;
@@ -34,7 +35,7 @@ fn rpc<R>(f: impl FnOnce(&mut Client) -> std::io::Result<R>) -> Option<R> {
     // instead of riding the full client timeout (the script run/off
     // wedge); event-driven plugins see the same None a failed RPC returns
     // today and re-fire on the next event.
-    if super::send_waiting() {
+    if super::send_waiting() || decisions::python_decision_active() {
         return None;
     }
     let port = RPC_PORT.load(Ordering::Acquire);
@@ -523,6 +524,39 @@ fn pb_event_names() -> Vec<&'static str> {
     PUBLIC_EVENT_NAMES.to_vec()
 }
 
+/// Registers a return-valued synchronous interceptor. Unlike pb.on(), the
+/// native event waits for a bounded time and consumes the callback result.
+#[pyfunction(name = "intercept", signature = (event, callback, *, once=false))]
+fn pb_intercept(py: Python<'_>, event: &str, callback: Py<PyAny>, once: bool) -> PyResult<u64> {
+    if current_plugin_name().is_none() {
+        return Err(no_plugin());
+    }
+    if !callback.bind(py).is_callable() {
+        return Err(PyErr::new::<pyo3::exceptions::PyTypeError, _>(
+            "interceptor callback must be callable",
+        ));
+    }
+    let selector = DecisionSelector::parse(event).ok_or_else(|| {
+        PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+            "unknown interceptor {event:?}; use pb.decision_names() to list supported names"
+        ))
+    })?;
+    let (id, subscription) = DecisionSubscription::new(selector, callback, once);
+    with_current_plugin_mut(|plugin| plugin.decisions.insert(id, subscription))
+        .ok_or_else(no_plugin)?;
+    Ok(id)
+}
+
+#[pyfunction(name = "unintercept")]
+fn pb_unintercept(id: u64) -> PyResult<bool> {
+    with_current_plugin_mut(|plugin| plugin.decisions.remove(&id).is_some()).ok_or_else(no_plugin)
+}
+
+#[pyfunction(name = "decision_names")]
+fn pb_decision_names() -> Vec<&'static str> {
+    PUBLIC_DECISION_NAMES.to_vec()
+}
+
 /// Restrict on_exception to the given codes (None = all).
 #[pyfunction(name = "on_exception", signature = (codes=None))]
 fn pb_on_exception(codes: Option<Vec<u64>>) -> PyResult<()> {
@@ -667,6 +701,9 @@ fn pb(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(pb_on_event, m)?)?;
     m.add_function(wrap_pyfunction!(pb_off_event, m)?)?;
     m.add_function(wrap_pyfunction!(pb_event_names, m)?)?;
+    m.add_function(wrap_pyfunction!(pb_intercept, m)?)?;
+    m.add_function(wrap_pyfunction!(pb_unintercept, m)?)?;
+    m.add_function(wrap_pyfunction!(pb_decision_names, m)?)?;
     m.add_function(wrap_pyfunction!(pb_on_exception, m)?)?;
     m.add_function(wrap_pyfunction!(pb_on_syscall, m)?)?;
     m.add_function(wrap_pyfunction!(pb_on_bp, m)?)?;

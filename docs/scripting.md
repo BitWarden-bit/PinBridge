@@ -297,3 +297,36 @@ Python 处理函数统一在脚本内部线程按“插件名、注册顺序”�
 上述生命周期、SMC、Pin 分离/附加和内存不足事件使用独立 4096 槽高优先级环，先于
 普通遥测派发。生产回调只执行固定记录和 try-lock，不调用 Python、不做阻塞等待。
 `pinbridge-agent.log` 的 Fini 行提供 `priority_total` 和 `priority_dropped`。
+
+## 同步决定：子进程跟随
+
+普通 `pb.on` 回调只观察事件。原生行为必须等待 Python 返回值时，使用单独的同步决定
+注册表：
+
+```python
+import pb
+
+def decide_child(event):
+    pb.print("child pid=%d argv=%r" % (event["pid"], event["argv"]))
+    return {"follow": "--analyze-child" in event["argv"]}
+
+def pb_init():
+    decision_id = pb.intercept("child.follow", decide_child, once=False)
+```
+
+- `pb.intercept(name, callback, once=False) -> decision_id`：注册当前插件拥有的同步处理函数；
+- `pb.unintercept(decision_id) -> bool`：删除当前插件的同步处理函数；
+- `pb.decision_names() -> list[str]`：当前返回 `["child.follow"]`；
+- 回调返回 `bool` 或 `{"follow": bool}`；多处理函数采用“全部同意才跟随”；
+- 事件字段为 `type`、`generation`、`process_id`/`pid`、`argv` 和 `argv_bytes`；
+- 默认等待上限为 2000ms，可用 `PINBRIDGE_SCRIPT_DECISION_TIMEOUT_MS=1..10000` 调整；
+- 无处理函数、Python 未就绪/忙碌、捕获失败、异常、非法返回值和超时都不跟随。
+
+Pin 回调只复制固定上限的 PID/命令行并等待 semaphore，不获取 GIL；Python 始终在专用
+脚本线程执行。决定处理期间可以使用 `pb.print`，但不能调用需要查询服务或目标停止状态的
+`pb.*` 动作，这些调用会快速返回失败以避免同步回调与查询服务互相等待。
+
+真实回归入口是 `fixtures/child_follow_demo/run.ps1`，`-Follow $false` 和
+`-Follow $true` 都必须通过。Fini 日志给出 `child_decisions`、`child_follow`、
+`child_reject`、`child_decision_timeouts`。目前跟随后的子 agent 继承父进程固定端口，端口
+冲突时仍继续插桩，但子进程没有独立 Python/查询控制面；此项仍待独立端口方案。

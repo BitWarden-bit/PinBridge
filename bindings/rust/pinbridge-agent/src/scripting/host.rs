@@ -9,6 +9,7 @@
 //!      server answered the load;
 //!   3. the tick's client connection is closed before Python runs.
 
+use super::decisions::{DecisionSelector, PythonDecisionGuard};
 use super::events::{self, EventSelector};
 use super::output;
 use super::subscriptions::{self, merge_action, StopAction};
@@ -22,7 +23,7 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use pinbridge_client::client::Client;
 use pinbridge_sys::pb_pin_sleep;
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList, PyModule};
+use pyo3::types::{PyBytes, PyDict, PyList, PyModule};
 
 /// Event kind ids (wire values, mirror of the agent's event.rs).
 const EVENT_HOOK_REGS: u32 = 1;
@@ -729,6 +730,7 @@ fn exec_one(name: &str, code: Py<PyAny>, port: u16) {
             on_stop: None,
             on_unload: None,
             events: crate::new_map(),
+            decisions: crate::new_map(),
             breakpoints: crate::new_map(),
             filters: super::Filters::default(),
             cursor: 0,
@@ -876,6 +878,150 @@ fn event_record(event: &crate::event::Event) -> pinbridge_proto::EventRecord {
     }
 }
 
+struct ChildDecisionHandler {
+    plugin: String,
+    id: u64,
+    callback: Py<PyAny>,
+    once: bool,
+    order: u64,
+}
+
+fn parse_child_follow(value: &Bound<'_, PyAny>) -> Result<bool, String> {
+    if let Ok(follow) = value.extract::<bool>() {
+        return Ok(follow);
+    }
+    if let Ok(dict) = value.downcast::<PyDict>() {
+        let follow = dict
+            .get_item("follow")
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "child.follow result dictionary needs 'follow'".to_string())?;
+        return follow
+            .extract::<bool>()
+            .map_err(|_| "child.follow result 'follow' must be bool".to_string());
+    }
+    Err("child.follow callback must return bool or {'follow': bool}".to_string())
+}
+
+/// Runs before every loopback phase: the native follow-child callback may be
+/// waiting while holding Pin state that ordinary target RPCs need. Interceptor
+/// callbacks can log and compute, but api::rpc fails fast while the guard is
+/// active so a script cannot deadlock this rendezvous.
+fn dispatch_child_decision() {
+    let Some(request) = crate::child_process::take_pending() else {
+        return;
+    };
+    Python::with_gil(|py| {
+        let mut handlers = with_registry(|registry| {
+            let mut names: Vec<&String> = registry.keys().collect();
+            names.sort();
+            let mut handlers = Vec::new();
+            for name in names {
+                let Some(plugin) = registry.get(name) else {
+                    continue;
+                };
+                if plugin.state != STATE_RUNNING {
+                    continue;
+                }
+                for (id, subscription) in &plugin.decisions {
+                    if subscription.selector == DecisionSelector::ChildFollow {
+                        handlers.push(ChildDecisionHandler {
+                            plugin: name.clone(),
+                            id: *id,
+                            callback: subscription.callback.clone_ref(py),
+                            once: subscription.once,
+                            order: subscription.order,
+                        });
+                    }
+                }
+            }
+            handlers
+        });
+        handlers.sort_by(|left, right| {
+            left.plugin
+                .cmp(&right.plugin)
+                .then(left.order.cmp(&right.order))
+        });
+
+        let mut follow = !handlers.is_empty();
+        for handler in handlers {
+            let event = PyDict::new_bound(py);
+            let argv = PyList::empty_bound(py);
+            let argv_bytes = PyList::empty_bound(py);
+            let mut build_error = None;
+            for argument in &request.arguments {
+                if let Err(error) = argv.append(String::from_utf8_lossy(argument).as_ref()) {
+                    build_error = Some(error.to_string());
+                    break;
+                }
+                if let Err(error) = argv_bytes.append(PyBytes::new_bound(py, argument)) {
+                    build_error = Some(error.to_string());
+                    break;
+                }
+            }
+            if build_error.is_none() {
+                let result: PyResult<()> = (|| {
+                    event.set_item("type", "child.follow")?;
+                    event.set_item("generation", request.generation)?;
+                    event.set_item("process_id", request.process_id)?;
+                    event.set_item("pid", request.process_id)?;
+                    event.set_item("argv", argv)?;
+                    event.set_item("argv_bytes", argv_bytes)?;
+                    Ok(())
+                })();
+                if let Err(error) = result {
+                    build_error = Some(error.to_string());
+                }
+            }
+
+            let outcome = if let Some(error) = build_error {
+                Err(format!("event build failed: {error}"))
+            } else {
+                with_plugin_context(&handler.plugin, || {
+                    let _guard = PythonDecisionGuard::enter();
+                    handler
+                        .callback
+                        .call1(py, (event,))
+                        .map_err(|error| error.to_string())
+                        .and_then(|value| parse_child_follow(value.bind(py)))
+                })
+            };
+            match outcome {
+                Ok(decision) => {
+                    follow &= decision;
+                    with_registry_mut(|registry| {
+                        if let Some(plugin) = registry.get_mut(&handler.plugin) {
+                            plugin.delivered += 1;
+                            if handler.once {
+                                plugin.decisions.remove(&handler.id);
+                            }
+                        }
+                    });
+                }
+                Err(error) => {
+                    follow = false;
+                    with_registry_mut(|registry| {
+                        if let Some(plugin) = registry.get_mut(&handler.plugin) {
+                            plugin.state = STATE_ERROR;
+                            if handler.once {
+                                plugin.decisions.remove(&handler.id);
+                            }
+                        }
+                    });
+                    output::push(
+                        &handler.plugin,
+                        &format!("pb.intercept(child.follow) failed: {error}"),
+                    );
+                    crate::log::line(&format!(
+                        "plugin {} child.follow failed: {error}",
+                        handler.plugin
+                    ));
+                }
+            }
+        }
+        crate::child_process::complete(request.generation, follow);
+    });
+}
+
 fn tick(pending: &mut Vec<(String, Py<PyAny>)>, port: u16) {
     if send_waiting() {
         // A script op is parked in send_command on the query server; any
@@ -888,6 +1034,9 @@ fn tick(pending: &mut Vec<(String, Py<PyAny>)>, port: u16) {
     }
     if !python_ready() {
         return;
+    }
+    if crate::child_process::pending() {
+        dispatch_child_decision();
     }
     // adapt the pull size to last tick's measured Python cost (routed count)
     adapt_page_limit();
