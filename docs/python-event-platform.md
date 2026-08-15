@@ -118,6 +118,7 @@ Python 处理函数不能通过返回值绕过其他插件。旧脚本直接调�
 - `scripting/subscriptions.rs`：订阅数据、断点所有权和动作类型；
 - `scripting/api.rs`：Python 参数校验和注册入口；
 - `scripting/host.rs`：解释器生命周期、异步事件循环和断点停止快照；
+- `scripting/instrumentation.rs`：合并各插件拥有的高频采集规则并发布原生快照；
 - `scripting/interceptors/`：同步决定总调度，以及相互独立的
   `child`、`hook`、`syscall`、`exception` 处理与补丁合并；
 - `context.rs` / 查询协议：提供一次性寄存器快照；
@@ -295,6 +296,39 @@ Pin 上下文切换回调不获取 GIL：它复制固定大小的源/目标寄�
 `call`。真实 x64 Pin 测试触发访问违规，Python 同时改写 `rip/rsp`，跳到恢复入口并绕过
 原生 SEH 处理器；目标最终正常退出，日志证明 1 次同步决定、0 超时、0 槽位拥塞。
 
+## 已完成：Python 配置高频插桩、原生执行
+
+指令、内存和分支事件不能逐条同步进入 Python。脚本只声明要采集什么，原生层把声明编译
+为不可变规则：
+
+```python
+generation = pb.instrumentation_set(
+    kinds=["instruction", "memory", "branch.edge"],
+    ranges=[(module_start, module_end), (jit_start, jit_end)],
+    threads=[worker_tid],       # 省略或 [] 表示全部线程
+)
+
+current = pb.instrumentation_policy()
+pb.instrumentation_clear()
+```
+
+规则属于当前插件；再次 `instrumentation_set` 是原子替换，不是追加。多个插件的规则在
+原生层按逻辑“或”合并，但每个插件自己的 `种类 + 地址范围 + 线程` 仍保持同一组“且”关系，
+不会错误地把 A 插件的线程和 B 插件的地址拼成放大的笛卡尔积。插件卸载、初始化失败或
+回调异常进入 error 状态时，它的规则自动退出合并结果；清空最后一份 Python 规则后恢复
+启动环境变量决定的默认引擎策略。
+
+每个插件最多提交 64 个原始范围和 64 个线程号，所有运行插件合并后的范围上限同样是
+64。相邻或重叠范围会先合并。更新时脚本线程发布新的不可变快照并让相关 Pin 代码缓存
+失效；已经编译过的函数会重新进入插桩回调。插桩阶段按种类和范围决定是否插入分析调用，
+运行阶段再次按种类、范围和线程过滤，因此旧代码缓存中的分析调用在规则收窄后立即失效。
+Pin 热路径不获取 GIL、不调用 Python、不分配规则对象。
+
+`pb.on("instruction"/"memory"/"branch.edge", callback)` 决定 Python 如何消费已采集事件，
+`pb.instrumentation_set` 决定原生层采集哪些事件；两者职责分开。真实 Pin 回归先在引擎
+关闭时执行并缓存一个函数，再由 Python 只启用该函数范围，验证动态重新插桩成功且相邻
+排除函数没有泄漏事件。
+
 ### 当前交付状态
 
 | 功能 | Python 入口 | 当前状态 |
@@ -309,4 +343,6 @@ Pin 上下文切换回调不获取 GIL：它复制固定大小的源/目标寄�
 | Hook 同步决定 | `pb.intercept("hook.entry/return", ..., address=...)` | 已完成，入口跳过/返回值改写真实 Pin 测试通过 |
 | 系统调用同步决定 | `pb.intercept("syscall.entry/exit", ..., numbers=...)` | 已完成，入口参数/出口返回值真实 Pin 测试通过 |
 | 异常同步决定 | `pb.intercept("exception.handle", ..., codes=...)` | 已完成，异常现场读取/目标上下文改写真实 Pin 测试通过 |
-| 地址转换/取码/插桩规则 | 尚未发布 | 待开发；必须采用 Python 配置、原生执行 |
+| 指令/内存/分支插桩规则 | `pb.instrumentation_set/clear/policy` | 已完成，动态重新插桩和原生范围过滤真实 Pin 测试通过 |
+| 地址转换 | 尚未发布 | 待开发；必须采用 Python 配置、原生执行 |
+| 取机器码 | 尚未发布 | 待开发；必须采用 Python 预置数据、原生快速读取 |

@@ -1,8 +1,8 @@
 //! Instrumentation-time engine dispatch and the analysis capture callbacks.
 //!
-//! Two-level filtering keeps the hot path cheap:
-//!   1. instrumentation time — only in-range instructions get capture calls;
-//!   2. analysis time — one atomic flag check before recording an event.
+//! Two-level filtering keeps the hot path bounded:
+//!   1. instrumentation time — immutable kind/range rules decide which capture calls are inserted;
+//!   2. analysis time — the same snapshot applies exact kind/range/thread rules before submission.
 
 use crate::event::{
     Event, EVENT_BRANCH_EDGE, EVENT_EXEC, EVENT_HOOK_REGS, EVENT_HOOK_RETURN, EVENT_MEMORY,
@@ -10,7 +10,7 @@ use crate::event::{
 };
 use crate::ring::submit;
 use core::ffi::c_void;
-use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 use pinbridge_sys::*;
 
 static ENGINE_ACTIVE: AtomicBool = AtomicBool::new(true);
@@ -21,6 +21,206 @@ static HOOK_END: AtomicU64 = AtomicU64::new(0); // empty range: hook engine off
 static ENABLE_EXEC: AtomicBool = AtomicBool::new(true);
 static ENABLE_MEMORY: AtomicBool = AtomicBool::new(true);
 static ENABLE_BRANCH: AtomicBool = AtomicBool::new(true);
+static DEFAULT_INSTRUMENTATION_KINDS: AtomicU64 = AtomicU64::new(0);
+
+pub const INSTRUMENT_EXEC: u32 = 1 << EVENT_EXEC;
+pub const INSTRUMENT_MEMORY: u32 = 1 << EVENT_MEMORY;
+pub const INSTRUMENT_BRANCH: u32 = 1 << EVENT_BRANCH_EDGE;
+pub const INSTRUMENT_ALL: u32 = INSTRUMENT_EXEC | INSTRUMENT_MEMORY | INSTRUMENT_BRANCH;
+pub const MAX_INSTRUMENTATION_RANGES: usize = 64;
+pub const MAX_INSTRUMENTATION_THREADS: usize = 64;
+
+pub struct InstrumentationPolicyConfig {
+    pub kinds: u32,
+    pub ranges: Vec<(u64, u64)>,
+    pub threads: Vec<u32>,
+}
+
+struct InstrumentationRule {
+    kinds: u32,
+    start: u64,
+    end: u64,
+    threads: Vec<u32>,
+}
+
+impl InstrumentationRule {
+    #[inline]
+    fn matches_instrumentation(&self, address: u64, kind: u32) -> bool {
+        self.kinds & (1 << kind) != 0 && address >= self.start && address < self.end
+    }
+
+    #[inline]
+    fn matches_analysis(&self, address: u64, thread_id: u32, kind: u32) -> bool {
+        self.matches_instrumentation(address, kind)
+            && (self.threads.is_empty() || self.threads.binary_search(&thread_id).is_ok())
+    }
+}
+
+struct InstrumentationPolicy {
+    rules: Vec<InstrumentationRule>,
+}
+
+static INSTRUMENTATION_POLICY: AtomicPtr<InstrumentationPolicy> =
+    AtomicPtr::new(core::ptr::null_mut());
+static RETIRED_INSTRUMENTATION_POLICIES: std::sync::Mutex<Vec<usize>> =
+    std::sync::Mutex::new(Vec::new());
+static POLICY_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+fn default_kinds() -> u32 {
+    let mut kinds = 0;
+    if ENABLE_EXEC.load(Ordering::Relaxed) {
+        kinds |= INSTRUMENT_EXEC;
+    }
+    if ENABLE_MEMORY.load(Ordering::Relaxed) {
+        kinds |= INSTRUMENT_MEMORY;
+    }
+    if ENABLE_BRANCH.load(Ordering::Relaxed) {
+        kinds |= INSTRUMENT_BRANCH;
+    }
+    kinds
+}
+
+fn default_policy() -> InstrumentationPolicy {
+    let (start, end) = trace_range();
+    InstrumentationPolicy {
+        rules: vec![InstrumentationRule {
+            kinds: DEFAULT_INSTRUMENTATION_KINDS.load(Ordering::Relaxed) as u32,
+            start,
+            end,
+            threads: Vec::new(),
+        }],
+    }
+}
+
+fn publish_policy(policy: InstrumentationPolicy) -> u64 {
+    let replacement = Box::into_raw(Box::new(policy));
+    let old = INSTRUMENTATION_POLICY.swap(replacement, Ordering::AcqRel);
+    if !old.is_null() {
+        RETIRED_INSTRUMENTATION_POLICIES
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .push(old as usize);
+    }
+    POLICY_GENERATION.fetch_add(1, Ordering::AcqRel) + 1
+}
+
+fn policy() -> &'static InstrumentationPolicy {
+    let snapshot = INSTRUMENTATION_POLICY.load(Ordering::Acquire);
+    if snapshot.is_null() {
+        // configure_from_env publishes before Pin starts the application.
+        // This branch is only a defensive identity used by unit tests.
+        static EMPTY: InstrumentationPolicy = InstrumentationPolicy { rules: Vec::new() };
+        &EMPTY
+    } else {
+        unsafe { &*snapshot }
+    }
+}
+
+#[inline]
+fn wants_at_instrumentation(address: u64, kind: u32) -> bool {
+    policy()
+        .rules
+        .iter()
+        .any(|rule| rule.matches_instrumentation(address, kind))
+}
+
+#[inline]
+fn wants_at_analysis(address: u64, thread_id: u32, kind: u32) -> bool {
+    policy()
+        .rules
+        .iter()
+        .any(|rule| rule.matches_analysis(address, thread_id, kind))
+}
+
+#[cfg(test)]
+mod instrumentation_tests {
+    use super::*;
+
+    #[test]
+    fn native_rule_keeps_kind_range_and_thread_as_one_conjunction() {
+        let rule = InstrumentationRule {
+            kinds: INSTRUMENT_EXEC,
+            start: 0x1000,
+            end: 0x1100,
+            threads: vec![3, 7],
+        };
+        assert!(rule.matches_instrumentation(0x1000, EVENT_EXEC));
+        assert!(!rule.matches_instrumentation(0x1100, EVENT_EXEC));
+        assert!(!rule.matches_instrumentation(0x1000, EVENT_MEMORY));
+        assert!(rule.matches_analysis(0x1080, 7, EVENT_EXEC));
+        assert!(!rule.matches_analysis(0x1080, 6, EVENT_EXEC));
+    }
+}
+
+/// Replaces all Python-owned instrumentation policies with one immutable
+/// native snapshot. Each policy keeps its own kind/range/thread conjunction;
+/// multiple plugins are combined as a logical OR without widening filters
+/// into an accidental cross product.
+pub fn set_instrumentation_policies(
+    configs: &[InstrumentationPolicyConfig],
+) -> Result<u64, PbStatus> {
+    let mut rules = Vec::new();
+    let mut flush_ranges = Vec::new();
+    if configs.is_empty() {
+        let default = default_policy();
+        for rule in &default.rules {
+            flush_ranges.push((rule.start, rule.end));
+        }
+        let kinds = default.rules.iter().fold(0, |mask, rule| mask | rule.kinds);
+        ENABLE_EXEC.store(kinds & INSTRUMENT_EXEC != 0, Ordering::Release);
+        ENABLE_MEMORY.store(kinds & INSTRUMENT_MEMORY != 0, Ordering::Release);
+        ENABLE_BRANCH.store(kinds & INSTRUMENT_BRANCH != 0, Ordering::Release);
+        let generation = publish_policy(default);
+        for (start, end) in flush_ranges {
+            let status = unsafe { pb_pin_remove_instrumentation_in_range(start, end) };
+            if status != PB_OK {
+                return Err(status);
+            }
+        }
+        return Ok(generation);
+    }
+
+    for config in configs {
+        if config.kinds == 0 || config.kinds & !INSTRUMENT_ALL != 0 {
+            return Err(PB_ERR_INVALID_ARGUMENT);
+        }
+        if config.ranges.is_empty()
+            || config.ranges.len() > MAX_INSTRUMENTATION_RANGES
+            || config.threads.len() > MAX_INSTRUMENTATION_THREADS
+        {
+            return Err(PB_ERR_INVALID_ARGUMENT);
+        }
+        let mut threads = config.threads.clone();
+        threads.sort_unstable();
+        threads.dedup();
+        for &(start, end) in &config.ranges {
+            if start >= end || rules.len() >= MAX_INSTRUMENTATION_RANGES {
+                return Err(PB_ERR_INVALID_ARGUMENT);
+            }
+            rules.push(InstrumentationRule {
+                kinds: config.kinds,
+                start,
+                end,
+                threads: threads.clone(),
+            });
+            flush_ranges.push((start, end));
+        }
+    }
+    flush_ranges.sort_unstable();
+    flush_ranges.dedup();
+    let kinds = rules.iter().fold(0, |mask, rule| mask | rule.kinds);
+    ENABLE_EXEC.store(kinds & INSTRUMENT_EXEC != 0, Ordering::Release);
+    ENABLE_MEMORY.store(kinds & INSTRUMENT_MEMORY != 0, Ordering::Release);
+    ENABLE_BRANCH.store(kinds & INSTRUMENT_BRANCH != 0, Ordering::Release);
+    let generation = publish_policy(InstrumentationPolicy { rules });
+    for (start, end) in flush_ranges {
+        let status = unsafe { pb_pin_remove_instrumentation_in_range(start, end) };
+        if status != PB_OK {
+            return Err(status);
+        }
+    }
+    Ok(generation)
+}
 
 // Instruction metadata (kind + static size), recorded at instrumentation time
 // for the step-over machinery. Instrumentation time may allocate; guarded by
@@ -113,6 +313,8 @@ pub fn configure_from_env() {
         ENABLE_MEMORY.store(value.contains("memory"), Ordering::Relaxed);
         ENABLE_BRANCH.store(value.contains("branch"), Ordering::Relaxed);
     }
+    DEFAULT_INSTRUMENTATION_KINDS.store(default_kinds() as u64, Ordering::Relaxed);
+    publish_policy(default_policy());
 }
 
 pub fn trace_range() -> (u64, u64) {
@@ -190,8 +392,11 @@ pub unsafe extern "C" fn on_ins(ins: PbInsHandle, _user_data: *mut c_void) {
     let recording = crate::record::instrumentation_enabled()
         && in_range(address, rec_lo, rec_hi);
 
-    let (trace_start, trace_end) = trace_range();
-    if !in_range(address, trace_start, trace_end) {
+    if !policy()
+        .rules
+        .iter()
+        .any(|rule| address >= rule.start && address < rule.end)
+    {
         if recording {
             let branchy = query_bool(ins, pb_ins_is_call)
                 || query_bool(ins, pb_ins_is_ret)
@@ -216,13 +421,16 @@ pub unsafe extern "C" fn on_ins(ins: PbInsHandle, _user_data: *mut c_void) {
     };
     meta_record(address, kind, size.min(255) as u8);
 
-    if ENABLE_EXEC.load(Ordering::Relaxed) {
+    if ENABLE_EXEC.load(Ordering::Relaxed) && wants_at_instrumentation(address, EVENT_EXEC) {
         pb_ins_insert_exec(ins, Some(on_exec), core::ptr::null_mut());
     }
-    if ENABLE_MEMORY.load(Ordering::Relaxed) {
+    if ENABLE_MEMORY.load(Ordering::Relaxed) && wants_at_instrumentation(address, EVENT_MEMORY) {
         pb_ins_insert_memory_operands(ins, Some(on_memory), core::ptr::null_mut());
     }
-    if ENABLE_BRANCH.load(Ordering::Relaxed) && (is_branch || is_call || is_ret) {
+    if ENABLE_BRANCH.load(Ordering::Relaxed)
+        && wants_at_instrumentation(address, EVENT_BRANCH_EDGE)
+        && (is_branch || is_call || is_ret)
+    {
         pb_ins_insert_branch_edge(ins, Some(on_branch_edge), core::ptr::null_mut());
     }
     if recording {
@@ -353,7 +561,9 @@ unsafe extern "C" fn on_memory(
     access: u32,
     _user_data: *mut c_void,
 ) {
-    if !ENABLE_MEMORY.load(Ordering::Relaxed) {
+    if !ENABLE_MEMORY.load(Ordering::Relaxed)
+        || !wants_at_analysis(instruction_address, thread_id, EVENT_MEMORY)
+    {
         return;
     }
     submit(Event {
@@ -376,7 +586,7 @@ unsafe extern "C" fn on_exec(
     if crate::stepper::on_step_event(thread_id, address) {
         return;
     }
-    if !ENABLE_EXEC.load(Ordering::Relaxed) {
+    if !ENABLE_EXEC.load(Ordering::Relaxed) || !wants_at_analysis(address, thread_id, EVENT_EXEC) {
         return;
     }
     submit(Event {
@@ -395,7 +605,9 @@ unsafe extern "C" fn on_branch_edge(
     taken: u64,
     _user_data: *mut c_void,
 ) {
-    if !ENABLE_BRANCH.load(Ordering::Relaxed) {
+    if !ENABLE_BRANCH.load(Ordering::Relaxed)
+        || !wants_at_analysis(address, thread_id, EVENT_BRANCH_EDGE)
+    {
         return;
     }
     submit(Event {

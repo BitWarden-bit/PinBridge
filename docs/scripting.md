@@ -148,6 +148,17 @@ service-class 高位会在进入事件和过滤器前移除。entry/exit 通过�
 - `pb.modules() -> [(base, end, is_main, name), ...]`;`pb.threads() -> [tid, ...]`
 - `pb.counters() -> (total, dropped, capacity, [kind_counts])`(kind_counts 8 类）
 - `pb.exc_policy(enabled, code=0) -> bool`（异常暂停策略；停止窗口按设计不精确）
+- `pb.instrumentation_set(kinds=None, ranges=None, threads=None) -> generation`：替换当前插件
+  的高频采集规则。`kinds` 可取 `instruction`、`memory`、`branch.edge`；`ranges` 是半开区间
+  `(lo, hi)` 列表，省略时使用启动配置的 trace range；`threads` 省略或空列表表示全部线程。
+- `pb.instrumentation_policy() -> (kinds, ranges, threads) | None`：读取当前插件自己的规则。
+- `pb.instrumentation_clear() -> bool`：移除当前插件的规则，不影响其他插件。
+
+高频插桩 API 是同一 DLL 内的控制面更新，不发 loopback RPC。Python 只配置不可变规则；
+Pin 插桩回调和分析回调在原生层执行种类、范围和线程过滤。规则更新会使相关 Pin 代码
+缓存失效，因此已运行过的函数也能按新规则重新插桩。各插件规则保持独立的“且”关系后
+再按“或”合并；插件卸载或进入 error 状态时自动撤销其规则。每个插件最多 64 个范围、
+64 个线程号，所有运行插件合计最多 64 个合并前范围。
 
 轨迹录制（.pbtr，见 docs/taint-roadmap.md 第 2 层；与 64K 主环相互独立）:
 - `pb.trace_start(path, kinds=None, range=None) -> bool`;kinds 名映射到录制档：
@@ -217,8 +228,10 @@ VMP 系保护壳把自己的异常导向 SEH 处理；经典解法是掐 `KiUser
 ## 线程与性能须知（血泪）
 
 - Python 永不跑在 Pin 分析回调里；事件批量投递。脚本里每次 `pb.*` 是一次 loopback RPC
-  （微秒级）。每秒几万到十几万条带逻辑的事件 Python 接得住；**指令级洪流请先原生过滤**——
-  引擎开关（`engine KIND on|off`)、`PINBRIDGE_AGENT_RANGE`、watch 的 range、
+  （`instrumentation_set/clear/policy` 是同 DLL 内规则更新）。每秒几万到十几万条带逻辑的
+  事件 Python 接得住；**指令级洪流请先原生过滤**——优先用
+  `pb.instrumentation_set` 的种类/范围/线程规则，也可用引擎开关（`engine KIND on|off`)、
+  `PINBRIDGE_AGENT_RANGE`、watch 的 range、
   `syscallfilter only`（原生位图），别让洪流进 Python。
 - 插件游标每 tick 从 64K 事件环翻页 ≤2048 条；默认引擎全开时 exec 洪流 ~100 万条/秒，
   翻页只是追赶。宿主按上一 tick 的实际 Python 开销自适应缩页/降频（5→40ms)。
@@ -418,3 +431,8 @@ decision_id = pb.intercept(
 直接把 `rip/eip` 改到函数入口不等同于执行一次 `call`，栈布局仍由脚本负责。真实 x64
 回归 `fixtures/exception_python_demo/run.ps1` 触发访问违规，回调根据 `from_registers`
 构造 Win64 栈并改写 `rip/rsp`，目标跳到恢复入口、绕过原生 SEH 处理器并以 0 退出。
+
+高频规则的真实回归入口为 `fixtures/instrumentation_python_demo/run.ps1`。测试先在
+`PINBRIDGE_AGENT_ENGINES=none` 下执行并缓存目标函数，再热加载 Python 规则，只允许一个
+函数范围内的 `instruction` 事件；通过第二次调用证明 Pin 已动态重新插桩，并验证旁边的
+排除函数没有事件泄漏。

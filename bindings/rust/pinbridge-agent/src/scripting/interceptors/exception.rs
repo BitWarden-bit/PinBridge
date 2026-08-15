@@ -177,6 +177,7 @@ pub(super) fn dispatch(request: crate::sync_intercept::InterceptRequest) {
             super::super::publish_list_snapshot();
         }
         if !valid {
+            super::super::instrumentation::publish_best_effort("exception interceptor failed");
             aggregate = crate::sync_intercept::InterceptResponse::EMPTY;
         }
         crate::sync_intercept::complete(request.slot, request.generation, aggregate);

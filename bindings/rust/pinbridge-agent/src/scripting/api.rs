@@ -714,6 +714,145 @@ fn pb_on_bp() -> PyResult<()> {
 #[pyfunction(name = "on_modules")]
 fn pb_on_modules() {}
 
+fn instrumentation_kind(name: &str) -> Option<u32> {
+    Some(match name.trim().to_ascii_lowercase().as_str() {
+        "instruction" | "instruction.exec" | "exec" => crate::engines::INSTRUMENT_EXEC,
+        "memory" | "mem" => crate::engines::INSTRUMENT_MEMORY,
+        "branch" | "branch.edge" | "branch_edge" => crate::engines::INSTRUMENT_BRANCH,
+        _ => return None,
+    })
+}
+
+/// Compiles this plugin's high-frequency capture rules into the native Pin
+/// instrumentation path. Python never runs at instrumentation or analysis
+/// time; only immutable range/thread/kind filters are read there.
+#[pyfunction(
+    name = "instrumentation_set",
+    signature = (*, kinds=None, ranges=None, threads=None)
+)]
+fn pb_instrumentation_set(
+    kinds: Option<Vec<String>>,
+    ranges: Option<Vec<(u64, u64)>>,
+    threads: Option<Vec<u32>>,
+) -> PyResult<u64> {
+    if current_plugin_name().is_none() {
+        return Err(no_plugin());
+    }
+    let mut kind_mask = 0;
+    for name in kinds.unwrap_or_else(|| {
+        vec![
+            "instruction".to_string(),
+            "memory".to_string(),
+            "branch.edge".to_string(),
+        ]
+    }) {
+        kind_mask |= instrumentation_kind(&name).ok_or_else(|| {
+            PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                "unknown instrumentation kind {name:?}; expected instruction, memory, or branch.edge"
+            ))
+        })?;
+    }
+    if kind_mask == 0 {
+        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+            "instrumentation_set needs at least one kind; use instrumentation_clear to disable",
+        ));
+    }
+
+    let mut ranges = ranges.unwrap_or_else(|| vec![crate::engines::trace_range()]);
+    if ranges.is_empty() || ranges.len() > crate::engines::MAX_INSTRUMENTATION_RANGES {
+        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+            "instrumentation ranges must contain 1..={} entries",
+            crate::engines::MAX_INSTRUMENTATION_RANGES
+        )));
+    }
+    if ranges.iter().any(|(start, end)| start >= end) {
+        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+            "every instrumentation range must satisfy start < end",
+        ));
+    }
+    ranges.sort_unstable();
+    let mut merged: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());
+    for (start, end) in ranges {
+        if let Some(last) = merged.last_mut() {
+            if start <= last.1 {
+                last.1 = last.1.max(end);
+                continue;
+            }
+        }
+        merged.push((start, end));
+    }
+
+    let mut threads = threads.unwrap_or_default();
+    if threads.len() > crate::engines::MAX_INSTRUMENTATION_THREADS
+        || threads.contains(&PB_INVALID_THREAD_ID)
+    {
+        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+            "instrumentation threads must contain at most {} valid thread ids",
+            crate::engines::MAX_INSTRUMENTATION_THREADS
+        )));
+    }
+    threads.sort_unstable();
+    threads.dedup();
+    let spec = super::instrumentation::Spec {
+        kinds: kind_mask,
+        ranges: merged,
+        threads,
+    };
+    let previous = with_current_plugin_mut(|plugin| plugin.instrumentation.replace(spec))
+        .ok_or_else(no_plugin)?;
+    match super::instrumentation::publish() {
+        Ok(generation) => Ok(generation),
+        Err(status) => {
+            with_current_plugin_mut(|plugin| plugin.instrumentation = previous);
+            super::instrumentation::publish_best_effort("rollback failed configuration");
+            Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+                "native instrumentation update failed with status {status}"
+            )))
+        }
+    }
+}
+
+/// Removes this plugin's capture policy without affecting other plugins.
+#[pyfunction(name = "instrumentation_clear")]
+fn pb_instrumentation_clear() -> PyResult<bool> {
+    let previous =
+        with_current_plugin_mut(|plugin| plugin.instrumentation.take()).ok_or_else(no_plugin)?;
+    if previous.is_none() {
+        return Ok(false);
+    }
+    match super::instrumentation::publish() {
+        Ok(_) => Ok(true),
+        Err(status) => {
+            with_current_plugin_mut(|plugin| plugin.instrumentation = previous);
+            super::instrumentation::publish_best_effort("rollback failed clear");
+            Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+                "native instrumentation clear failed with status {status}"
+            )))
+        }
+    }
+}
+
+/// Returns this plugin's declarative policy, not another plugin's rules.
+#[pyfunction(name = "instrumentation_policy")]
+fn pb_instrumentation_policy() -> PyResult<Option<(Vec<String>, Vec<(u64, u64)>, Vec<u32>)>> {
+    with_current_plugin_mut(|plugin| {
+        plugin.instrumentation.as_ref().map(|spec| {
+            let mut kinds = Vec::new();
+            if spec.kinds & crate::engines::INSTRUMENT_EXEC != 0 {
+                kinds.push("instruction".to_string());
+            }
+            if spec.kinds & crate::engines::INSTRUMENT_MEMORY != 0 {
+                kinds.push("memory".to_string());
+            }
+            if spec.kinds & crate::engines::INSTRUMENT_BRANCH != 0 {
+                kinds.push("branch.edge".to_string());
+            }
+            (kinds, spec.ranges.clone(), spec.threads.clone())
+        })
+    })
+    .ok_or_else(no_plugin)
+}
+
 /// Subscribes on_event_batch to the given event kinds (hook, mem, exec,
 /// branch, syscall, ctx, module_load, module_unload), optionally limited to
 /// an address range; batch paces the per-tick page size (default 512).
@@ -822,6 +961,9 @@ fn pb(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(pb_on_syscall, m)?)?;
     m.add_function(wrap_pyfunction!(pb_on_bp, m)?)?;
     m.add_function(wrap_pyfunction!(pb_on_modules, m)?)?;
+    m.add_function(wrap_pyfunction!(pb_instrumentation_set, m)?)?;
+    m.add_function(wrap_pyfunction!(pb_instrumentation_clear, m)?)?;
+    m.add_function(wrap_pyfunction!(pb_instrumentation_policy, m)?)?;
     m.add_function(wrap_pyfunction!(pb_watch, m)?)?;
     m.add_function(wrap_pyfunction!(pb_unsubscribe, m)?)?;
     m.add_function(wrap_pyfunction!(pb_subscribe, m)?)?;

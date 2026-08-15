@@ -30,6 +30,7 @@ pub mod api;
 mod decisions;
 mod events;
 mod host;
+mod instrumentation;
 mod interceptors;
 pub mod output;
 mod python_data;
@@ -125,6 +126,9 @@ pub struct Plugin {
     pub events: TlsFreeMap<u64, events::EventSubscription>,
     /// Return-valued synchronous interceptors (`pb.intercept`).
     pub decisions: TlsFreeMap<u64, decisions::DecisionSubscription>,
+    /// This plugin's high-frequency capture rules. They are compiled into
+    /// one immutable native policy shared by the Pin analysis callbacks.
+    pub instrumentation: Option<instrumentation::Spec>,
     /// New-style callbacks bound to exact native breakpoint ids.  Legacy
     /// `on_bp_hit` remains separate and receives every stop notification.
     pub breakpoints: TlsFreeMap<u32, subscriptions::BreakpointSubscription>,

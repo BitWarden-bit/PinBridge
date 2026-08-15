@@ -55,6 +55,7 @@ pub(super) fn dispatch() {
         sort_handlers(&mut handlers);
 
         let mut follow = !handlers.is_empty();
+        let mut plugin_failed = false;
         for handler in handlers {
             let event = PyDict::new_bound(py);
             let argv = PyList::empty_bound(py);
@@ -111,6 +112,7 @@ pub(super) fn dispatch() {
                 }
                 Err(error) => {
                     follow = false;
+                    plugin_failed = true;
                     with_registry_mut(|registry| {
                         if let Some(plugin) = registry.get_mut(&handler.plugin) {
                             plugin.state = STATE_ERROR;
@@ -129,6 +131,9 @@ pub(super) fn dispatch() {
                     ));
                 }
             }
+        }
+        if plugin_failed {
+            super::super::instrumentation::publish_best_effort("child interceptor failed");
         }
         crate::child_process::complete(request.generation, follow);
     });
