@@ -300,7 +300,7 @@ pb.off(subscription_id)
 目前已接入的命名事件：`process.start`、`process.exit`、`thread.start`、
 `thread.exit`、`module.load`、`module.unload`、`exception`、`context.change`、
 `syscall`、`hook.entry`、`hook.return`、`instruction`、`memory`、`branch.edge`、
-`code.smc`、`pin.detach`、`pin.attach`、`memory.oom`。
+`code.smc`、`pin.detach`、`pin.attach`、`memory.oom`、`pin.internal_exception`。
 
 订阅 `instruction`、`memory`、`branch.edge` 或 `syscall` 会把对应的原生采集引擎加入
 脚本需求并在下一次宿主节拍开启。取消订阅不会擅自关闭可能由 CLI/UI 开启的全局引擎。
@@ -318,6 +318,7 @@ pb.off(subscription_id)
 | `thread.exit` | `ip`, `exit_code` | 退出码按有符号 64 位值提供 |
 | `code.smc` | `trace_start`, `trace_end` | 第一次订阅时才启用 Pin 的 SMC 跟踪 |
 | `memory.oom` | `requested_size` | 原生分配失败通知；回调自身不分配内存 |
+| `pin.internal_exception` | `ip`, `code`, `exception_address`, `fault_address`, `fault_address_known`, `access_type`, `exception_class` | 先写原生崩溃记录；只有 Pin 仍存活时 Python 才可能收到 |
 | `pin.detach` | `phase="detached"` | 已接入 JIT/Probe 原生完成回调；分离后不承诺 Python 仍被调度 |
 | `pin.attach` | `phase="attached"` | 字段已固定；完整重新附加控制链仍在开发 |
 
@@ -330,7 +331,7 @@ Python 处理函数统一在脚本内部线程按“插件名、注册顺序”�
 `PINBRIDGE_SCRIPT_EXIT_GRACE_MS=0..5000` 调整。超时后原生层无条件继续退出，Python
 故障不会把被分析进程永久卡在结束阶段。
 
-上述生命周期、SMC、Pin 分离/附加和内存不足事件使用独立 4096 槽高优先级环，先于
+上述生命周期、SMC、Pin 分离/附加、内存不足和 Pin 内部异常事件使用独立 4096 槽高优先级环，先于
 普通遥测派发。生产回调只执行固定记录和 try-lock，不调用 Python、不做阻塞等待。
 `pinbridge-agent.log` 的 Fini 行提供 `priority_total` 和 `priority_dropped`。
 

@@ -332,6 +332,39 @@ unsafe extern "C" fn on_pin_fault(
     let mut address: u64 = 0;
     pinbridge_sys::pb_pin_get_exception_code(exception_info, &mut code);
     pinbridge_sys::pb_pin_get_exception_address(exception_info, &mut address);
+    let mut exception_class: pinbridge_sys::PbExceptionClass =
+        pinbridge_sys::PB_EXCEPTCLASS_NONE;
+    let _ = pinbridge_sys::pb_pin_get_exception_class(code, &mut exception_class);
+    let mut fault_address = 0u64;
+    let mut fault_address_known = 0u8;
+    let _ = pinbridge_sys::pb_pin_get_faulty_access_address(
+        exception_info,
+        &mut fault_address,
+        &mut fault_address_known,
+    );
+    let mut access_type: pinbridge_sys::PbFaultyAccessType =
+        pinbridge_sys::PB_FAULTY_ACCESS_TYPE_UNKNOWN;
+    let _ = pinbridge_sys::pb_pin_get_faulty_access_type(exception_info, &mut access_type);
+    // Snapshot the exact physical IP/SP before doing any file I/O. The
+    // borrowed physical context is valid only for this Pin callback.
+    let instr_ptr = crate::arch::instr_ptr_reg();
+    let stack_ptr = crate::arch::stack_ptr_reg();
+    let mut ip: u64 = 0;
+    let mut sp: u64 = 0;
+    pinbridge_sys::pb_pin_get_physical_context_reg(physical_context, instr_ptr, &mut ip);
+    pinbridge_sys::pb_pin_get_physical_context_reg(physical_context, stack_ptr, &mut sp);
+    let event = crate::event::Event {
+        kind: crate::event::EVENT_PIN_INTERNAL_EXCEPTION,
+        thread_id,
+        address: ip,
+        arg0: code as u64,
+        arg1: address,
+        arg2: fault_address,
+        arg3: access_type as u64,
+        arg4: exception_class as u64,
+        arg5: fault_address_known as u64,
+        ..crate::event::Event::EMPTY
+    };
     let file = CreateFileA(
         CRASH_PATH.as_ptr(),
         FILE_APPEND_DATA,
@@ -342,6 +375,7 @@ unsafe extern "C" fn on_pin_fault(
         core::ptr::null_mut(),
     );
     if file.is_null() || file == usize::MAX as *mut c_void {
+        crate::priority::submit(event);
         return pinbridge_sys::PB_EHR_UNHANDLED;
     }
     let os_tid = GetCurrentThreadId();
@@ -354,12 +388,6 @@ unsafe extern "C" fn on_pin_fault(
     // exact register state at the fault, from the physical context. Use the
     // per-arch instruction/stack pointers (eip/esp on ia32) rather than the
     // x64 rip/rsp names.
-    let instr_ptr = crate::arch::instr_ptr_reg();
-    let stack_ptr = crate::arch::stack_ptr_reg();
-    let mut ip: u64 = 0;
-    let mut sp: u64 = 0;
-    pinbridge_sys::pb_pin_get_physical_context_reg(physical_context, instr_ptr, &mut ip);
-    pinbridge_sys::pb_pin_get_physical_context_reg(physical_context, stack_ptr, &mut sp);
     let ip_name = crate::arch::gp_name(instr_ptr).unwrap_or("ip");
     let sp_name = crate::arch::gp_name(stack_ptr).unwrap_or("sp");
     let (ip_base, ip_mod) = module_of(ip as *mut c_void);
@@ -450,5 +478,8 @@ unsafe extern "C" fn on_pin_fault(
         }
     }
     CloseHandle(file);
+    // The native crash record is complete. If Pin keeps the process alive,
+    // the scripting thread will later deliver this POD snapshot to Python.
+    crate::priority::submit(event);
     pinbridge_sys::PB_EHR_UNHANDLED // let Pin's default reporter kill us
 }

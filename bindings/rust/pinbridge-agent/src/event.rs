@@ -64,6 +64,10 @@ pub const EVENT_PIN_DETACH: u32 = 21;
 pub const EVENT_PIN_ATTACH: u32 = 22;
 /// Pin reported an allocation failure. arg0=requested size.
 pub const EVENT_OUT_OF_MEMORY: u32 = 23;
+/// Pin's own internal exception handler ran. address=physical IP, arg0=code,
+/// arg1=exception address, arg2=fault address, arg3=access type,
+/// arg4=exception class, arg5=fault address known.
+pub const EVENT_PIN_INTERNAL_EXCEPTION: u32 = 24;
 
 pub const EVENT_KIND_COUNT: usize = 9;
 
@@ -139,6 +143,7 @@ pub fn kind_name(kind: u32) -> &'static str {
         EVENT_PIN_DETACH => "pin_detach",
         EVENT_PIN_ATTACH => "pin_attach",
         EVENT_OUT_OF_MEMORY => "out_of_memory",
+        EVENT_PIN_INTERNAL_EXCEPTION => "pin_internal_exception",
         _ => "unknown",
     }
 }

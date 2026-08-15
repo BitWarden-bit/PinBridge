@@ -167,7 +167,7 @@ pb.off(sid)
 ## 已完成：高优先级事件通道
 
 第三阶段增加了独立于 64K 遥测环的 4096 槽高优先级环。进程/线程生命周期、
-`code.smc`、`pin.detach`、`pin.attach` 和 `memory.oom` 使用自己的游标，脚本宿主每个
+`code.smc`、`pin.detach`、`pin.attach`、`memory.oom` 和 `pin.internal_exception` 使用自己的游标，脚本宿主每个
 节拍先处理高优先级记录，再处理断点和普通遥测。因此指令或内存事件洪流不会再把这些
 记录从普通环中挤掉。
 
@@ -406,6 +406,7 @@ SMC 检测覆盖全部情况。
 | 进程/线程生命周期 | `pb.on(...)` | 已完成，真实 Pin 测试通过 |
 | 动态机器码修改 | `pb.on("code.smc", ...)` | 已完成，真实 Pin 测试通过 |
 | 内存不足 | `pb.on("memory.oom", ...)` | 原生接入和契约测试完成，无法安全强制触发 |
+| Pin 内部异常 | `pb.on("pin.internal_exception", ...)` | 原生崩溃记录后投递高优先级快照；仅在进程存活时可到达 Python |
 | Pin 分离完成 | `pb.on("pin.detach", ...)` | JIT/Probe 原生接入完成；分离后的即时 Python 调度不承诺 |
 | Pin 重新附加 | `pb.on("pin.attach", ...)` | 事件结构已完成，重新附加控制链待开发 |
 | 子进程跟随决策 | `pb.intercept("child.follow", ...)` | 已完成，跟随/不跟随真实 Pin 测试通过；子进程独立控制端口待开发 |

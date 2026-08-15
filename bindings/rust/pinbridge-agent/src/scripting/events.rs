@@ -12,7 +12,7 @@ use pyo3::types::PyDict;
 const CONTEXT_CHANGE_EXCEPTION: u64 = 4;
 static NEXT_SUBSCRIPTION_ID: AtomicU64 = AtomicU64::new(1);
 
-pub const PUBLIC_EVENT_NAMES: [&str; 18] = [
+pub const PUBLIC_EVENT_NAMES: [&str; 19] = [
     "process.start",
     "process.exit",
     "thread.start",
@@ -31,6 +31,7 @@ pub const PUBLIC_EVENT_NAMES: [&str; 18] = [
     "pin.detach",
     "pin.attach",
     "memory.oom",
+    "pin.internal_exception",
 ];
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -66,6 +67,9 @@ impl EventSelector {
             "pin.detach" | "pin_detach" => Self::Kind(EVENT_PIN_DETACH),
             "pin.attach" | "pin_attach" => Self::Kind(EVENT_PIN_ATTACH),
             "memory.oom" | "out_of_memory" | "oom" => Self::Kind(EVENT_OUT_OF_MEMORY),
+            "pin.internal_exception" | "pin_internal_exception" | "internal_exception" => {
+                Self::Kind(EVENT_PIN_INTERNAL_EXCEPTION)
+            }
             _ => return None,
         })
     }
@@ -90,6 +94,7 @@ impl EventSelector {
             Self::Kind(EVENT_PIN_DETACH) => "pin.detach",
             Self::Kind(EVENT_PIN_ATTACH) => "pin.attach",
             Self::Kind(EVENT_OUT_OF_MEMORY) => "memory.oom",
+            Self::Kind(EVENT_PIN_INTERNAL_EXCEPTION) => "pin.internal_exception",
             Self::Kind(_) => "unknown",
         }
     }
@@ -121,6 +126,7 @@ impl EventSelector {
                 | Self::Kind(EVENT_PIN_DETACH)
                 | Self::Kind(EVENT_PIN_ATTACH)
                 | Self::Kind(EVENT_OUT_OF_MEMORY)
+                | Self::Kind(EVENT_PIN_INTERNAL_EXCEPTION)
         )
     }
 
@@ -239,6 +245,15 @@ pub fn build_event_dict(
         EventSelector::Kind(EVENT_OUT_OF_MEMORY) => {
             row.set_item("requested_size", event.arg0)?;
         }
+        EventSelector::Kind(EVENT_PIN_INTERNAL_EXCEPTION) => {
+            row.set_item("ip", event.address)?;
+            row.set_item("code", event.arg0)?;
+            row.set_item("exception_address", event.arg1)?;
+            row.set_item("fault_address", event.arg2)?;
+            row.set_item("fault_address_known", event.arg5 != 0)?;
+            row.set_item("access_type", event.arg3)?;
+            row.set_item("exception_class", event.arg4)?;
+        }
         EventSelector::Kind(EVENT_MODULE_LOAD) => {
             row.set_item("base", event.arg0)?;
             row.set_item("end", event.arg1)?;
@@ -307,7 +322,13 @@ mod tests {
             Some(EventSelector::Exception)
         );
         assert_eq!(EventSelector::parse("not-an-event"), None);
-        for name in ["code.smc", "pin.detach", "pin.attach", "memory.oom"] {
+        for name in [
+            "code.smc",
+            "pin.detach",
+            "pin.attach",
+            "memory.oom",
+            "pin.internal_exception",
+        ] {
             let selector = EventSelector::parse(name).expect("public event must parse");
             assert!(selector.is_priority());
             assert!(PUBLIC_EVENT_NAMES.contains(&name));
