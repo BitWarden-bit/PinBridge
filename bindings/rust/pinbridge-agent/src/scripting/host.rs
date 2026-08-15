@@ -44,6 +44,7 @@ const DEFAULT_WATCH_BATCH: u64 = 512;
 
 const RING_PAGE_CAP: u64 = 2048;
 const PRIORITY_PAGE_CAP: usize = 512;
+const OBSERVATION_PAGE_CAP: usize = 2048;
 pub const BATCH_MAX: u64 = 4096;
 
 // Debugger launches request an entry stop before plugin code is allowed to
@@ -751,8 +752,12 @@ fn exec_one(name: &str, code: Py<PyAny>, port: u16) {
             filters: super::Filters::default(),
             cursor: 0,
             priority_cursor: 0,
+            observation_cursor: 0,
             module_generation: 0,
             exception_generation: 0,
+            syscall_generations: events::shared_generation_window(
+                crate::syscall_engine::generation(),
+            ),
             last_stop_gen: 0,
             last_breakpoint_gen: 0,
             delivered: 0,
@@ -811,20 +816,30 @@ fn exec_one(name: &str, code: Py<PyAny>, port: u16) {
             }
         });
         // Start fresh: events/stops from before the load are not the plugin's.
-        let (cursor, priority_cursor, gen) = match TickClient::connect(port) {
+        let (cursor, priority_cursor, observation_cursor, gen) = match TickClient::connect(port) {
             Some(mut client) => (
                 client.counters_total().unwrap_or(0),
                 crate::priority::total(),
+                crate::observation::total(),
                 client.bp_list().map(|b| b.3).unwrap_or(0),
             ),
-            None => (0, crate::priority::total(), 0),
+            None => (0, crate::priority::total(), crate::observation::total(), 0),
         };
         with_registry_mut(|r| {
             if let Some(p) = r.get_mut(name) {
                 p.cursor = cursor;
                 p.priority_cursor = priority_cursor;
+                p.observation_cursor = observation_cursor;
                 p.module_generation = crate::modules::generation();
                 p.exception_generation = crate::exception::generation();
+                let syscall_generation = crate::syscall_engine::generation();
+                p.syscall_generations = events::shared_generation_window(syscall_generation);
+                for subscription in p.events.values_mut().filter(|subscription| {
+                    subscription.selector == EventSelector::Kind(EVENT_SYSCALL)
+                }) {
+                    subscription.syscall_generations =
+                        events::shared_generation_window(syscall_generation);
+                }
                 p.last_stop_gen = gen;
             }
         });
@@ -862,6 +877,7 @@ struct TickShared {
     bp_entries: Vec<(u32, u64, u64)>,
     context_registers: Vec<(u32, u64)>,
     priority_events: Vec<pinbridge_proto::EventRecord>,
+    observation_events: Vec<pinbridge_proto::EventRecord>,
     events: Vec<pinbridge_proto::EventRecord>,
     module_names: crate::TlsFreeMap<u64, String>,
 }
@@ -885,6 +901,13 @@ fn consumes_priority(p: &Plugin) -> bool {
             .events
             .values()
             .any(|subscription| subscription.selector.is_priority())
+}
+
+fn consumes_observation(p: &Plugin) -> bool {
+    p.on_syscall.is_some()
+        || p.events
+            .values()
+            .any(|subscription| subscription.selector == EventSelector::Kind(EVENT_SYSCALL))
 }
 
 fn event_record(event: &crate::event::Event) -> pinbridge_proto::EventRecord {
@@ -924,9 +947,10 @@ fn tick(pending: &mut Vec<(String, Py<PyAny>)>, port: u16) {
     // adapt the pull size to last tick's measured Python cost (routed count)
     adapt_page_limit();
 
-    let (min_cursor, min_priority_cursor, wants_stop, page_limit) = with_registry(|r| {
+    let (min_cursor, min_priority_cursor, min_observation_cursor, wants_stop, page_limit) = with_registry(|r| {
         let mut min_cursor: Option<u64> = None;
         let mut min_priority_cursor: Option<u64> = None;
+        let mut min_observation_cursor: Option<u64> = None;
         let mut wants_stop = false;
         let mut page_limit = 0u64;
         let mut any_watch = false;
@@ -942,6 +966,13 @@ fn tick(pending: &mut Vec<(String, Py<PyAny>)>, port: u16) {
                     min_priority_cursor
                         .map(|m: u64| m.min(p.priority_cursor))
                         .unwrap_or(p.priority_cursor),
+                );
+            }
+            if consumes_observation(p) {
+                min_observation_cursor = Some(
+                    min_observation_cursor
+                        .map(|m: u64| m.min(p.observation_cursor))
+                        .unwrap_or(p.observation_cursor),
                 );
             }
             if p.filters.want_bp || p.on_stop.is_some() || !p.breakpoints.is_empty() {
@@ -961,13 +992,14 @@ fn tick(pending: &mut Vec<(String, Py<PyAny>)>, port: u16) {
         };
         // adaptive good-citizen ceiling under flood (see adapt_page_limit)
         let page_limit = page_limit.min(ADAPT_PAGE.load(Ordering::Relaxed));
-        (min_cursor, min_priority_cursor, wants_stop, page_limit)
+        (min_cursor, min_priority_cursor, min_observation_cursor, wants_stop, page_limit)
     });
     let knobs_dirty = NATIVE_DIRTY.swap(false, Ordering::AcqRel);
     let pending_native_removals = subscriptions::has_native_removals();
     let exit_delivery_pending = crate::lifecycle::exit_delivery_pending();
     if min_cursor.is_none()
         && min_priority_cursor.is_none()
+        && min_observation_cursor.is_none()
         && !wants_stop
         && !knobs_dirty
         && !pending_native_removals
@@ -987,6 +1019,7 @@ fn tick(pending: &mut Vec<(String, Py<PyAny>)>, port: u16) {
         bp_entries: Vec::new(),
         context_registers: Vec::new(),
         priority_events: Vec::new(),
+        observation_events: Vec::new(),
         events: Vec::new(),
         module_names: crate::new_map(),
     };
@@ -995,6 +1028,14 @@ fn tick(pending: &mut Vec<(String, Py<PyAny>)>, port: u16) {
         if crate::priority::try_page(after, PRIORITY_PAGE_CAP, &mut events).is_some() {
             shared
                 .priority_events
+                .extend(events.iter().map(event_record));
+        }
+    }
+    if let Some(after) = min_observation_cursor {
+        let mut events = Vec::with_capacity(OBSERVATION_PAGE_CAP);
+        if crate::observation::try_page(after, OBSERVATION_PAGE_CAP, &mut events).is_some() {
+            shared
+                .observation_events
                 .extend(events.iter().map(event_record));
         }
     }
@@ -1130,22 +1171,21 @@ fn recompute_native_knobs(client: &mut TickClient) {
                 telemetry[1] |= watch.kinds_mask & (1u32 << EVENT_EXEC) != 0;
                 telemetry[2] |= watch.kinds_mask & (1u32 << EVENT_BRANCH_EDGE) != 0;
             }
-            let generic_syscall = p
-                .events
-                .values()
-                .any(|subscription| subscription.selector == EventSelector::Kind(EVENT_SYSCALL));
-            if p.on_syscall.is_none() && !generic_syscall {
-                continue;
+            if p.on_syscall.is_some() {
+                any = true;
+                match &p.filters.syscall_numbers {
+                    None => all = true,
+                    Some(numbers) => union.extend(numbers.iter().copied()),
+                }
             }
-            any = true;
-            if generic_syscall {
-                // Named event subscriptions currently have no number
-                // filter, so their native requirement is the full stream.
-                all = true;
-            }
-            match &p.filters.syscall_numbers {
-                None => all = true,
-                Some(numbers) => union.extend(numbers.iter().copied()),
+            for subscription in p.events.values().filter(|subscription| {
+                subscription.selector == EventSelector::Kind(EVENT_SYSCALL)
+            }) {
+                any = true;
+                match &subscription.syscall_numbers {
+                    None => all = true,
+                    Some(numbers) => union.extend(numbers.iter().copied()),
+                }
             }
         }
         (any, all, union, telemetry)
@@ -1161,6 +1201,7 @@ fn recompute_native_knobs(client: &mut TickClient) {
     if any {
         let _ = client.engine_set(EVENT_SYSCALL, true);
     }
+    crate::syscall_engine::set_observation_enabled(any);
     if all || !any {
         let _ = client.syscall_filter(0, &[]);
     } else {
@@ -1394,6 +1435,8 @@ struct EventHandlerSnapshot {
     callback: Py<PyAny>,
     once: bool,
     order: u64,
+    syscall_numbers: Option<crate::TlsFreeSet<u32>>,
+    syscall_generations: events::SharedGenerationWindow,
     sticky_delivered: bool,
     oom_generation: u64,
     mirror_generation: u64,
@@ -1402,8 +1445,10 @@ struct EventHandlerSnapshot {
 struct DispatchSnapshot {
     cursor: u64,
     priority_cursor: u64,
+    observation_cursor: u64,
     module_generation: u64,
     exception_generation: u64,
+    syscall_generations: events::SharedGenerationWindow,
     last_stop_gen: u64,
     on_exception: Option<Py<PyAny>>,
     on_syscall: Option<Py<PyAny>>,
@@ -1434,6 +1479,8 @@ fn dispatch_one(py: Python<'_>, name: &str, shared: &TickShared) {
                 callback: subscription.callback.clone_ref(py),
                 once: subscription.once,
                 order: subscription.order,
+                syscall_numbers: subscription.syscall_numbers.clone(),
+                syscall_generations: subscription.syscall_generations.clone(),
                 sticky_delivered: subscription.sticky_delivered,
                 oom_generation: subscription.oom_generation,
                 mirror_generation: subscription.mirror_generation,
@@ -1443,8 +1490,10 @@ fn dispatch_one(py: Python<'_>, name: &str, shared: &TickShared) {
         Some(DispatchSnapshot {
             cursor: plugin.cursor,
             priority_cursor: plugin.priority_cursor,
+            observation_cursor: plugin.observation_cursor,
             module_generation: plugin.module_generation,
             exception_generation: plugin.exception_generation,
+            syscall_generations: plugin.syscall_generations.clone(),
             last_stop_gen: plugin.last_stop_gen,
             on_exception: plugin.on_exception.as_ref().map(|c| c.clone_ref(py)),
             on_syscall: plugin.on_syscall.as_ref().map(|c| c.clone_ref(py)),
@@ -1557,6 +1606,38 @@ fn dispatch_one(py: Python<'_>, name: &str, shared: &TickShared) {
             }
         }
         dropped += priority_missed;
+
+        // Native-filtered observations have a separate cursor from both the
+        // rare-event lane and compatibility telemetry. Syscall generations
+        // suppress the later compatibility copy per Python handler.
+        let mut observation_missed = 0u64;
+        if failed.is_none() {
+            for event in &shared.observation_events {
+                if event.sequence <= s.observation_cursor {
+                    continue;
+                }
+                if observation_missed == 0 && event.sequence > s.observation_cursor + 1 {
+                    observation_missed = event.sequence - s.observation_cursor - 1;
+                }
+                s.observation_cursor = event.sequence;
+                if route_event(py, &mut s, event, shared, &mut delivered, &mut failed) {
+                    break;
+                }
+                if route_named_handlers(
+                    py,
+                    &mut s.event_handlers,
+                    event,
+                    shared,
+                    &mut delivered,
+                    &mut failed,
+                    &mut remove_event_handlers,
+                    &mut delivered_sticky_handlers,
+                ) {
+                    break;
+                }
+            }
+        }
+        dropped += observation_missed;
 
         // Allocation failure may prevent the priority ring's try-lock from
         // succeeding. After routing retained records, use the coherent
@@ -1686,6 +1767,7 @@ fn dispatch_one(py: Python<'_>, name: &str, shared: &TickShared) {
         if let Some(p) = r.get_mut(name) {
             p.cursor = s.cursor;
             p.priority_cursor = s.priority_cursor;
+            p.observation_cursor = s.observation_cursor;
             p.module_generation = p.module_generation.max(s.module_generation);
             p.exception_generation = p.exception_generation.max(s.exception_generation);
             p.last_stop_gen = s.last_stop_gen;
@@ -1745,6 +1827,27 @@ fn route_named_handlers(
         }
         if handler.selector.is_sticky() && handler.sticky_delivered {
             continue;
+        }
+        if handler.selector == EventSelector::Kind(EVENT_SYSCALL)
+            && event.kind == EVENT_SYSCALL
+        {
+            let number = event.arg0 as u32;
+            if handler
+                .syscall_numbers
+                .as_ref()
+                .is_some_and(|numbers| !numbers.contains(&number))
+            {
+                continue;
+            }
+            if event.address != 0 {
+                if !handler
+                    .syscall_generations
+                    .borrow_mut()
+                    .accept(event.address)
+                {
+                    continue;
+                }
+            }
         }
         if handler.selector == EventSelector::Kind(EVENT_OUT_OF_MEMORY)
             && event.kind == EVENT_OUT_OF_MEMORY
@@ -1861,6 +1964,15 @@ fn route_event(
             }
         }
         EVENT_SYSCALL => {
+            if event.address != 0 {
+                if !s
+                    .syscall_generations
+                    .borrow_mut()
+                    .accept(event.address)
+                {
+                    return false;
+                }
+            }
             let number = event.arg0 as u32;
             match (&s.on_syscall, &s.syscall_numbers) {
                 (Some(callback), numbers)
@@ -1871,6 +1983,7 @@ fn route_event(
                     let _ = dict.set_item("number", event.arg0);
                     let _ = dict.set_item("phase", phase);
                     let _ = dict.set_item("tid", event.thread_id);
+                    let _ = dict.set_item("syscall_generation", event.address);
                     let args: Vec<u64> = if phase == 0 {
                         vec![
                             event.arg2, event.arg3, event.arg4, event.arg5, event.arg6, event.arg7,

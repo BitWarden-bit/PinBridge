@@ -508,11 +508,36 @@ fn pb_trace_status() -> Option<(bool, u64, u64)> {
 
 // ---- registrations (mutate the current plugin's filters) ----
 
+fn parse_syscall_numbers(
+    numbers: Option<Vec<u64>>,
+) -> PyResult<Option<crate::TlsFreeSet<u32>>> {
+    numbers
+        .map(|numbers| {
+            let mut filter = crate::new_set();
+            for number in numbers {
+                if number >= crate::syscall_engine::SYSCALL_NUMBER_LIMIT as u64 {
+                    return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                        "syscall number must be in the native 0..0xfff range",
+                    ));
+                }
+                filter.insert(number as u32);
+            }
+            Ok(filter)
+        })
+        .transpose()
+}
+
 /// Registers a named asynchronous event handler owned by the current
 /// plugin.  Breakpoints use pb.breakpoint because they are synchronous stop
 /// events with a return action; pb.on handles notification events.
-#[pyfunction(name = "on", signature = (event, callback, *, once=false))]
-fn pb_on_event(py: Python<'_>, event: &str, callback: Py<PyAny>, once: bool) -> PyResult<u64> {
+#[pyfunction(name = "on", signature = (event, callback, *, once=false, numbers=None))]
+fn pb_on_event(
+    py: Python<'_>,
+    event: &str,
+    callback: Py<PyAny>,
+    once: bool,
+    numbers: Option<Vec<u64>>,
+) -> PyResult<u64> {
     if current_plugin_name().is_none() {
         return Err(no_plugin());
     }
@@ -531,12 +556,19 @@ fn pb_on_event(py: Python<'_>, event: &str, callback: Py<PyAny>, once: bool) -> 
             "unknown event {event:?}; use pb.event_names() to list supported names"
         ))
     })?;
+    if numbers.is_some() && selector != EventSelector::Kind(crate::event::EVENT_SYSCALL) {
+        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+            "numbers is valid only for the syscall event",
+        ));
+    }
+    let syscall_numbers = parse_syscall_numbers(numbers)?;
     if selector.requires_smc_registration() && crate::high_priority::enable_smc() != PB_OK {
         return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
             "Pin rejected SMC callback registration",
         ));
     }
-    let (id, subscription) = EventSubscription::new(selector, callback, once);
+    let (id, subscription) =
+        EventSubscription::new(selector, callback, once, syscall_numbers);
     with_current_plugin_mut(|plugin| plugin.events.insert(id, subscription))
         .ok_or_else(no_plugin)?;
     mark_native_dirty();
@@ -734,12 +766,9 @@ fn pb_on_exception(codes: Option<Vec<u64>>) -> PyResult<()> {
 /// is the union across plugins, recomputed on the next host tick.
 #[pyfunction(name = "on_syscall", signature = (numbers=None))]
 fn pb_on_syscall(numbers: Option<Vec<u64>>) -> PyResult<()> {
+    let numbers = parse_syscall_numbers(numbers)?;
     with_current_plugin_mut(|p| {
-        p.filters.syscall_numbers = numbers.map(|v| {
-            let mut set = crate::new_set();
-            set.extend(v.into_iter().map(|n| n as u32));
-            set
-        });
+        p.filters.syscall_numbers = numbers;
     })
     .ok_or_else(no_plugin)?;
     mark_native_dirty();

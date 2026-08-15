@@ -13,11 +13,22 @@
 use crate::event::{Event, EVENT_SYSCALL};
 use crate::ring::submit;
 use core::ffi::c_void;
-use core::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU64, Ordering};
 use pinbridge_sys::*;
 
 static ENABLED: AtomicBool = AtomicBool::new(true);
+static OBSERVATION_ENABLED: AtomicBool = AtomicBool::new(false);
 static SYSCALL_TLS_KEY: AtomicI32 = AtomicI32::new(PB_INVALID_TLS_KEY);
+static SYSCALL_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+pub fn generation() -> u64 {
+    SYSCALL_GENERATION.load(Ordering::Acquire)
+}
+
+#[inline]
+fn next_generation() -> u64 {
+    SYSCALL_GENERATION.fetch_add(1, Ordering::AcqRel) + 1
+}
 
 pub fn set_enabled(on: bool) {
     ENABLED.store(on, Ordering::Relaxed);
@@ -27,8 +38,17 @@ pub fn enabled() -> bool {
     ENABLED.load(Ordering::Relaxed)
 }
 
+pub fn set_observation_enabled(on: bool) {
+    OBSERVATION_ENABLED.store(on, Ordering::Release);
+}
+
+#[inline]
+fn observation_enabled() -> bool {
+    OBSERVATION_ENABLED.load(Ordering::Acquire)
+}
+
 /// Windows syscall numbers are < 0x1000: one bit each, 512 bytes total.
-const SYSCALL_NUMBER_LIMIT: usize = 4096;
+pub const SYSCALL_NUMBER_LIMIT: usize = 4096;
 
 /// Pin's IA-32 Windows syscall value includes the service-class bits (for
 /// example `0x3000f`); the low 12 bits are the native syscall ordinal. Keep
@@ -193,9 +213,12 @@ unsafe extern "C" fn on_entry(
     if !capture {
         return;
     }
-    submit(Event {
+    let event = Event {
         kind: EVENT_SYSCALL,
         thread_id,
+        // Syscall entry needs all eight argument slots. The otherwise-unused
+        // generic address field carries the shared dual-lane generation.
+        address: next_generation(),
         arg0: number,
         arg1: 0, // entry
         arg2: args[0],
@@ -205,21 +228,12 @@ unsafe extern "C" fn on_entry(
         arg6: args[4],
         arg7: args[5],
         ..Event::EMPTY
-    });
-    let trace_event = Event {
-        kind: EVENT_SYSCALL,
-        thread_id,
-        arg0: number,
-        arg1: 0,
-        arg2: args[0],
-        arg3: args[1],
-        arg4: args[2],
-        arg5: args[3],
-        arg6: args[4],
-        arg7: args[5],
-        ..Event::EMPTY
     };
-    crate::record::submit_global(context as PbConstContextHandle, trace_event);
+    if observation_enabled() {
+        crate::observation::submit(event);
+    }
+    submit(event);
+    crate::record::submit_global(context as PbConstContextHandle, event);
 }
 
 unsafe extern "C" fn on_exit(
@@ -258,25 +272,21 @@ unsafe extern "C" fn on_exit(
     if !enabled() || !number_allowed(number) {
         return;
     }
-    submit(Event {
+    let event = Event {
         kind: EVENT_SYSCALL,
         thread_id,
+        address: next_generation(),
         arg0: number,
         arg1: 1, // exit
         arg3: return_value,
         arg4: errno,
         ..Event::EMPTY
-    });
-    let trace_event = Event {
-        kind: EVENT_SYSCALL,
-        thread_id,
-        arg0: number,
-        arg1: 1,
-        arg3: return_value,
-        arg4: errno,
-        ..Event::EMPTY
     };
-    crate::record::submit_global(context as PbConstContextHandle, trace_event);
+    if observation_enabled() {
+        crate::observation::submit(event);
+    }
+    submit(event);
+    crate::record::submit_global(context as PbConstContextHandle, event);
 }
 
 pub fn register() -> PbStatus {

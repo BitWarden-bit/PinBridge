@@ -85,7 +85,7 @@ kinds 合法值:`hook`/`hook_regs`、`mem`/`memory`、`exec`、`branch`/`branch_
 |---|---|---|
 | `pb_init()` | 顶层跑完之后 | 无 |
 | `on_exception(evt)` | context_change 异常事件 | `{tid, code, rip, reason, exception_generation}` |
-| `on_syscall(evt)` | syscall 引擎事件 | `{number, phase, tid, args[6], retval}`(phase 0=entry 带六参,1=exit 带 retval) |
+| `on_syscall(evt)` | syscall 引擎事件 | `{number, phase, tid, args[6], retval, syscall_generation}`(phase 0=entry 带六参,1=exit 带 retval) |
 | `on_bp_hit(evt)` | 断点命中停下 | `{tid, addr, id}` |
 | `on_module_load(evt)` | 镜像加载 | `{base, end, is_main, name, module_generation}` |
 | `on_module_unload(evt)` | 镜像卸载 | `{base, end=0, is_main, name, module_generation}` |
@@ -104,7 +104,7 @@ kinds 合法值:`hook`/`hook_regs`、`mem`/`memory`、`exec`、`branch`/`branch_
 | 2 | memory | 指令地址 | EA | size | access(0=读,1=写,2=第二读操作数) | — | — |
 | 3 | exec | 指令地址 | — | — | — | — | — |
 | 4 | branch_edge | 指令地址 | target | taken | — | — | — |
-| 5 | syscall | — | number | phase(0=entry,1=exit) | entry:arg0 | entry:arg1 / exit:retval | entry:arg2..arg5 / exit:a4=errno |
+| 5 | syscall | syscall_generation | number | phase(0=entry,1=exit) | entry:arg0 | entry:arg1 / exit:retval | entry:arg2..arg5 / exit:a4=errno |
 | 6 | context_change | 异常 IP | reason(4=异常) | info(异常码) | ip | exception_generation（非异常为 0） | — |
 | 7 | module_load | base | base | end | is_main | module_generation | — |
 | 8 | module_unload | base | base | — | — | module_generation | — |
@@ -301,9 +301,8 @@ VMP 系保护壳把自己的异常导向 SEH 处理；经典解法是掐 `KiUser
 1. **python 就绪竞态**：脚本功能约在端口绑定后 ~1s 才可用（预加载 + 解释器初始化在脚本
    线程上异步完成）;`script run` 报 "python unavailable" 时重试即可。
 2. **部分事件仍只走普通环**：生命周期、模块加载/卸载、异常边沿、SMC、Pin 分离/附加和
-   内存不足已经接入独立 4096 槽高优先级环；系统调用观察和非异常 context change 仍可能
-   被默认引擎洪流（~100 万 exec/s）挤出 64K 普通环。等 syscall 时关掉用不到的引擎
-   （`engine 2 off; engine 3 off; engine 4 off`)——`tests/control_e2e.py` 就是这么做的。
+   内存不足使用 4096 槽高优先级环；命名/固定系统调用观察使用经过原生号码过滤的 16384 槽
+   独立环。非异常 context change 仍可能被默认引擎洪流（~100 万 exec/s）挤出普通环。
 3. **异常码符号扩展**:`on_exception` 的 `code` 到达时是符号扩展的 64 位值
    （如 `0xFFFFFFFFC0000005`)，用前掩到 u32(`code & 0xFFFFFFFF`)。
 4. **间歇性堆损坏崩溃**（历史遗留，排查中）：签名恒定为内部线程在 `ntdll.dll+0x5b897`
@@ -326,7 +325,10 @@ subscription_id = pb.on("thread.start", thread_started)
 pb.off(subscription_id)
 ```
 
-- `pb.on(name, callback, once=False) -> subscription_id`：当前插件订阅一个异步通知；
+- `pb.on(name, callback, once=False, numbers=None) -> subscription_id`：当前插件订阅一个异步
+  通知；`numbers` 只适用于 `syscall`，在原生回调进入独立观察环之前过滤；
+- 常驻 syscall 观察应显式传 `numbers=[...]`；`numbers=None` 会接收全部系统调用，独立环也会
+  在 Python 长期处理不过来时覆盖旧记录并计入丢失；
 - `pb.off(subscription_id) -> bool`：只移除当前插件拥有的订阅；
 - `pb.event_names() -> list[str]`：返回 `pb.on` 接受的规范事件名；
 - 断点是会停止目标的同步事件，必须使用 `pb.breakpoint(address, callback)` 注册。
@@ -357,6 +359,7 @@ pb.off(subscription_id)
 | `module.unload` | `base`, `name`, `module_generation` | 与加载事件共享单调递增的原生代号；真实 DLL 卸载回归已覆盖 |
 | `exception` | `reason`, `code`, `ip`, `exception_generation` | 异常边沿向高优先级环和兼容普通环双写；命名回调与旧固定回调各自去重 |
 | `context.change` | `reason`, `info`, `ip`, `exception_generation` | 异常原因携带非零代号并双写；其他上下文切换仍只走普通环，代号为 0 |
+| `syscall` | `number`, `phase`, `args`/`retval`/`errno`, `syscall_generation` | `phase` 为 `enter`/`exit`；原生号码过滤后向 16384 槽观察环和兼容普通环双写并逐处理函数去重 |
 | `code.smc` | `trace_start`, `trace_end` | 第一次订阅时才启用 Pin 的 SMC 跟踪 |
 | `memory.oom` | `requested_size`, `occurrence`, `recovered_from_emergency_slot` | 原生先追加 `pinbridge_oom.log`，存活时再通知 Python；`recovered_from_emergency_slot=True` 表示普通高优先级环未作为唯一投递来源 |
 | `pin.internal_exception` | `ip`, `code`, `exception_address`, `fault_address`, `fault_address_known`, `access_type`, `exception_class` | 先写原生崩溃记录；只有 Pin 仍存活时 Python 才可能收到 |
@@ -388,11 +391,17 @@ Python；退出交接也只有有界确认等待。Python 处理函数统一在�
 异常边沿采用相同的兼容设计，两份记录携带同一个 `exception_generation`。每个
 `pb.on("exception")`、`pb.on("context.change")` 处理函数和旧 `on_exception` 回调分别保存
 自己的已投递代号，所以三种 API 可以同时使用而不会互相吞事件或各自收到双份事件。
+系统调用命名回调和旧 `on_syscall` 使用独立的 16384 槽原生过滤观察环，不与稀有事件共享
+容量，也不会被 instruction/memory 洪流覆盖。兼容普通环仍保留给 CLI/UI 和
+`on_event_batch`；双写记录共享 `syscall_generation`，每个 Python 处理函数各自去重。
+不同应用线程可能乱序写入事件环，因此这里不是只记“最大代号”，而是每个处理函数使用
+固定 65536 位滑动窗口；乱序的真实事件不会被误删，状态大小也不会随运行时间增长。
 内存不足另有不分配 Rust 堆、不加锁的紧急路径：先用预先转换好的固定文件名追加
 `pinbridge_oom.log`，再发布一个原子保底槽并尝试写高优先级环。脚本宿主先处理当次可用的
 环记录，缺失时读取保底槽，并按 `occurrence` 去重迟到的环记录，因此同一次原生回调只调用一次 Python。并发 OOM
 回调不会互相等待；保底槽正被写入的事件仍保留独立紧急日志和高优先级环尝试。
-`pinbridge-agent.log` 的 Fini 行提供 `priority_total`、`priority_dropped` 和 `oom_total`。
+`pinbridge-agent.log` 的 Fini 行提供 `priority_total/priority_dropped`、
+`observation_total/observation_dropped` 和 `oom_total`。
 自动测试覆盖紧急行格式、保底槽/环去重和事件字段；真实耗尽内存可能破坏测试机稳定性，
 因此不把它列为已强制触发的回归。
 
@@ -483,9 +492,12 @@ exit_id = pb.intercept("syscall.exit", after, numbers=[0x0F])
 - `None` 表示不修改，插件可在回调中调用 `pb.unintercept(id)` 结束常驻拦截；
 - 同一字段的多插件返回冲突、异常、超时或槽满时保留原上下文。
 
-同步过滤与异步 `pb.on("syscall")`/`pb.on_syscall` 分开管理。真实回归入口为
+同步过滤与异步观察分开管理。命名接口使用
+`pb.on("syscall", callback, numbers=[...])`，旧固定回调继续用 `pb.on_syscall(numbers=[...])`
+声明号码；所有运行插件的号码取并集后编译成原生位图。真实回归入口为
 `fixtures/syscall_python_demo/run.ps1`：第一轮在 entry 把 `NtClose` 句柄改为无效值，
-第二轮让内核真正关闭句柄，再在 exit 修改 NTSTATUS。
+第二轮让内核真正关闭句柄，再在 exit 修改 NTSTATUS；同一用例按 `syscall_generation`
+验证命名/旧回调各自无重复、两者事件集合一致且独立观察环丢失为 0。
 
 ### 同步异常接管
 

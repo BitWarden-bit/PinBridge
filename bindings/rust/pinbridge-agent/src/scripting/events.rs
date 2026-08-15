@@ -8,9 +8,69 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use pinbridge_proto::EventRecord;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
+use std::cell::RefCell;
+use std::rc::Rc;
 
 const CONTEXT_CHANGE_EXCEPTION: u64 = 4;
 static NEXT_SUBSCRIPTION_ID: AtomicU64 = AtomicU64::new(1);
+
+const GENERATION_WINDOW_BITS: u64 = 65_536;
+const GENERATION_WINDOW_WORDS: usize = GENERATION_WINDOW_BITS as usize / 64;
+
+/// Bounded exact-once window for mirrored events whose native producers may
+/// publish out of generation order on different application threads.
+pub struct GenerationWindow {
+    ignore_through: u64,
+    highest: u64,
+    bits: Box<[u64]>,
+}
+
+impl GenerationWindow {
+    pub fn new(ignore_through: u64) -> Self {
+        Self {
+            ignore_through,
+            highest: ignore_through,
+            bits: vec![0; GENERATION_WINDOW_WORDS].into_boxed_slice(),
+        }
+    }
+
+    /// True only for the first copy of a generation inside the retained
+    /// window. Generations older than a full main-ring-sized window are
+    /// treated as stale rather than risking a duplicate Python callback.
+    pub fn accept(&mut self, generation: u64) -> bool {
+        if generation == 0 || generation <= self.ignore_through {
+            return false;
+        }
+        if generation > self.highest {
+            let advance = generation - self.highest;
+            if advance >= GENERATION_WINDOW_BITS {
+                self.bits.fill(0);
+            } else {
+                for value in self.highest + 1..=generation {
+                    let bit = value % GENERATION_WINDOW_BITS;
+                    self.bits[bit as usize / 64] &= !(1u64 << (bit % 64));
+                }
+            }
+            self.highest = generation;
+        } else if self.highest - generation >= GENERATION_WINDOW_BITS {
+            return false;
+        }
+        let bit = generation % GENERATION_WINDOW_BITS;
+        let word = &mut self.bits[bit as usize / 64];
+        let mask = 1u64 << (bit % 64);
+        if *word & mask != 0 {
+            return false;
+        }
+        *word |= mask;
+        true
+    }
+}
+
+pub type SharedGenerationWindow = Rc<RefCell<GenerationWindow>>;
+
+pub fn shared_generation_window(ignore_through: u64) -> SharedGenerationWindow {
+    Rc::new(RefCell::new(GenerationWindow::new(ignore_through)))
+}
 
 pub const PUBLIC_EVENT_NAMES: [&str; 27] = [
     "process.start",
@@ -210,6 +270,12 @@ pub struct EventSubscription {
     pub callback: Py<PyAny>,
     pub once: bool,
     pub order: u64,
+    /// Per-handler native syscall-number interest. None means all numbers.
+    /// Other selector kinds always keep this as None.
+    pub syscall_numbers: Option<crate::TlsFreeSet<u32>>,
+    /// Exact-once state shared with the current dispatch snapshot. This is
+    /// separate per handler so named and legacy APIs may coexist.
+    pub syscall_generations: SharedGenerationWindow,
     /// Sticky process events are replayed once to handlers registered after
     /// the native edge.  This flag is per subscription, so adding a second
     /// handler later still receives the current lifecycle state.
@@ -224,7 +290,12 @@ pub struct EventSubscription {
 }
 
 impl EventSubscription {
-    pub fn new(selector: EventSelector, callback: Py<PyAny>, once: bool) -> (u64, Self) {
+    pub fn new(
+        selector: EventSelector,
+        callback: Py<PyAny>,
+        once: bool,
+        syscall_numbers: Option<crate::TlsFreeSet<u32>>,
+    ) -> (u64, Self) {
         let id = NEXT_SUBSCRIPTION_ID.fetch_add(1, Ordering::Relaxed);
         let oom_generation = if selector == EventSelector::Kind(EVENT_OUT_OF_MEMORY) {
             crate::high_priority::oom_snapshot()
@@ -253,6 +324,10 @@ impl EventSubscription {
                 callback,
                 once,
                 order: id,
+                syscall_numbers,
+                syscall_generations: shared_generation_window(
+                    crate::syscall_engine::generation(),
+                ),
                 sticky_delivered: false,
                 oom_generation,
                 mirror_generation,
@@ -460,6 +535,7 @@ pub fn build_event_dict(
             let phase = if event.arg1 == 0 { "enter" } else { "exit" };
             row.set_item("number", event.arg0)?;
             row.set_item("phase", phase)?;
+            row.set_item("syscall_generation", event.address)?;
             if event.arg1 == 0 {
                 row.set_item(
                     "args",
@@ -682,5 +758,20 @@ mod tests {
             ..ring_copy
         };
         assert_eq!(unseen_exception_generation(21, &non_exception), None);
+    }
+
+    #[test]
+    fn generation_window_deduplicates_mirrors_without_dropping_reordered_events() {
+        let mut window = GenerationWindow::new(30);
+        assert!(window.accept(32));
+        assert!(window.accept(31));
+        assert!(!window.accept(32));
+        assert!(!window.accept(31));
+        assert!(!window.accept(30));
+
+        assert!(window.accept(70_000));
+        assert!(!window.accept(1));
+        assert!(!window.accept(1_000));
+        assert!(!window.accept(70_000));
     }
 }

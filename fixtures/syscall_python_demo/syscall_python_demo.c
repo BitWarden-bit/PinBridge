@@ -20,6 +20,8 @@ int main(void)
     BOOL survived_first = SetEvent(event);
     NTSTATUS second = nt_close(event);
     BOOL closed_after_second = !CloseHandle(event) && GetLastError() == ERROR_INVALID_HANDLE;
+    /* Let both Python observation APIs drain the target calls' edges. */
+    Sleep(750);
     printf("syscall_python_demo: first=0x%08lx second=0x%08lx survived=%d closed=%d\n",
            (unsigned long)first, (unsigned long)second,
            (int)survived_first, (int)closed_after_second);

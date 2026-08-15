@@ -94,11 +94,19 @@ try {
     if (-not $pinProcess.HasExited) { throw "target did not exit" }
     [void]$pinProcess.WaitForExit()
     if (Test-Path -LiteralPath $log) { $captured += "`n" + (Get-Content -LiteralPath $log -Raw) }
-    foreach ($marker in @("SYSCALL_INTERCEPT_READY", "SYSCALL_ENTRY_INTERCEPT_PASS", "SYSCALL_EXIT_INTERCEPT_PASS hit=2")) {
+    foreach ($marker in @(
+        "SYSCALL_INTERCEPT_READY",
+        "SYSCALL_ENTRY_INTERCEPT_PASS",
+        "SYSCALL_EXIT_INTERCEPT_PASS hit=2",
+        "SYSCALL_OBSERVE_EXACT_ONCE"
+    )) {
         if (-not $captured.Contains($marker)) { throw "missing callback marker: $marker" }
     }
     if (-not $captured.Contains("sync_decisions=3 sync_timeouts=0 sync_busy=0")) {
         throw "native synchronous syscall counters did not confirm three decisions"
+    }
+    if (-not $captured.Contains("observation_dropped=0")) {
+        throw "filtered syscall observation lane dropped events"
     }
     $targetOutput = $stdoutTask.Result.Trim()
     $targetError = $stderrTask.Result.Trim()
@@ -109,6 +117,9 @@ try {
         result = "SYSCALL_PYTHON_INTERCEPT_PASS"
         target_exit = $pinProcess.ExitCode
         decisions = 3
+        named_observer_exact_once = $true
+        legacy_observer_exact_once = $true
+        observation_dropped = 0
         target_output = $targetOutput
     } | ConvertTo-Json -Depth 3
 } finally {

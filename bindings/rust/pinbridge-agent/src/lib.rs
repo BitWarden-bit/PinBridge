@@ -15,6 +15,7 @@ mod debugger;
 mod emergency;
 mod engines;
 mod event;
+mod event_channel;
 mod exception;
 mod hooks;
 mod high_priority;
@@ -22,6 +23,7 @@ mod instrumentation_lifecycle;
 mod lifecycle;
 mod log;
 mod modules;
+mod observation;
 mod pin_session;
 mod priority;
 mod query_server;
@@ -101,6 +103,10 @@ fn agent_main(argc: c_int, argv: *mut *mut c_char) -> c_int {
         if priority::init() != PB_OK {
             log::line("priority queue init failed");
             return 12;
+        }
+        if observation::init() != PB_OK {
+            log::line("filtered observation queue init failed");
+            return 20;
         }
         let bp_status = bp::init();
         log::line(&format!("breakpoint engine init -> {bp_status}"));
@@ -223,9 +229,11 @@ unsafe extern "C" fn on_fini(code: i32, _user_data: *mut c_void) {
     let (child_decisions, child_follow, child_reject) = child_process::decision_counts();
     let (sync_decisions, sync_timeouts, sync_busy) = sync_intercept::stats();
     crate::log::line(&format!(
-        "fini code={code} exit_probes={exit_probes} exit_hits={exit_hits} native_prepare={native_prepare} priority_total={} priority_dropped={} oom_total={} child_decisions={child_decisions} child_follow={child_follow} child_reject={child_reject} child_decision_timeouts={} sync_decisions={sync_decisions} sync_timeouts={sync_timeouts} sync_busy={sync_busy}",
+        "fini code={code} exit_probes={exit_probes} exit_hits={exit_hits} native_prepare={native_prepare} priority_total={} priority_dropped={} observation_total={} observation_dropped={} oom_total={} child_decisions={child_decisions} child_follow={child_follow} child_reject={child_reject} child_decision_timeouts={} sync_decisions={sync_decisions} sync_timeouts={sync_timeouts} sync_busy={sync_busy}",
         priority::total(),
         priority::dropped(),
+        observation::total(),
+        observation::dropped(),
         high_priority::oom_total(),
         child_process::timeout_count(),
     ));
