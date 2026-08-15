@@ -11,12 +11,13 @@ $repo = (Resolve-Path -LiteralPath (Join-Path $dir "..\..")).Path
 $bundle = Split-Path -Parent $repo
 $target = Join-Path $dir "child_follow_demo_x64.exe"
 $plugin = Join-Path $dir "child_decision.py"
+$badReplacement = Join-Path $dir "bad\child_decision.py"
 $childPlugin = Join-Path $dir "child_session.py"
 $cli = Join-Path $repo "bindings\rust\target\release\pinbridge-cli.exe"
 $agent = Join-Path $repo "bindings\rust\target\release\pinbridge_agent.dll"
 $pin = Join-Path $bundle "VMP_Offline_Recovery_Kit_20260803_FINAL\runtime\pin\intel64\bin\pin.exe"
 
-foreach ($path in @($target, $plugin, $childPlugin, $cli, $agent, $pin)) {
+foreach ($path in @($target, $plugin, $badReplacement, $childPlugin, $cli, $agent, $pin)) {
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
         throw "required file not found: $path"
     }
@@ -114,6 +115,30 @@ try {
     }
     if (-not $loaded) { throw "Python plugin did not load" }
 
+    $readyOutput = ""
+    while ([datetime]::UtcNow -lt $deadline -and
+           -not $readyOutput.Contains("CHILD_DECISION_READY")) {
+        try { $readyOutput = Invoke-Cli -Command @("script", "output") } catch {}
+        Start-Sleep -Milliseconds 50
+    }
+    if (-not $readyOutput.Contains("CHILD_DECISION_READY")) {
+        throw "original child decision plugin did not enter running state"
+    }
+    $badRejected = $false
+    try {
+        [void](Invoke-Cli -Command @("script", "run", $badReplacement))
+    } catch {
+        $badRejected = $true
+    }
+    if (-not $badRejected) { throw "syntax-invalid same-name replacement was accepted" }
+    $pluginsAfterBadLoad = Invoke-Cli -Command @("script", "list") | ConvertFrom-Json
+    $originalStillRunning = @($pluginsAfterBadLoad.plugins | Where-Object {
+        $_.name -eq "child_decision.py" -and [int]$_.state -eq 1
+    }).Count -eq 1
+    if (-not $originalStillRunning) {
+        throw "syntax-invalid update retired the running plugin"
+    }
+
     $childPort = 0
     $childOutput = ""
     if ($Follow) {
@@ -201,6 +226,7 @@ try {
         requested_follow = $Follow
         target_exit = $pinProcess.ExitCode
         callback = $true
+        bad_replacement_preserved_original = $true
         child_control_port = $(if ($Follow) { $childPort } else { $null })
         child_python = $(if ($Follow) { $true } else { $false })
         target_output = $targetOutput

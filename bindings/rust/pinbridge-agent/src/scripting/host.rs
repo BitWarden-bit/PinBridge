@@ -613,14 +613,10 @@ fn cmd_load(
         return Err("python unavailable: python310.dll not loaded".to_string());
     }
     crate::diag::heap_check("cmd_load pre");
-    let replaced = with_registry(|r| r.contains_key(name));
-    if replaced {
-        retire_plugin(name, "replaced");
-    }
     let c_source =
         std::ffi::CString::new(source).map_err(|_| "source contains a NUL byte".to_string())?;
     let c_name = std::ffi::CString::new(name).map_err(|_| "bad plugin name".to_string())?;
-    Python::with_gil(|py| {
+    let code = Python::with_gil(|py| {
         let code = unsafe {
             pyo3::ffi::Py_CompileString(
                 c_source.as_ptr(),
@@ -636,9 +632,21 @@ fn cmd_load(
             output::push(name, &format!("compile error: {text}"));
             return Err(text);
         }
-        pending.push((name.to_string(), unsafe { Py::from_owned_ptr(py, code) }));
-        Ok(1)
-    })
+        Ok(unsafe { Py::from_owned_ptr(py, code) })
+    })?;
+
+    // A broken update must never destroy the currently running plugin.
+    // Retire only after compilation succeeded. Multiple compile-only loads
+    // for the same name before the next tick collapse to the newest code;
+    // the superseded Py code object is dropped while the GIL is held.
+    if with_registry(|registry| registry.contains_key(name)) {
+        retire_plugin(name, "replaced");
+    }
+    Python::with_gil(|_py| {
+        pending.retain(|(pending_name, _)| pending_name != name);
+        pending.push((name.to_string(), code));
+    });
+    Ok(1)
 }
 
 fn cmd_unload(name: &str) {
