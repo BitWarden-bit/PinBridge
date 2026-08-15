@@ -14,6 +14,7 @@ mod engines;
 mod event;
 mod exception;
 mod hooks;
+mod lifecycle;
 mod log;
 mod modules;
 mod query_server;
@@ -65,6 +66,14 @@ pub fn new_set<K>() -> TlsFreeSet<K> {
 fn agent_main(argc: c_int, argv: *mut *mut c_char) -> c_int {
     log::init();
     unsafe {
+        // Routine-name instrumentation (including the early process-exit
+        // edge) requires Pin's symbol manager. Pin requires this before
+        // pb_pin_init/PIN_Init.
+        let symbols_status = pb_pin_init_symbols();
+        log::line(&format!("pb_pin_init_symbols -> {symbols_status}"));
+        if symbols_status != PB_OK {
+            return 11;
+        }
         if pb_pin_init(argc, argv) != PB_OK {
             log::line("pb_pin_init failed");
             return 1;
@@ -132,9 +141,13 @@ fn agent_main(argc: c_int, argv: *mut *mut c_char) -> c_int {
         let syscall_status = syscall_engine::register();
         let exception_status = exception::register();
         let modules_status = modules::register();
+        let lifecycle_status = lifecycle::register();
         log::line(&format!(
-            "engines: syscall -> {syscall_status}, exception -> {exception_status}, modules -> {modules_status}"
+            "engines: syscall -> {syscall_status}, exception -> {exception_status}, modules -> {modules_status}, lifecycle -> {lifecycle_status}"
         ));
+        if lifecycle_status != PB_OK {
+            return 10;
+        }
         if std::env::var("PINBRIDGE_ENTRY_BP").ok().as_deref() == Some("1") {
             // The main image is not in the image list at tool-init time, so
             // plant the one-shot entry breakpoint from the image-load
@@ -183,8 +196,12 @@ unsafe extern "C" fn on_img_load(img: PbImgHandle, _user_data: *mut c_void) {
 #[cfg(not(test))]
 pinbridge_tool::tool_entry!(agent_main);
 
-unsafe extern "C" fn on_fini(_code: i32, _user_data: *mut c_void) {
-    crate::log::line("fini");
+unsafe extern "C" fn on_fini(code: i32, _user_data: *mut c_void) {
+    lifecycle::record_fini(code);
+    let (exit_probes, exit_hits) = lifecycle::exit_probe_counts();
+    crate::log::line(&format!(
+        "fini code={code} exit_probes={exit_probes} exit_hits={exit_hits}"
+    ));
     let (trace_start, trace_end) = engines::trace_range();
     let (hook_start, hook_end) = engines::hook_range();
     // Copy under a try-locked Pin mutex into a reserved buffer; formatting

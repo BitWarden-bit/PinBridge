@@ -41,6 +41,22 @@ pub const EVENT_REG_SNAPSHOT: u32 = 13;
 /// register slots, and `arg5..arg7` are the first three ABI stack arguments.
 pub const EVENT_HOOK_RETURN: u32 = 14;
 
+// Low-frequency process lifecycle kinds.  They use the same wire record as
+// telemetry, but are consumed by the scripting host's named subscriptions
+// (`pb.on("thread.start", ...)`, etc.).  Keep these ids below 32 so old
+// u32 watch masks can still represent them when a diagnostic consumer asks
+// for the raw records.
+/// Pin application thread created. arg0=flags, address=context IP.
+pub const EVENT_THREAD_START: u32 = 15;
+/// Pin application thread exited. arg0=exit code, address=context IP.
+pub const EVENT_THREAD_EXIT: u32 = 16;
+/// The application is about to begin executing.
+pub const EVENT_PROCESS_START: u32 = 17;
+/// Pin entered PrepareForFini; this is the last Python-deliverable exit edge.
+pub const EVENT_PROCESS_EXIT: u32 = 18;
+/// Native-only final fini edge. Python delivery is not promised at this point.
+pub const EVENT_PROCESS_FINI: u32 = 19;
+
 pub const EVENT_KIND_COUNT: usize = 9;
 
 #[repr(C)]
@@ -89,19 +105,28 @@ impl Event {
     };
 
     pub fn kind_name(&self) -> &'static str {
-        match self.kind {
-            EVENT_HOOK_REGS => "hook_regs",
-            EVENT_MEMORY => "memory",
-            EVENT_EXEC => "exec",
-            EVENT_BRANCH_EDGE => "branch_edge",
-            EVENT_SYSCALL => "syscall",
-            EVENT_CONTEXT_CHANGE => "context_change",
-            EVENT_MODULE_LOAD => "module_load",
-            EVENT_MODULE_UNLOAD => "module_unload",
-            EVENT_REPEAT => "repeat",
-            EVENT_REG_SNAPSHOT => "reg_snapshot",
-            EVENT_HOOK_RETURN => "hook_return",
-            _ => "unknown",
-        }
+        kind_name(self.kind)
+    }
+}
+
+pub fn kind_name(kind: u32) -> &'static str {
+    match kind {
+        EVENT_HOOK_REGS => "hook_regs",
+        EVENT_MEMORY => "memory",
+        EVENT_EXEC => "exec",
+        EVENT_BRANCH_EDGE => "branch_edge",
+        EVENT_SYSCALL => "syscall",
+        EVENT_CONTEXT_CHANGE => "context_change",
+        EVENT_MODULE_LOAD => "module_load",
+        EVENT_MODULE_UNLOAD => "module_unload",
+        EVENT_REPEAT => "repeat",
+        EVENT_REG_SNAPSHOT => "reg_snapshot",
+        EVENT_HOOK_RETURN => "hook_return",
+        EVENT_THREAD_START => "thread_start",
+        EVENT_THREAD_EXIT => "thread_exit",
+        EVENT_PROCESS_START => "process_start",
+        EVENT_PROCESS_EXIT => "process_exit",
+        EVENT_PROCESS_FINI => "process_fini",
+        _ => "unknown",
     }
 }

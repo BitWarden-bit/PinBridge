@@ -9,6 +9,7 @@
 //!      server answered the load;
 //!   3. the tick's client connection is closed before Python runs.
 
+use super::events::{self, EventSelector};
 use super::output;
 use super::subscriptions::{self, merge_action, StopAction};
 use super::{
@@ -718,6 +719,7 @@ fn exec_one(name: &str, code: Py<PyAny>, port: u16) {
             on_event_batch: None,
             on_stop: None,
             on_unload: None,
+            events: crate::new_map(),
             breakpoints: crate::new_map(),
             filters: super::Filters::default(),
             cursor: 0,
@@ -832,6 +834,7 @@ fn consumes_ring(p: &Plugin) -> bool {
         || p.on_syscall.is_some()
         || p.on_module_load.is_some()
         || p.on_module_unload.is_some()
+        || !p.events.is_empty()
         || (p.on_event_batch.is_some() && p.filters.watch.is_some())
 }
 
@@ -884,7 +887,13 @@ fn tick(pending: &mut Vec<(String, Py<PyAny>)>, port: u16) {
     });
     let knobs_dirty = NATIVE_DIRTY.swap(false, Ordering::AcqRel);
     let pending_native_removals = subscriptions::has_native_removals();
-    if min_cursor.is_none() && !wants_stop && !knobs_dirty && !pending_native_removals {
+    let exit_delivery_pending = crate::lifecycle::exit_delivery_pending();
+    if min_cursor.is_none()
+        && !wants_stop
+        && !knobs_dirty
+        && !pending_native_removals
+        && !exit_delivery_pending
+    {
         return;
     }
     diag("tick conn begin");
@@ -966,21 +975,26 @@ fn tick(pending: &mut Vec<(String, Py<PyAny>)>, port: u16) {
         return; // free the host for the parked script op
     }
     // Phase 2: per-plugin dispatch (their pb.* RPCs get a free server).
-    let stop_action = Python::with_gil(|py| {
+    let (stop_action, dispatch_completed) = Python::with_gil(|py| {
         let names = with_registry(|r| {
             let mut names: Vec<String> = r.keys().cloned().collect();
             names.sort();
             names
         });
         let action = dispatch_bound_breakpoints(py, &names, &shared);
+        let mut completed = true;
         for name in &names {
             if send_waiting() {
+                completed = false;
                 break; // script op parked on the server: stop dialing it
             }
             dispatch_one(py, name, &shared);
         }
-        action
+        (action, completed)
     });
+    if dispatch_completed && exit_delivery_pending {
+        crate::lifecycle::acknowledge_exit_delivery();
+    }
     apply_stop_action(port, stop_action, &shared);
     diag("tick dispatch end");
 }
@@ -994,27 +1008,62 @@ fn diag(msg: &str) {
     }
 }
 
-/// Union native knobs: syscall engine on while any plugin wants syscalls;
-/// the native number filter is the UNION of plugin filters (any plugin with
-/// None = mode all). Runs on the scripting thread inside the connected
-/// phase, never in an analysis callback.
+/// Union native requirements across fixed callbacks, named handlers and
+/// batch watches. Enabling is monotonic here: a script must not switch off
+/// an engine that a CLI/UI session enabled independently. Syscall filters
+/// are still recomputed as a union because they are script-owned policy.
+/// Runs on the scripting thread, never in an analysis callback.
 fn recompute_native_knobs(client: &mut TickClient) {
-    let (any, all, union) = with_registry(|r| {
+    let (any, all, union, telemetry) = with_registry(|r| {
         let mut any = false;
         let mut all = false;
         let mut union = crate::new_set();
+        let mut telemetry = [false; 3]; // memory, exec, branch
         for p in r.values() {
-            if p.state != STATE_RUNNING || p.on_syscall.is_none() {
+            if p.state != STATE_RUNNING {
+                continue;
+            }
+            for subscription in p.events.values() {
+                match subscription.selector {
+                    EventSelector::Kind(EVENT_MEMORY) => telemetry[0] = true,
+                    EventSelector::Kind(EVENT_EXEC) => telemetry[1] = true,
+                    EventSelector::Kind(EVENT_BRANCH_EDGE) => telemetry[2] = true,
+                    _ => {}
+                }
+            }
+            if let Some(watch) = &p.filters.watch {
+                telemetry[0] |= watch.kinds_mask & (1u32 << EVENT_MEMORY) != 0;
+                telemetry[1] |= watch.kinds_mask & (1u32 << EVENT_EXEC) != 0;
+                telemetry[2] |= watch.kinds_mask & (1u32 << EVENT_BRANCH_EDGE) != 0;
+            }
+            let generic_syscall = p
+                .events
+                .values()
+                .any(|subscription| subscription.selector == EventSelector::Kind(EVENT_SYSCALL));
+            if p.on_syscall.is_none() && !generic_syscall {
                 continue;
             }
             any = true;
+            if generic_syscall {
+                // Named event subscriptions currently have no number
+                // filter, so their native requirement is the full stream.
+                all = true;
+            }
             match &p.filters.syscall_numbers {
                 None => all = true,
                 Some(numbers) => union.extend(numbers.iter().copied()),
             }
         }
-        (any, all, union)
+        (any, all, union, telemetry)
     });
+    for (kind, enabled) in [EVENT_MEMORY, EVENT_EXEC, EVENT_BRANCH_EDGE]
+        .into_iter()
+        .zip(telemetry)
+    {
+        if enabled {
+            let _ = client.engine_set(kind, true);
+        }
+    }
     if any {
         let _ = client.engine_set(EVENT_SYSCALL, true);
     }
@@ -1232,6 +1281,15 @@ fn apply_stop_action(port: u16, action: Option<StopAction>, shared: &TickShared)
 
 /// Callbacks a dispatch may invoke, cloned out of the registry (under the
 /// GIL) so no registry reference is ever held across a Python call.
+struct EventHandlerSnapshot {
+    id: u64,
+    selector: EventSelector,
+    callback: Py<PyAny>,
+    once: bool,
+    order: u64,
+    sticky_delivered: bool,
+}
+
 struct DispatchSnapshot {
     cursor: u64,
     last_stop_gen: u64,
@@ -1242,6 +1300,7 @@ struct DispatchSnapshot {
     on_module_unload: Option<Py<PyAny>>,
     on_event_batch: Option<Py<PyAny>>,
     on_stop: Option<Py<PyAny>>,
+    event_handlers: Vec<EventHandlerSnapshot>,
     exc_codes: Option<crate::TlsFreeSet<u32>>,
     syscall_numbers: Option<crate::TlsFreeSet<u32>>,
     watch: Option<(u32, u64, u64, u64)>, // mask, lo, hi, batch
@@ -1254,6 +1313,19 @@ fn dispatch_one(py: Python<'_>, name: &str, shared: &TickShared) {
         if plugin.state != STATE_RUNNING {
             return None;
         }
+        let mut event_handlers: Vec<EventHandlerSnapshot> = plugin
+            .events
+            .iter()
+            .map(|(id, subscription)| EventHandlerSnapshot {
+                id: *id,
+                selector: subscription.selector,
+                callback: subscription.callback.clone_ref(py),
+                once: subscription.once,
+                order: subscription.order,
+                sticky_delivered: subscription.sticky_delivered,
+            })
+            .collect();
+        event_handlers.sort_by_key(|handler| handler.order);
         Some(DispatchSnapshot {
             cursor: plugin.cursor,
             last_stop_gen: plugin.last_stop_gen,
@@ -1264,6 +1336,7 @@ fn dispatch_one(py: Python<'_>, name: &str, shared: &TickShared) {
             on_module_unload: plugin.on_module_unload.as_ref().map(|c| c.clone_ref(py)),
             on_event_batch: plugin.on_event_batch.as_ref().map(|c| c.clone_ref(py)),
             on_stop: plugin.on_stop.as_ref().map(|c| c.clone_ref(py)),
+            event_handlers,
             exc_codes: plugin.filters.exc_codes.clone(),
             syscall_numbers: plugin.filters.syscall_numbers.clone(),
             watch: plugin
@@ -1281,13 +1354,47 @@ fn dispatch_one(py: Python<'_>, name: &str, shared: &TickShared) {
     let mut delivered: u64 = 0;
     let mut dropped: u64 = 0;
     let mut failed: Option<String> = None;
+    let mut remove_event_handlers: Vec<u64> = Vec::new();
+    let mut delivered_sticky_handlers: Vec<u64> = Vec::new();
 
     // Every callback runs with the plugin context set, so pb.print carries
     // the plugin name and pb.on_*/pb.watch inside callbacks mutate this
     // plugin's filters.
     with_plugin_context(name, || {
+        // Lifecycle state is sticky: plugins usually load after Pin's
+        // application-start edge, so each new subscription receives the
+        // current state once instead of losing it behind a fresh cursor.
+        if crate::lifecycle::process_started() {
+            let event = events::synthetic_process_event(crate::event::EVENT_PROCESS_START);
+            let _ = route_named_handlers(
+                py,
+                &mut s.event_handlers,
+                &event,
+                shared,
+                &mut delivered,
+                &mut failed,
+                &mut remove_event_handlers,
+                &mut delivered_sticky_handlers,
+            );
+        }
+        if failed.is_none() && crate::lifecycle::process_exiting() {
+            let mut event = events::synthetic_process_event(crate::event::EVENT_PROCESS_EXIT);
+            event.arg0 = crate::lifecycle::process_exit_code() as i64 as u64;
+            event.arg1 = crate::lifecycle::process_exit_source() as u64;
+            let _ = route_named_handlers(
+                py,
+                &mut s.event_handlers,
+                &event,
+                shared,
+                &mut delivered,
+                &mut failed,
+                &mut remove_event_handlers,
+                &mut delivered_sticky_handlers,
+            );
+        }
+
         // Stop-gen edge: on_bp_hit first, then on_stop (tid -1 = manual pause).
-        if shared.stop_gen > s.last_stop_gen {
+        if failed.is_none() && shared.stop_gen > s.last_stop_gen {
             s.last_stop_gen = shared.stop_gen;
             if shared.stopped {
                 let tid: i64 = if shared.hit_tid == u32::MAX {
@@ -1338,6 +1445,18 @@ fn dispatch_one(py: Python<'_>, name: &str, shared: &TickShared) {
                 if route_event(py, &s, event, shared, &mut delivered, &mut failed) {
                     break; // callback failed: plugin marked error below
                 }
+                if route_named_handlers(
+                    py,
+                    &mut s.event_handlers,
+                    event,
+                    shared,
+                    &mut delivered,
+                    &mut failed,
+                    &mut remove_event_handlers,
+                    &mut delivered_sticky_handlers,
+                ) {
+                    break;
+                }
                 if s.on_event_batch.is_some() {
                     if let Some((mask, lo, hi, _batch)) = &s.watch {
                         if (mask & (1u32 << event.kind)) != 0
@@ -1380,6 +1499,14 @@ fn dispatch_one(py: Python<'_>, name: &str, shared: &TickShared) {
             p.last_stop_gen = s.last_stop_gen;
             p.delivered += delivered;
             p.dropped += dropped;
+            for id in &delivered_sticky_handlers {
+                if let Some(subscription) = p.events.get_mut(id) {
+                    subscription.sticky_delivered = true;
+                }
+            }
+            for id in &remove_event_handlers {
+                p.events.remove(id);
+            }
             if failed.is_some() {
                 p.state = STATE_ERROR;
             }
@@ -1392,6 +1519,66 @@ fn dispatch_one(py: Python<'_>, name: &str, shared: &TickShared) {
         output::push(name, &format!("callback failed: {what}"));
         crate::log::line(&format!("plugin {name} callback failed: {what}"));
     }
+}
+
+/// Routes one event through the plugin's ordered `pb.on(...)` handlers.
+/// The snapshot is mutable only to suppress a duplicate raw lifecycle edge
+/// after a sticky replay during the same tick; registry state is written
+/// back after every Python callback has returned.
+#[allow(clippy::too_many_arguments)]
+fn route_named_handlers(
+    py: Python<'_>,
+    handlers: &mut [EventHandlerSnapshot],
+    event: &pinbridge_proto::EventRecord,
+    shared: &TickShared,
+    delivered: &mut u64,
+    failed: &mut Option<String>,
+    removals: &mut Vec<u64>,
+    sticky_deliveries: &mut Vec<u64>,
+) -> bool {
+    for handler in handlers {
+        if !handler.selector.matches(event) {
+            continue;
+        }
+        if handler.selector.is_sticky() && handler.sticky_delivered {
+            continue;
+        }
+
+        if handler.selector.is_sticky() {
+            handler.sticky_delivered = true;
+            if !sticky_deliveries.contains(&handler.id) {
+                sticky_deliveries.push(handler.id);
+            }
+        }
+        if handler.once && !removals.contains(&handler.id) {
+            removals.push(handler.id);
+        }
+
+        let module_name = match event.kind {
+            EVENT_MODULE_LOAD | EVENT_MODULE_UNLOAD => {
+                shared.module_names.get(&event.arg0).map(String::as_str)
+            }
+            _ => None,
+        };
+        let event_dict = match events::build_event_dict(py, handler.selector, event, module_name) {
+            Ok(event_dict) => event_dict,
+            Err(error) => {
+                *failed = Some(format!(
+                    "pb.on({}): event build failed: {error}",
+                    handler.selector.event_type()
+                ));
+                return true;
+            }
+        };
+        match handler.callback.call1(py, (event_dict,)) {
+            Ok(_) => *delivered += 1,
+            Err(error) => {
+                *failed = Some(format!("pb.on({}): {error}", handler.selector.event_type()));
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Routes one ring event to its dedicated callback. Returns true when a
@@ -1533,16 +1720,5 @@ fn build_event_list(
 }
 
 fn kind_name(kind: u32) -> &'static str {
-    match kind {
-        EVENT_HOOK_REGS => "hook_regs",
-        EVENT_MEMORY => "memory",
-        EVENT_EXEC => "exec",
-        EVENT_BRANCH_EDGE => "branch_edge",
-        EVENT_SYSCALL => "syscall",
-        EVENT_CONTEXT_CHANGE => "context_change",
-        EVENT_MODULE_LOAD => "module_load",
-        EVENT_MODULE_UNLOAD => "module_unload",
-        crate::event::EVENT_HOOK_RETURN => "hook_return",
-        _ => "unknown",
-    }
+    crate::event::kind_name(kind)
 }

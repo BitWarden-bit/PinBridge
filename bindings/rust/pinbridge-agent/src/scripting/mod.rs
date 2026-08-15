@@ -27,6 +27,7 @@ use std::sync::mpsc::Sender;
 use crate::{new_map, TlsFreeMap, TlsFreeSet};
 
 pub mod api;
+mod events;
 mod host;
 pub mod output;
 mod python_data;
@@ -117,6 +118,9 @@ pub struct Plugin {
     pub on_event_batch: Option<Py<PyAny>>,
     pub on_stop: Option<Py<PyAny>>,
     pub on_unload: Option<Py<PyAny>>,
+    /// Named `pb.on(...)` subscriptions. Multiple handlers may observe the
+    /// same event without creating more native Pin callbacks.
+    pub events: TlsFreeMap<u64, events::EventSubscription>,
     /// New-style callbacks bound to exact native breakpoint ids.  Legacy
     /// `on_bp_hit` remains separate and receives every stop notification.
     pub breakpoints: TlsFreeMap<u32, subscriptions::BreakpointSubscription>,

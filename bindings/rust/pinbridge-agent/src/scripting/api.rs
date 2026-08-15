@@ -10,6 +10,7 @@
 //! handled explicitly (panic="abort" would turn any panic into a process
 //! abort inside the target).
 
+use super::events::{EventSelector, EventSubscription, PUBLIC_EVENT_NAMES};
 use super::host::{connect, mark_native_dirty, BATCH_MAX};
 use super::output;
 use super::subscriptions::{self, BreakpointSubscription};
@@ -463,6 +464,55 @@ fn pb_trace_status() -> Option<(bool, u64, u64)> {
 
 // ---- registrations (mutate the current plugin's filters) ----
 
+/// Registers a named asynchronous event handler owned by the current
+/// plugin.  Breakpoints use pb.breakpoint because they are synchronous stop
+/// events with a return action; pb.on handles notification events.
+#[pyfunction(name = "on", signature = (event, callback, *, once=false))]
+fn pb_on_event(py: Python<'_>, event: &str, callback: Py<PyAny>, once: bool) -> PyResult<u64> {
+    if current_plugin_name().is_none() {
+        return Err(no_plugin());
+    }
+    if !callback.bind(py).is_callable() {
+        return Err(PyErr::new::<pyo3::exceptions::PyTypeError, _>(
+            "event callback must be callable",
+        ));
+    }
+    if event.trim().eq_ignore_ascii_case("breakpoint") {
+        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+            "breakpoint is a synchronous stop event; use pb.breakpoint(address, callback)",
+        ));
+    }
+    let selector = EventSelector::parse(event).ok_or_else(|| {
+        PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+            "unknown event {event:?}; use pb.event_names() to list supported names"
+        ))
+    })?;
+    let (id, subscription) = EventSubscription::new(selector, callback, once);
+    with_current_plugin_mut(|plugin| plugin.events.insert(id, subscription))
+        .ok_or_else(no_plugin)?;
+    mark_native_dirty();
+    Ok(id)
+}
+
+/// Removes one named event handler from the current plugin.
+#[pyfunction(name = "off")]
+fn pb_off_event(subscription_id: u64) -> PyResult<bool> {
+    let removed =
+        with_current_plugin_mut(|plugin| plugin.events.remove(&subscription_id).is_some())
+            .ok_or_else(no_plugin)?;
+    if removed {
+        mark_native_dirty();
+    }
+    Ok(removed)
+}
+
+/// Canonical names accepted by pb.on. Breakpoints use pb.breakpoint because
+/// their handlers return a synchronous stop decision.
+#[pyfunction(name = "event_names")]
+fn pb_event_names() -> Vec<&'static str> {
+    PUBLIC_EVENT_NAMES.to_vec()
+}
+
 /// Restrict on_exception to the given codes (None = all).
 #[pyfunction(name = "on_exception", signature = (codes=None))]
 fn pb_on_exception(codes: Option<Vec<u64>>) -> PyResult<()> {
@@ -537,6 +587,7 @@ fn pb_watch(
         });
     })
     .ok_or_else(no_plugin)?;
+    mark_native_dirty();
     Ok(())
 }
 
@@ -544,6 +595,7 @@ fn pb_watch(
 #[pyfunction(name = "unsubscribe")]
 fn pb_unsubscribe() {
     with_current_plugin_mut(|p| p.filters.watch = None);
+    mark_native_dirty();
 }
 
 /// Old name of watch (kept so existing examples keep working).
@@ -610,6 +662,9 @@ fn pb(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(pb_memory_region, m)?)?;
     m.add_function(wrap_pyfunction!(pb_trace_stop, m)?)?;
     m.add_function(wrap_pyfunction!(pb_trace_status, m)?)?;
+    m.add_function(wrap_pyfunction!(pb_on_event, m)?)?;
+    m.add_function(wrap_pyfunction!(pb_off_event, m)?)?;
+    m.add_function(wrap_pyfunction!(pb_event_names, m)?)?;
     m.add_function(wrap_pyfunction!(pb_on_exception, m)?)?;
     m.add_function(wrap_pyfunction!(pb_on_syscall, m)?)?;
     m.add_function(wrap_pyfunction!(pb_on_bp, m)?)?;

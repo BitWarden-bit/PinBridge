@@ -31,3 +31,6 @@ sample_window.pbtr
 fixtures/**/*.stdout.txt
 fixtures/**/*.stderr.txt
 fixtures/**/*.error.txt
+fixtures/lifecycle_demo/*.exe
+fixtures/lifecycle_demo/*.exp
+fixtures/lifecycle_demo/*.lib

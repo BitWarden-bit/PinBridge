@@ -240,3 +240,50 @@ VMP 系保护壳把自己的异常导向 SEH 处理；经典解法是掐 `KiUser
    对 AV 类故障写 `crash_dump.txt`，复现先拿 dump。
 5. **hook 别名去重**:ntdll 的 `Zw*`/`Nt*` 对共享地址，hook 集合按地址去重——
    `hooks` 的数量少于 `exports` 数量是去重，不是丢点。
+
+## 统一事件订阅
+
+新代码使用 `pb.on` 注册命名事件，旧的顶层固定回调继续兼容：
+
+```python
+import pb
+
+def thread_started(event):
+    pb.print("thread %d started at 0x%x" % (event["tid"], event["ip"]))
+
+subscription_id = pb.on("thread.start", thread_started)
+pb.off(subscription_id)
+```
+
+- `pb.on(name, callback, once=False) -> subscription_id`：当前插件订阅一个异步通知；
+- `pb.off(subscription_id) -> bool`：只移除当前插件拥有的订阅；
+- `pb.event_names() -> list[str]`：返回 `pb.on` 接受的规范事件名；
+- 断点是会停止目标的同步事件，必须使用 `pb.breakpoint(address, callback)` 注册。
+
+目前已接入的命名事件：`process.start`、`process.exit`、`thread.start`、
+`thread.exit`、`module.load`、`module.unload`、`exception`、`context.change`、
+`syscall`、`hook.entry`、`hook.return`、`instruction`、`memory`、`branch.edge`。
+
+订阅 `instruction`、`memory`、`branch.edge` 或 `syscall` 会把对应的原生采集引擎加入
+脚本需求并在下一次宿主节拍开启。取消订阅不会擅自关闭可能由 CLI/UI 开启的全局引擎。
+`hook.entry`/`hook.return` 只观察已经用 `pb.hook_set`、`pb.hook_rule` 或 CLI 创建的 Hook
+点；订阅本身不会猜测要 Hook 哪个地址。
+
+所有处理函数接收一个字典。公共字段为 `type`、`sequence`、`kind`、
+`kind_name`、`thread_id`/`tid`、`address`/`addr` 和 `a0..a7`。生命周期字段：
+
+| 事件 | 专用字段 | 说明 |
+|---|---|---|
+| `process.start` | `phase="start"` | 插件晚于应用启动加载时，每个订阅补发一次当前状态 |
+| `process.exit` | `phase="exiting"`, `exit_code`, `source` | 在用户态退出路径、Pin 最终销毁前通知 |
+| `thread.start` | `ip`, `flags` | `tid` 是 Pin 线程号，回调不在该应用线程上运行 |
+| `thread.exit` | `ip`, `exit_code` | 退出码按有符号 64 位值提供 |
+
+原生生命周期回调只写固定大小记录，不分配内存、不获取 GIL，也不等待 Python。
+Python 处理函数统一在脚本内部线程按“插件名、注册顺序”稳定调用。处理函数异常只把
+所属插件置为 error，不会在 Pin 回调栈中传播到目标程序。
+
+原生层在 `RtlExitUserProcess`/`ExitProcess` 入口提前产生 `process.exit`，使 Python 内部
+线程仍有调度机会；`PrepareForFini` 是绕过常规退出 API 时的保底边沿。交接等待默认上限为 1000ms，可在启动前用
+`PINBRIDGE_SCRIPT_EXIT_GRACE_MS=0..5000` 调整。超时后原生层无条件继续退出，Python
+故障不会把被分析进程永久卡在结束阶段。
