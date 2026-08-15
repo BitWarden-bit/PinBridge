@@ -12,7 +12,7 @@ use pyo3::types::PyDict;
 const CONTEXT_CHANGE_EXCEPTION: u64 = 4;
 static NEXT_SUBSCRIPTION_ID: AtomicU64 = AtomicU64::new(1);
 
-pub const PUBLIC_EVENT_NAMES: [&str; 14] = [
+pub const PUBLIC_EVENT_NAMES: [&str; 18] = [
     "process.start",
     "process.exit",
     "thread.start",
@@ -27,6 +27,10 @@ pub const PUBLIC_EVENT_NAMES: [&str; 14] = [
     "instruction",
     "memory",
     "branch.edge",
+    "code.smc",
+    "pin.detach",
+    "pin.attach",
+    "memory.oom",
 ];
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -58,6 +62,10 @@ impl EventSelector {
             "process.exit" | "process_exit" | "process.exit.prepare" | "prepare_fini" => {
                 Self::Kind(EVENT_PROCESS_EXIT)
             }
+            "code.smc" | "smc" | "self_modifying_code" => Self::Kind(EVENT_SMC),
+            "pin.detach" | "pin_detach" => Self::Kind(EVENT_PIN_DETACH),
+            "pin.attach" | "pin_attach" => Self::Kind(EVENT_PIN_ATTACH),
+            "memory.oom" | "out_of_memory" | "oom" => Self::Kind(EVENT_OUT_OF_MEMORY),
             _ => return None,
         })
     }
@@ -78,6 +86,10 @@ impl EventSelector {
             Self::Kind(EVENT_THREAD_EXIT) => "thread.exit",
             Self::Kind(EVENT_PROCESS_START) => "process.start",
             Self::Kind(EVENT_PROCESS_EXIT) => "process.exit",
+            Self::Kind(EVENT_SMC) => "code.smc",
+            Self::Kind(EVENT_PIN_DETACH) => "pin.detach",
+            Self::Kind(EVENT_PIN_ATTACH) => "pin.attach",
+            Self::Kind(EVENT_OUT_OF_MEMORY) => "memory.oom",
             Self::Kind(_) => "unknown",
         }
     }
@@ -96,6 +108,24 @@ impl EventSelector {
             self,
             Self::Kind(EVENT_PROCESS_START) | Self::Kind(EVENT_PROCESS_EXIT)
         )
+    }
+
+    pub fn is_priority(self) -> bool {
+        matches!(
+            self,
+            Self::Kind(EVENT_THREAD_START)
+                | Self::Kind(EVENT_THREAD_EXIT)
+                | Self::Kind(EVENT_PROCESS_START)
+                | Self::Kind(EVENT_PROCESS_EXIT)
+                | Self::Kind(EVENT_SMC)
+                | Self::Kind(EVENT_PIN_DETACH)
+                | Self::Kind(EVENT_PIN_ATTACH)
+                | Self::Kind(EVENT_OUT_OF_MEMORY)
+        )
+    }
+
+    pub fn requires_smc_registration(self) -> bool {
+        self == Self::Kind(EVENT_SMC)
     }
 }
 
@@ -196,6 +226,19 @@ pub fn build_event_dict(
                 },
             )?;
         }
+        EventSelector::Kind(EVENT_SMC) => {
+            row.set_item("trace_start", event.arg0)?;
+            row.set_item("trace_end", event.arg1)?;
+        }
+        EventSelector::Kind(EVENT_PIN_DETACH) => {
+            row.set_item("phase", "detached")?;
+        }
+        EventSelector::Kind(EVENT_PIN_ATTACH) => {
+            row.set_item("phase", "attached")?;
+        }
+        EventSelector::Kind(EVENT_OUT_OF_MEMORY) => {
+            row.set_item("requested_size", event.arg0)?;
+        }
         EventSelector::Kind(EVENT_MODULE_LOAD) => {
             row.set_item("base", event.arg0)?;
             row.set_item("end", event.arg1)?;
@@ -264,6 +307,17 @@ mod tests {
             Some(EventSelector::Exception)
         );
         assert_eq!(EventSelector::parse("not-an-event"), None);
+        for name in ["code.smc", "pin.detach", "pin.attach", "memory.oom"] {
+            let selector = EventSelector::parse(name).expect("public event must parse");
+            assert!(selector.is_priority());
+            assert!(PUBLIC_EVENT_NAMES.contains(&name));
+        }
+        assert!(EventSelector::parse("code.smc")
+            .expect("SMC selector")
+            .requires_smc_registration());
+        assert!(!EventSelector::parse("thread.start")
+            .expect("thread selector")
+            .requires_smc_registration());
     }
 
     #[test]

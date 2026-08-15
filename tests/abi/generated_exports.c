@@ -94,6 +94,7 @@ static const char* const kRequiredSymbols[] = {
     "pb_child_process_set_pin_command_line",
     "pb_pin_insert_call_probed",
     "pb_pin_safe_copy_ex",
+    "pb_pin_add_detach_function",
     "pb_pin_add_detach_function_probed",
     "pb_pin_detach",
     "pb_pin_detach_probed",

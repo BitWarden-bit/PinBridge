@@ -28,7 +28,7 @@ extern "C" {
 #endif
 
 #define PB_ABI_VERSION_MAJOR 1u
-#define PB_ABI_VERSION_MINOR 5u
+#define PB_ABI_VERSION_MINOR 6u
 #define PB_ABI_VERSION ((PB_ABI_VERSION_MAJOR << 16u) | PB_ABI_VERSION_MINOR)
 
 typedef int32_t PbStatus;
@@ -543,6 +543,7 @@ typedef void(PB_CALL* PbImgInstrumentCallback)(PbImgHandle img, void* user_data)
 typedef void(PB_CALL* PbApplicationStartCallback)(void* user_data);
 typedef void(PB_CALL* PbPrepareForFiniCallback)(void* user_data);
 typedef void(PB_CALL* PbFiniCallback)(int32_t code, void* user_data);
+typedef void(PB_CALL* PbDetachCallback)(void* user_data);
 typedef void(PB_CALL* PbDetachProbedCallback)(void* user_data);
 typedef void(PB_CALL* PbAttachProbedCallback)(void* user_data);
 typedef void(PB_CALL* PbOutOfMemoryCallback)(
@@ -1547,6 +1548,11 @@ PB_API PbStatus PB_CALL pb_pin_call_application_function_u64_2(
 PB_API PbStatus PB_CALL pb_pin_call_application_function_ptr_usize(
     PbConstContextHandle context, PbThreadId thread_id,
     uint64_t function_address, uint64_t size, void** out_result);
+/* JIT and Probe detach completion callbacks are deliberately separate:
+   registering the wrong Pin callback family for the active mode is invalid. */
+PB_API PbStatus PB_CALL pb_pin_add_detach_function(
+    PbDetachCallback callback, void* user_data,
+    PbCallbackHandle* out_callback);
 PB_API PbStatus PB_CALL pb_pin_add_detach_function_probed(
     PbDetachProbedCallback callback, void* user_data,
     PbCallbackHandle* out_callback);

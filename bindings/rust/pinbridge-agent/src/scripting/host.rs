@@ -13,8 +13,8 @@ use super::events::{self, EventSelector};
 use super::output;
 use super::subscriptions::{self, merge_action, StopAction};
 use super::{
-    agent_dir, python_ready, reply, set_mailbox, set_python_ready, with_plugin_context, Plugin,
-    with_registry, with_registry_mut, ScriptCmd, ScriptReply, Watch, RPC_PORT, STATE_ERROR,
+    agent_dir, python_ready, reply, set_mailbox, set_python_ready, with_plugin_context,
+    with_registry, with_registry_mut, Plugin, ScriptCmd, ScriptReply, Watch, RPC_PORT, STATE_ERROR,
     STATE_RUNNING,
 };
 use core::ffi::c_void;
@@ -42,6 +42,7 @@ const DEFAULT_WATCH_KINDS: u32 =
 const DEFAULT_WATCH_BATCH: u64 = 512;
 
 const RING_PAGE_CAP: u64 = 2048;
+const PRIORITY_PAGE_CAP: usize = 512;
 pub const BATCH_MAX: u64 = 4096;
 
 // Debugger launches request an entry stop before plugin code is allowed to
@@ -156,9 +157,10 @@ impl TickResolution {
     /// Same rendering as pinbridge_client's Resolution::display.
     fn display(&self) -> Option<String> {
         match self.kind {
-            2 if self.offset > 0 => {
-                Some(format!("{}!{}+0x{:x}", self.module, self.symbol, self.offset))
-            }
+            2 if self.offset > 0 => Some(format!(
+                "{}!{}+0x{:x}",
+                self.module, self.symbol, self.offset
+            )),
             2 => Some(format!("{}!{}", self.module, self.symbol)),
             1 => Some(format!("{}+0x{:x}", self.module, self.offset)),
             _ => None,
@@ -190,10 +192,14 @@ impl TickClient {
 
     /// One request/response. None on any transport/server failure.
     fn request(&mut self, op_code: u8, payload: &[u8]) -> Option<Vec<u8>> {
-        pinbridge_proto::write_frame(&mut self.stream, op_code, pinbridge_proto::STATUS_OK, payload)
-            .ok()?;
-        let (resp_op, status, body) =
-            pinbridge_proto::read_frame(&mut self.stream).ok()?;
+        pinbridge_proto::write_frame(
+            &mut self.stream,
+            op_code,
+            pinbridge_proto::STATUS_OK,
+            payload,
+        )
+        .ok()?;
+        let (resp_op, status, body) = pinbridge_proto::read_frame(&mut self.stream).ok()?;
         if resp_op != op_code || status != pinbridge_proto::STATUS_OK {
             return None;
         }
@@ -270,7 +276,9 @@ impl TickClient {
     }
 
     fn resolve(&mut self, addresses: &[u64]) -> Option<Vec<TickResolution>> {
-        self.stream.set_read_timeout(Some(RESOLVE_READ_TIMEOUT)).ok()?;
+        self.stream
+            .set_read_timeout(Some(RESOLVE_READ_TIMEOUT))
+            .ok()?;
         let mut request = Vec::with_capacity(4 + addresses.len() * 8);
         pinbridge_proto::put_u32(&mut request, addresses.len() as u32);
         for address in addresses {
@@ -344,17 +352,15 @@ pub fn run() -> ! {
     // anything); it is cleared only after the whole load+init attempt ends.
     let python_module = preload_python();
     let ready = match python_module {
-        Some(module) => {
-            match super::python_data::init_cells(module) {
-                Ok(()) => init_interpreter(),
-                Err(export) => {
-                    crate::log::line(&format!(
-                        "scripting disabled: python310.dll export missing: {export}"
-                    ));
-                    false
-                }
+        Some(module) => match super::python_data::init_cells(module) {
+            Ok(()) => init_interpreter(),
+            Err(export) => {
+                crate::log::line(&format!(
+                    "scripting disabled: python310.dll export missing: {export}"
+                ));
+                false
             }
-        }
+        },
         None => false,
     };
     super::set_py_load_in_flight(false);
@@ -448,13 +454,19 @@ fn preload_python() -> Option<*mut c_void> {
         let path = format!("{dir}\\python310.dll");
         let wide: Vec<u16> = path.encode_utf16().chain(core::iter::once(0)).collect();
         let module = unsafe {
-            LoadLibraryExW(wide.as_ptr(), core::ptr::null_mut(), LOAD_WITH_ALTERED_SEARCH_PATH)
+            LoadLibraryExW(
+                wide.as_ptr(),
+                core::ptr::null_mut(),
+                LOAD_WITH_ALTERED_SEARCH_PATH,
+            )
         };
         if !module.is_null() {
             crate::log::line(&format!("python310.dll preloaded from {path}"));
             return Some(module);
         }
-        crate::log::line(&format!("python310.dll not loadable from {path}; trying PATH"));
+        crate::log::line(&format!(
+            "python310.dll not loadable from {path}; trying PATH"
+        ));
     } else {
         crate::log::line("python310.dll preload: agent dir unresolved; trying PATH");
     }
@@ -511,8 +523,7 @@ fn init_interpreter() -> bool {
                 config.isolated = 1;
                 config.module_search_paths_set = 1;
                 for path in [&zip, &dir] {
-                    let wide: Vec<u16> =
-                        path.encode_utf16().chain(core::iter::once(0)).collect();
+                    let wide: Vec<u16> = path.encode_utf16().chain(core::iter::once(0)).collect();
                     let status = pyo3::ffi::PyWideStringList_Append(
                         &mut config.module_search_paths,
                         wide.as_ptr(),
@@ -623,9 +634,7 @@ fn cmd_load(
             output::push(name, &format!("compile error: {text}"));
             return Err(text);
         }
-        pending.push((name.to_string(), unsafe {
-            Py::from_owned_ptr(py, code)
-        }));
+        pending.push((name.to_string(), unsafe { Py::from_owned_ptr(py, code) }));
         Ok(1)
     })
 }
@@ -723,6 +732,7 @@ fn exec_one(name: &str, code: Py<PyAny>, port: u16) {
             breakpoints: crate::new_map(),
             filters: super::Filters::default(),
             cursor: 0,
+            priority_cursor: 0,
             last_stop_gen: 0,
             last_breakpoint_gen: 0,
             delivered: 0,
@@ -779,16 +789,18 @@ fn exec_one(name: &str, code: Py<PyAny>, port: u16) {
             }
         });
         // Start fresh: events/stops from before the load are not the plugin's.
-        let (cursor, gen) = match TickClient::connect(port) {
+        let (cursor, priority_cursor, gen) = match TickClient::connect(port) {
             Some(mut client) => (
                 client.counters_total().unwrap_or(0),
+                crate::priority::total(),
                 client.bp_list().map(|b| b.3).unwrap_or(0),
             ),
-            None => (0, 0),
+            None => (0, crate::priority::total(), 0),
         };
         with_registry_mut(|r| {
             if let Some(p) = r.get_mut(name) {
                 p.cursor = cursor;
+                p.priority_cursor = priority_cursor;
                 p.last_stop_gen = gen;
             }
         });
@@ -825,6 +837,7 @@ struct TickShared {
     hit_addr: u64,
     bp_entries: Vec<(u32, u64, u64)>,
     context_registers: Vec<(u32, u64)>,
+    priority_events: Vec<pinbridge_proto::EventRecord>,
     events: Vec<pinbridge_proto::EventRecord>,
     module_names: crate::TlsFreeMap<u64, String>,
 }
@@ -834,8 +847,33 @@ fn consumes_ring(p: &Plugin) -> bool {
         || p.on_syscall.is_some()
         || p.on_module_load.is_some()
         || p.on_module_unload.is_some()
-        || !p.events.is_empty()
+        || p.events
+            .values()
+            .any(|subscription| !subscription.selector.is_priority())
         || (p.on_event_batch.is_some() && p.filters.watch.is_some())
+}
+
+fn consumes_priority(p: &Plugin) -> bool {
+    p.events
+        .values()
+        .any(|subscription| subscription.selector.is_priority())
+}
+
+fn event_record(event: &crate::event::Event) -> pinbridge_proto::EventRecord {
+    pinbridge_proto::EventRecord {
+        sequence: event.sequence,
+        kind: event.kind,
+        thread_id: event.thread_id,
+        address: event.address,
+        arg0: event.arg0,
+        arg1: event.arg1,
+        arg2: event.arg2,
+        arg3: event.arg3,
+        arg4: event.arg4,
+        arg5: event.arg5,
+        arg6: event.arg6,
+        arg7: event.arg7,
+    }
 }
 
 fn tick(pending: &mut Vec<(String, Py<PyAny>)>, port: u16) {
@@ -854,8 +892,9 @@ fn tick(pending: &mut Vec<(String, Py<PyAny>)>, port: u16) {
     // adapt the pull size to last tick's measured Python cost (routed count)
     adapt_page_limit();
 
-    let (min_cursor, wants_stop, page_limit) = with_registry(|r| {
+    let (min_cursor, min_priority_cursor, wants_stop, page_limit) = with_registry(|r| {
         let mut min_cursor: Option<u64> = None;
+        let mut min_priority_cursor: Option<u64> = None;
         let mut wants_stop = false;
         let mut page_limit = 0u64;
         let mut any_watch = false;
@@ -865,6 +904,13 @@ fn tick(pending: &mut Vec<(String, Py<PyAny>)>, port: u16) {
             }
             if consumes_ring(p) {
                 min_cursor = Some(min_cursor.map(|m: u64| m.min(p.cursor)).unwrap_or(p.cursor));
+            }
+            if consumes_priority(p) {
+                min_priority_cursor = Some(
+                    min_priority_cursor
+                        .map(|m: u64| m.min(p.priority_cursor))
+                        .unwrap_or(p.priority_cursor),
+                );
             }
             if p.filters.want_bp || p.on_stop.is_some() || !p.breakpoints.is_empty() {
                 wants_stop = true;
@@ -883,12 +929,13 @@ fn tick(pending: &mut Vec<(String, Py<PyAny>)>, port: u16) {
         };
         // adaptive good-citizen ceiling under flood (see adapt_page_limit)
         let page_limit = page_limit.min(ADAPT_PAGE.load(Ordering::Relaxed));
-        (min_cursor, wants_stop, page_limit)
+        (min_cursor, min_priority_cursor, wants_stop, page_limit)
     });
     let knobs_dirty = NATIVE_DIRTY.swap(false, Ordering::AcqRel);
     let pending_native_removals = subscriptions::has_native_removals();
     let exit_delivery_pending = crate::lifecycle::exit_delivery_pending();
     if min_cursor.is_none()
+        && min_priority_cursor.is_none()
         && !wants_stop
         && !knobs_dirty
         && !pending_native_removals
@@ -907,9 +954,18 @@ fn tick(pending: &mut Vec<(String, Py<PyAny>)>, port: u16) {
         hit_addr: 0,
         bp_entries: Vec::new(),
         context_registers: Vec::new(),
+        priority_events: Vec::new(),
         events: Vec::new(),
         module_names: crate::new_map(),
     };
+    if let Some(after) = min_priority_cursor {
+        let mut events = Vec::with_capacity(PRIORITY_PAGE_CAP);
+        if crate::priority::try_page(after, PRIORITY_PAGE_CAP, &mut events).is_some() {
+            shared
+                .priority_events
+                .extend(events.iter().map(event_record));
+        }
+    }
     {
         if send_waiting() {
             return;
@@ -1292,6 +1348,7 @@ struct EventHandlerSnapshot {
 
 struct DispatchSnapshot {
     cursor: u64,
+    priority_cursor: u64,
     last_stop_gen: u64,
     on_exception: Option<Py<PyAny>>,
     on_syscall: Option<Py<PyAny>>,
@@ -1328,6 +1385,7 @@ fn dispatch_one(py: Python<'_>, name: &str, shared: &TickShared) {
         event_handlers.sort_by_key(|handler| handler.order);
         Some(DispatchSnapshot {
             cursor: plugin.cursor,
+            priority_cursor: plugin.priority_cursor,
             last_stop_gen: plugin.last_stop_gen,
             on_exception: plugin.on_exception.as_ref().map(|c| c.clone_ref(py)),
             on_syscall: plugin.on_syscall.as_ref().map(|c| c.clone_ref(py)),
@@ -1392,6 +1450,34 @@ fn dispatch_one(py: Python<'_>, name: &str, shared: &TickShared) {
                 &mut delivered_sticky_handlers,
             );
         }
+
+        // Rare events have an independent queue/cursor, so an instruction
+        // flood cannot evict them before Python observes them.
+        let mut priority_missed = 0u64;
+        if failed.is_none() {
+            for event in &shared.priority_events {
+                if event.sequence <= s.priority_cursor {
+                    continue;
+                }
+                if priority_missed == 0 && event.sequence > s.priority_cursor + 1 {
+                    priority_missed = event.sequence - s.priority_cursor - 1;
+                }
+                s.priority_cursor = event.sequence;
+                if route_named_handlers(
+                    py,
+                    &mut s.event_handlers,
+                    event,
+                    shared,
+                    &mut delivered,
+                    &mut failed,
+                    &mut remove_event_handlers,
+                    &mut delivered_sticky_handlers,
+                ) {
+                    break;
+                }
+            }
+        }
+        dropped += priority_missed;
 
         // Stop-gen edge: on_bp_hit first, then on_stop (tid -1 = manual pause).
         if failed.is_none() && shared.stop_gen > s.last_stop_gen {
@@ -1496,6 +1582,7 @@ fn dispatch_one(py: Python<'_>, name: &str, shared: &TickShared) {
     with_registry_mut(|r| {
         if let Some(p) = r.get_mut(name) {
             p.cursor = s.cursor;
+            p.priority_cursor = s.priority_cursor;
             p.last_stop_gen = s.last_stop_gen;
             p.delivered += delivered;
             p.dropped += dropped;
@@ -1595,9 +1682,7 @@ fn route_event(
         EVENT_CONTEXT_CHANGE if event.arg0 == CONTEXT_CHANGE_EXCEPTION => {
             let code = event.arg1 as u32;
             match (&s.on_exception, &s.exc_codes) {
-                (Some(callback), codes)
-                    if codes.as_ref().map_or(true, |c| c.contains(&code)) =>
-                {
+                (Some(callback), codes) if codes.as_ref().map_or(true, |c| c.contains(&code)) => {
                     let dict = PyDict::new_bound(py);
                     let _ = dict.set_item("tid", event.thread_id);
                     let _ = dict.set_item("code", event.arg1);
@@ -1626,8 +1711,7 @@ fn route_event(
                     let _ = dict.set_item("tid", event.thread_id);
                     let args: Vec<u64> = if phase == 0 {
                         vec![
-                            event.arg2, event.arg3, event.arg4, event.arg5, event.arg6,
-                            event.arg7,
+                            event.arg2, event.arg3, event.arg4, event.arg5, event.arg6, event.arg7,
                         ]
                     } else {
                         Vec::new()
@@ -1694,10 +1778,7 @@ fn route_event(
     }
 }
 
-fn build_event_list(
-    py: Python<'_>,
-    batch: &[pinbridge_proto::EventRecord],
-) -> PyResult<Py<PyAny>> {
+fn build_event_list(py: Python<'_>, batch: &[pinbridge_proto::EventRecord]) -> PyResult<Py<PyAny>> {
     let out = PyList::empty_bound(py);
     for event in batch {
         let row = PyDict::new_bound(py);

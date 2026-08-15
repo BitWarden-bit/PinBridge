@@ -56,6 +56,14 @@ pub const EVENT_PROCESS_START: u32 = 17;
 pub const EVENT_PROCESS_EXIT: u32 = 18;
 /// Native-only final fini edge. Python delivery is not promised at this point.
 pub const EVENT_PROCESS_FINI: u32 = 19;
+/// Pin detected self-modifying code. address/arg0=start, arg1=end.
+pub const EVENT_SMC: u32 = 20;
+/// Pin completed a detach operation.
+pub const EVENT_PIN_DETACH: u32 = 21;
+/// Pin completed a reattach sequence.
+pub const EVENT_PIN_ATTACH: u32 = 22;
+/// Pin reported an allocation failure. arg0=requested size.
+pub const EVENT_OUT_OF_MEMORY: u32 = 23;
 
 pub const EVENT_KIND_COUNT: usize = 9;
 
@@ -127,6 +135,10 @@ pub fn kind_name(kind: u32) -> &'static str {
         EVENT_PROCESS_START => "process_start",
         EVENT_PROCESS_EXIT => "process_exit",
         EVENT_PROCESS_FINI => "process_fini",
+        EVENT_SMC => "smc",
+        EVENT_PIN_DETACH => "pin_detach",
+        EVENT_PIN_ATTACH => "pin_attach",
+        EVENT_OUT_OF_MEMORY => "out_of_memory",
         _ => "unknown",
     }
 }

@@ -18,7 +18,7 @@ use super::{current_plugin_name, with_current_plugin_mut, Watch, RPC_PORT};
 use core::sync::atomic::Ordering;
 use pinbridge_client::client::Client;
 use pinbridge_proto::ARCH_X64;
-use pinbridge_sys::{pb_pin_sleep, PbRegId, PB_INVALID_THREAD_ID, PB_REG_INVALID_};
+use pinbridge_sys::{pb_pin_sleep, PbRegId, PB_INVALID_THREAD_ID, PB_OK, PB_REG_INVALID_};
 use pyo3::prelude::*;
 
 /// Runtime architecture id from a PING reply (x64 fallback against an agent
@@ -49,9 +49,7 @@ fn pin_sleep(ms: u32) {
 }
 
 fn no_plugin() -> PyErr {
-    PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-        "registration outside of a plugin context",
-    )
+    PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("registration outside of a plugin context")
 }
 
 // ---- output ----
@@ -163,16 +161,13 @@ fn pb_breakpoint(
         .iter()
         .any(|(_, existing_address, _)| *existing_address == address);
     let id = rpc(|c| c.bp_set(address)).ok_or_else(|| {
-        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-            "failed to create native breakpoint",
-        )
+        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("failed to create native breakpoint")
     })?;
 
     let previous = with_current_plugin_mut(|plugin| {
-        plugin.breakpoints.insert(
-            id,
-            BreakpointSubscription::new(callback, once, thread_id),
-        )
+        plugin
+            .breakpoints
+            .insert(id, BreakpointSubscription::new(callback, once, thread_id))
     })
     .ok_or_else(no_plugin)?;
     if previous.is_none() {
@@ -185,8 +180,8 @@ fn pb_breakpoint(
 /// remains while another plugin or a legacy owner still uses it.
 #[pyfunction(name = "breakpoint_remove")]
 fn pb_breakpoint_remove(id: u32) -> PyResult<bool> {
-    let removed = with_current_plugin_mut(|plugin| plugin.breakpoints.remove(&id))
-        .ok_or_else(no_plugin)?;
+    let removed =
+        with_current_plugin_mut(|plugin| plugin.breakpoints.remove(&id)).ok_or_else(no_plugin)?;
     if removed.is_none() {
         return Ok(false);
     }
@@ -206,9 +201,7 @@ fn pb_breakpoint_remove(id: u32) -> PyResult<bool> {
 #[pyfunction(name = "hit")]
 fn pb_hit() -> (Option<u32>, u64) {
     match rpc(|c| c.bp_list()) {
-        Some((_, hit_tid, hit_addr, _, _)) => {
-            ((hit_tid != u32::MAX).then_some(hit_tid), hit_addr)
-        }
+        Some((_, hit_tid, hit_addr, _, _)) => ((hit_tid != u32::MAX).then_some(hit_tid), hit_addr),
         None => (None, 0),
     }
 }
@@ -271,9 +264,7 @@ fn pb_disasm(addr: u64, count: u64) -> Option<Vec<(u64, u32, u32, u64, String)>>
     let rows = rpc(|c| c.disasm(addr, count))?;
     Some(
         rows.into_iter()
-            .map(|(address, size, kind, text, _bytes, target)| {
-                (address, size, kind, target, text)
-            })
+            .map(|(address, size, kind, text, _bytes, target)| (address, size, kind, target, text))
             .collect(),
     )
 }
@@ -402,8 +393,7 @@ fn record_kind(name: &str) -> Option<u32> {
 /// is already recording or the arguments are rejected.
 #[pyfunction(name = "trace_start", signature = (path, kinds=None, range=None))]
 fn pb_trace_start(path: &str, kinds: Option<Vec<String>>, range: Option<(u64, u64)>) -> bool {
-    let names =
-        kinds.unwrap_or_else(|| vec!["exec".to_string(), "memory".to_string()]);
+    let names = kinds.unwrap_or_else(|| vec!["exec".to_string(), "memory".to_string()]);
     let mut kind_ids = Vec::with_capacity(names.len());
     for name in &names {
         let Some(kind) = record_kind(name) else {
@@ -427,11 +417,16 @@ fn pb_trace_start_spec(
     let names = kinds.unwrap_or_else(|| vec!["exec".to_string(), "memory".to_string()]);
     let mut kind_ids = Vec::with_capacity(names.len());
     for name in &names {
-        let Some(kind) = record_kind(name) else { return false; };
+        let Some(kind) = record_kind(name) else {
+            return false;
+        };
         kind_ids.push(kind);
     }
-    let Some(ranges) = ranges else { return false; };
-    rpc(|c| c.trace_start_spec(&kind_ids, &ranges, threads.as_deref().unwrap_or(&[]), path)).is_some()
+    let Some(ranges) = ranges else {
+        return false;
+    };
+    rpc(|c| c.trace_start_spec(&kind_ids, &ranges, threads.as_deref().unwrap_or(&[]), path))
+        .is_some()
 }
 
 /// Extends the active native trace with additional address ranges. Existing
@@ -446,8 +441,18 @@ fn pb_trace_extend(ranges: Vec<(u64, u64)>) -> bool {
 /// virtual region containing an address, or None when it is unmapped.
 #[pyfunction(name = "memory_region")]
 fn pb_memory_region(address: u64) -> Option<(u64, u64, u64, u32, u32, u32)> {
-    rpc(|c| c.memory_region(address))
-        .and_then(|region| region.map(|r| (r.base, r.size, r.allocation_base, r.protect, r.state, r.kind)))
+    rpc(|c| c.memory_region(address)).and_then(|region| {
+        region.map(|r| {
+            (
+                r.base,
+                r.size,
+                r.allocation_base,
+                r.protect,
+                r.state,
+                r.kind,
+            )
+        })
+    })
 }
 
 /// Stops the recording session and returns (recorded, dropped).
@@ -487,6 +492,11 @@ fn pb_on_event(py: Python<'_>, event: &str, callback: Py<PyAny>, once: bool) -> 
             "unknown event {event:?}; use pb.event_names() to list supported names"
         ))
     })?;
+    if selector.requires_smc_registration() && crate::high_priority::enable_smc() != PB_OK {
+        return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+            "Pin rejected SMC callback registration",
+        ));
+    }
     let (id, subscription) = EventSubscription::new(selector, callback, once);
     with_current_plugin_mut(|plugin| plugin.events.insert(id, subscription))
         .ok_or_else(no_plugin)?;
@@ -560,11 +570,7 @@ fn pb_on_modules() {}
 /// branch, syscall, ctx, module_load, module_unload), optionally limited to
 /// an address range; batch paces the per-tick page size (default 512).
 #[pyfunction(name = "watch", signature = (kinds, range=None, batch=None))]
-fn pb_watch(
-    kinds: Vec<String>,
-    range: Option<(u64, u64)>,
-    batch: Option<u64>,
-) -> PyResult<()> {
+fn pb_watch(kinds: Vec<String>, range: Option<(u64, u64)>, batch: Option<u64>) -> PyResult<()> {
     let mut mask: u32 = 0;
     for name in &kinds {
         mask |= kind_bit(name).ok_or_else(|| {
@@ -600,11 +606,7 @@ fn pb_unsubscribe() {
 
 /// Old name of watch (kept so existing examples keep working).
 #[pyfunction(name = "subscribe", signature = (kinds, range=None, batch=None))]
-fn pb_subscribe(
-    kinds: Vec<String>,
-    range: Option<(u64, u64)>,
-    batch: Option<u64>,
-) -> PyResult<()> {
+fn pb_subscribe(kinds: Vec<String>, range: Option<(u64, u64)>, batch: Option<u64>) -> PyResult<()> {
     pb_watch(kinds, range, batch)
 }
 

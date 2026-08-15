@@ -127,6 +127,8 @@ pub struct Plugin {
     pub filters: Filters,
     /// Ring cursor: events with sequence <= cursor are consumed already.
     pub cursor: u64,
+    /// Independent cursor in the rare/high-priority event queue.
+    pub priority_cursor: u64,
     pub last_stop_gen: u64,
     /// Separate edge cursor for bound breakpoint callbacks.  It must not
     /// share `last_stop_gen`: a plugin may use both the new handler and the
@@ -196,9 +198,14 @@ pub fn with_plugin_context<R>(name: &str, f: impl FnOnce() -> R) -> R {
 // ---- mailbox command channel (query-server thread sends, host answers) ----
 
 pub enum ScriptCmd {
-    Load { name: String, source: String },
+    Load {
+        name: String,
+        source: String,
+    },
     /// Empty name = unload all.
-    Unload { name: String },
+    Unload {
+        name: String,
+    },
 }
 
 pub enum ScriptReply {

@@ -6,10 +6,10 @@
 //! place where a Python handler is invoked.
 
 use crate::event::{
-    Event, EVENT_PROCESS_EXIT, EVENT_PROCESS_FINI, EVENT_PROCESS_START, EVENT_THREAD_EXIT,
-    EVENT_THREAD_START,
+    Event, EVENT_PIN_ATTACH, EVENT_PROCESS_EXIT, EVENT_PROCESS_FINI, EVENT_PROCESS_START,
+    EVENT_THREAD_EXIT, EVENT_THREAD_START,
 };
-use crate::ring::submit;
+use crate::priority::submit;
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use pinbridge_sys::*;
@@ -39,7 +39,16 @@ unsafe fn context_ip(context: PbConstContextHandle) -> u64 {
 }
 
 unsafe extern "C" fn on_application_start(_user_data: *mut c_void) {
-    PROCESS_STARTED.store(true, Ordering::Release);
+    if PROCESS_STARTED.swap(true, Ordering::AcqRel) {
+        // Pin documents another application-start notification after a
+        // successful reattach, following image initialization.
+        submit(Event {
+            kind: EVENT_PIN_ATTACH,
+            thread_id: PB_INVALID_THREAD_ID,
+            ..Event::EMPTY
+        });
+        return;
+    }
     submit(Event {
         kind: EVENT_PROCESS_START,
         thread_id: PB_INVALID_THREAD_ID,
@@ -103,9 +112,7 @@ unsafe fn instrument_exit_routine(img: PbImgHandle, name: &'static [u8]) {
         value: 0,
         value2: 0,
     };
-    if pb_iarg_list_add(arguments, &descriptor, 1) == PB_OK
-        && pb_rtn_open(routine) == PB_OK
-    {
+    if pb_iarg_list_add(arguments, &descriptor, 1) == PB_OK && pb_rtn_open(routine) == PB_OK {
         if pb_rtn_insert_call(
             routine,
             PB_IPOINT_BEFORE,
@@ -274,10 +281,6 @@ pub fn register() -> PbStatus {
         }
 
         let mut image_load = PbCallbackHandle { opaque: 0 };
-        pb_img_add_instrument_function(
-            Some(on_image_load),
-            core::ptr::null_mut(),
-            &mut image_load,
-        )
+        pb_img_add_instrument_function(Some(on_image_load), core::ptr::null_mut(), &mut image_load)
     }
 }

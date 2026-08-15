@@ -17,6 +17,20 @@ template< typename Function > PbStatus GuardProbeDetach(Function function)
 
 } // namespace
 
+PbStatus PB_CALL pb_pin_add_detach_function(
+    PbDetachCallback callback, void* user_data,
+    PbCallbackHandle* out_callback)
+{
+    if (out_callback)
+        out_callback->opaque = 0;
+    if (!callback || !out_callback)
+        return PB_ERR_INVALID_ARGUMENT;
+    return GuardProbeDetach([&]() {
+        return PbBackendAddDetachFunction(
+            callback, user_data, &out_callback->opaque);
+    });
+}
+
 PbStatus PB_CALL pb_pin_add_detach_function_probed(
     PbDetachProbedCallback callback, void* user_data,
     PbCallbackHandle* out_callback)

@@ -14,9 +14,11 @@ mod engines;
 mod event;
 mod exception;
 mod hooks;
+mod high_priority;
 mod lifecycle;
 mod log;
 mod modules;
+mod priority;
 mod query_server;
 mod record;
 mod resolve;
@@ -89,6 +91,10 @@ fn agent_main(argc: c_int, argv: *mut *mut c_char) -> c_int {
             log::line("ring init failed");
             return 3;
         }
+        if priority::init() != PB_OK {
+            log::line("priority queue init failed");
+            return 12;
+        }
         let bp_status = bp::init();
         log::line(&format!("breakpoint engine init -> {bp_status}"));
         if bp_status != PB_OK {
@@ -142,8 +148,9 @@ fn agent_main(argc: c_int, argv: *mut *mut c_char) -> c_int {
         let exception_status = exception::register();
         let modules_status = modules::register();
         let lifecycle_status = lifecycle::register();
+        let (oom_status, detach_status) = high_priority::register();
         log::line(&format!(
-            "engines: syscall -> {syscall_status}, exception -> {exception_status}, modules -> {modules_status}, lifecycle -> {lifecycle_status}"
+            "engines: syscall -> {syscall_status}, exception -> {exception_status}, modules -> {modules_status}, lifecycle -> {lifecycle_status}, oom -> {oom_status}, detach -> {detach_status}"
         ));
         if lifecycle_status != PB_OK {
             return 10;
@@ -200,7 +207,9 @@ unsafe extern "C" fn on_fini(code: i32, _user_data: *mut c_void) {
     lifecycle::record_fini(code);
     let (exit_probes, exit_hits) = lifecycle::exit_probe_counts();
     crate::log::line(&format!(
-        "fini code={code} exit_probes={exit_probes} exit_hits={exit_hits}"
+        "fini code={code} exit_probes={exit_probes} exit_hits={exit_hits} priority_total={} priority_dropped={}",
+        priority::total(),
+        priority::dropped(),
     ));
     let (trace_start, trace_end) = engines::trace_range();
     let (hook_start, hook_end) = engines::hook_range();

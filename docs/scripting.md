@@ -230,8 +230,9 @@ VMP 系保护壳把自己的异常导向 SEH 处理；经典解法是掐 `KiUser
 
 1. **python 就绪竞态**：脚本功能约在端口绑定后 ~1s 才可用（预加载 + 解释器初始化在脚本
    线程上异步完成）;`script run` 报 "python unavailable" 时重试即可。
-2. **稀有类事件饿死**：插件游标每 tick ≤2048 条；默认引擎洪流（~100 万 exec/s）下稀有
-   类（异常、模块）可能在被投递前就被挤出 64K 环。等异常/syscall 时关掉用不到的引擎
+2. **部分稀有类事件仍走普通环**：生命周期、SMC、Pin 分离/附加和内存不足已经迁移到
+   独立 4096 槽高优先级环；异常和模块事件暂时仍可能被默认引擎洪流（~100 万 exec/s）
+   挤出 64K 普通环。等异常/syscall 时关掉用不到的引擎
    （`engine 2 off; engine 3 off; engine 4 off`)——`tests/control_e2e.py` 就是这么做的。
 3. **异常码符号扩展**:`on_exception` 的 `code` 到达时是符号扩展的 64 位值
    （如 `0xFFFFFFFFC0000005`)，用前掩到 u32(`code & 0xFFFFFFFF`)。
@@ -262,7 +263,8 @@ pb.off(subscription_id)
 
 目前已接入的命名事件：`process.start`、`process.exit`、`thread.start`、
 `thread.exit`、`module.load`、`module.unload`、`exception`、`context.change`、
-`syscall`、`hook.entry`、`hook.return`、`instruction`、`memory`、`branch.edge`。
+`syscall`、`hook.entry`、`hook.return`、`instruction`、`memory`、`branch.edge`、
+`code.smc`、`pin.detach`、`pin.attach`、`memory.oom`。
 
 订阅 `instruction`、`memory`、`branch.edge` 或 `syscall` 会把对应的原生采集引擎加入
 脚本需求并在下一次宿主节拍开启。取消订阅不会擅自关闭可能由 CLI/UI 开启的全局引擎。
@@ -278,6 +280,10 @@ pb.off(subscription_id)
 | `process.exit` | `phase="exiting"`, `exit_code`, `source` | 在用户态退出路径、Pin 最终销毁前通知 |
 | `thread.start` | `ip`, `flags` | `tid` 是 Pin 线程号，回调不在该应用线程上运行 |
 | `thread.exit` | `ip`, `exit_code` | 退出码按有符号 64 位值提供 |
+| `code.smc` | `trace_start`, `trace_end` | 第一次订阅时才启用 Pin 的 SMC 跟踪 |
+| `memory.oom` | `requested_size` | 原生分配失败通知；回调自身不分配内存 |
+| `pin.detach` | `phase="detached"` | 已接入 JIT/Probe 原生完成回调；分离后不承诺 Python 仍被调度 |
+| `pin.attach` | `phase="attached"` | 字段已固定；完整重新附加控制链仍在开发 |
 
 原生生命周期回调只写固定大小记录，不分配内存、不获取 GIL，也不等待 Python。
 Python 处理函数统一在脚本内部线程按“插件名、注册顺序”稳定调用。处理函数异常只把
@@ -287,3 +293,7 @@ Python 处理函数统一在脚本内部线程按“插件名、注册顺序”�
 线程仍有调度机会；`PrepareForFini` 是绕过常规退出 API 时的保底边沿。交接等待默认上限为 1000ms，可在启动前用
 `PINBRIDGE_SCRIPT_EXIT_GRACE_MS=0..5000` 调整。超时后原生层无条件继续退出，Python
 故障不会把被分析进程永久卡在结束阶段。
+
+上述生命周期、SMC、Pin 分离/附加和内存不足事件使用独立 4096 槽高优先级环，先于
+普通遥测派发。生产回调只执行固定记录和 try-lock，不调用 Python、不做阻塞等待。
+`pinbridge-agent.log` 的 Fini 行提供 `priority_total` 和 `priority_dropped`。

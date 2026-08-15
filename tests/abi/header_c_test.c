@@ -56,8 +56,8 @@ _Static_assert(sizeof(PbConstPhysicalContextHandle) == sizeof(void*),
     "PbConstPhysicalContextHandle must be pointer-sized");
 _Static_assert(sizeof(PbChildProcessHandle) == sizeof(void*),
     "PbChildProcessHandle must be pointer-sized");
-_Static_assert(PB_ABI_VERSION_MAJOR == 1u && PB_ABI_VERSION_MINOR == 5u,
-    "public ABI version must match v1.5");
+_Static_assert(PB_ABI_VERSION_MAJOR == 1u && PB_ABI_VERSION_MINOR == 6u,
+    "public ABI version must match v1.6");
 _Static_assert(sizeof(PbLogType) == 4, "PbLogType must be 32-bit");
 _Static_assert(sizeof(PbMessageKind) == 4, "PbMessageKind must be 32-bit");
 _Static_assert(sizeof(PbMessageCallback) == sizeof(void*),
@@ -82,6 +82,8 @@ _Static_assert(sizeof(PbPinErrorSeverity) == 4,
     "PbPinErrorSeverity must be 32-bit");
 _Static_assert(sizeof(PbDetachProbedCallback) == sizeof(void*),
     "PbDetachProbedCallback must be pointer-sized");
+_Static_assert(sizeof(PbDetachCallback) == sizeof(void*),
+    "PbDetachCallback must be pointer-sized");
 _Static_assert(sizeof(PbOutOfMemoryCallback) == sizeof(void*),
     "PbOutOfMemoryCallback must be pointer-sized");
 _Static_assert(sizeof(PbAttachProbedCallback) == sizeof(void*),
@@ -162,7 +164,7 @@ int main(void)
     (void)mutex;
     (void)rwmutex;
     (void)semaphore;
-    if (PB_ABI_VERSION != ((1u << 16u) | 5u))
+    if (PB_ABI_VERSION != ((1u << 16u) | 6u))
         return 1;
     if (PB_OK != 0 || PB_ERR_INVALID_ARGUMENT == PB_OK)
         return 2;

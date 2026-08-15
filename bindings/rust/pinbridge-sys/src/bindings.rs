@@ -3,8 +3,8 @@
 use core::ffi::{c_char, c_void};
 
 pub const PB_ABI_VERSION_MAJOR: u32 = 1;
-pub const PB_ABI_VERSION_MINOR: u32 = 5;
-pub const PB_ABI_VERSION: u32 = 65541;
+pub const PB_ABI_VERSION_MINOR: u32 = 6;
+pub const PB_ABI_VERSION: u32 = 65542;
 pub const PB_TRI_YES: PbTri = 0;
 pub const PB_TRI_NO: PbTri = 1;
 pub const PB_TRI_MAYBE: PbTri = 2;
@@ -1486,6 +1486,7 @@ pub type PbImgInstrumentCallback = Option<unsafe extern "C" fn(img: PbImgHandle,
 pub type PbApplicationStartCallback = Option<unsafe extern "C" fn(user_data: *mut c_void)>;
 pub type PbPrepareForFiniCallback = Option<unsafe extern "C" fn(user_data: *mut c_void)>;
 pub type PbFiniCallback = Option<unsafe extern "C" fn(code: i32, user_data: *mut c_void)>;
+pub type PbDetachCallback = Option<unsafe extern "C" fn(user_data: *mut c_void)>;
 pub type PbDetachProbedCallback = Option<unsafe extern "C" fn(user_data: *mut c_void)>;
 pub type PbAttachProbedCallback = Option<unsafe extern "C" fn(user_data: *mut c_void)>;
 pub type PbOutOfMemoryCallback = Option<unsafe extern "C" fn(requested_size: u64, user_data: *mut c_void)>;
@@ -2153,6 +2154,7 @@ unsafe extern "C" {
     pub fn pb_pin_call_application_function_u64_1(context: PbConstContextHandle, thread_id: PbThreadId, function_address: u64, argument0: u64, out_result: *mut u64) -> PbStatus;
     pub fn pb_pin_call_application_function_u64_2(context: PbConstContextHandle, thread_id: PbThreadId, function_address: u64, argument0: u64, argument1: u64, out_result: *mut u64) -> PbStatus;
     pub fn pb_pin_call_application_function_ptr_usize(context: PbConstContextHandle, thread_id: PbThreadId, function_address: u64, size: u64, out_result: *mut *mut c_void) -> PbStatus;
+    pub fn pb_pin_add_detach_function(callback: PbDetachCallback, user_data: *mut c_void, out_callback: *mut PbCallbackHandle) -> PbStatus;
     pub fn pb_pin_add_detach_function_probed(callback: PbDetachProbedCallback, user_data: *mut c_void, out_callback: *mut PbCallbackHandle) -> PbStatus;
     pub fn pb_pin_detach() -> PbStatus;
     pub fn pb_pin_detach_probed() -> PbStatus;

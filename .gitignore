@@ -34,3 +34,6 @@ fixtures/**/*.error.txt
 fixtures/lifecycle_demo/*.exe
 fixtures/lifecycle_demo/*.exp
 fixtures/lifecycle_demo/*.lib
+fixtures/smc_demo/*.exe
+fixtures/smc_demo/*.exp
+fixtures/smc_demo/*.lib

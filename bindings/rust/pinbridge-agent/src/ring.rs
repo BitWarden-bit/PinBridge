@@ -24,28 +24,25 @@ use pinbridge_sys::*;
 
 pub const RING_CAPACITY: usize = 65536;
 
-pub struct Ring {
-    events: [Event; RING_CAPACITY],
+pub struct Ring<const CAPACITY: usize> {
+    events: [Event; CAPACITY],
     total: u64,
 }
 
-impl Ring {
+impl<const CAPACITY: usize> Ring<CAPACITY> {
     pub const fn new() -> Self {
         Ring {
-            events: [Event::EMPTY; RING_CAPACITY],
+            events: [Event::EMPTY; CAPACITY],
             total: 0,
         }
     }
 
     #[inline]
-    pub fn push(&mut self, mut event: Event) {
+    pub fn push(&mut self, mut event: Event) -> u64 {
         self.total += 1;
         event.sequence = self.total;
-        self.events[((self.total - 1) % RING_CAPACITY as u64) as usize] = event;
-        // Lock-free mirror of the CONTENT edge (unlike TOTAL_SEQ, counts only
-        // events that actually landed). Paging cursors must be based on this:
-        // a TOTAL_SEQ-based cursor sails past the content when submits drop.
-        RING_TOTAL.store(self.total, Ordering::Release);
+        self.events[((self.total - 1) % CAPACITY as u64) as usize] = event;
+        self.total
     }
 
     pub fn total(&self) -> u64 {
@@ -55,11 +52,11 @@ impl Ring {
     /// Allocation-free newest-N copy: appends the newest `max` retained
     /// events (oldest first) to `out`.
     pub fn drain_newest_into(&self, max: usize, out: &mut Vec<Event>) {
-        let retained = self.total.min(RING_CAPACITY as u64);
+        let retained = self.total.min(CAPACITY as u64);
         let take = retained.min(max as u64);
         let first = self.total - take; // sequence space: (first, total]
         for sequence in first + 1..=self.total {
-            out.push(self.events[((sequence - 1) % RING_CAPACITY as u64) as usize]);
+            out.push(self.events[((sequence - 1) % CAPACITY as u64) as usize]);
         }
     }
 
@@ -68,21 +65,21 @@ impl Ring {
     /// events were skipped because the cursor fell behind the oldest
     /// retained slot.
     pub fn page_into(&self, after: u64, limit: usize, out: &mut Vec<Event>) -> u64 {
-        let retained = self.total.min(RING_CAPACITY as u64);
+        let retained = self.total.min(CAPACITY as u64);
         let oldest = self.total - retained + 1; // first retained sequence
         let first = (after + 1).max(oldest);
         let missed = first.saturating_sub(after + 1);
         if first <= self.total {
             let end = (first + limit as u64 - 1).min(self.total);
             for sequence in first..=end {
-                out.push(self.events[((sequence - 1) % RING_CAPACITY as u64) as usize]);
+                out.push(self.events[((sequence - 1) % CAPACITY as u64) as usize]);
             }
         }
         missed
     }
 }
 
-static mut RING: Ring = Ring::new();
+static mut RING: Ring<RING_CAPACITY> = Ring::new();
 static RING_MUTEX: AtomicUsize = AtomicUsize::new(0);
 static KIND_COUNTERS: [AtomicU64; EVENT_KIND_COUNT] =
     [const { AtomicU64::new(0) }; EVENT_KIND_COUNT];
@@ -130,7 +127,11 @@ pub fn submit(event: Event) {
         }
         #[allow(static_mut_refs)]
         let ring = &mut *core::ptr::addr_of_mut!(RING);
-        ring.push(event);
+        let total = ring.push(event);
+        // Lock-free mirror of the CONTENT edge (unlike TOTAL_SEQ, counts only
+        // events that actually landed). Paging cursors must be based on this:
+        // a TOTAL_SEQ-based cursor sails past the content when submits drop.
+        RING_TOTAL.store(total, Ordering::Release);
         pb_pin_mutex_unlock(mutex);
     }
 }
@@ -153,7 +154,7 @@ pub fn ring_total() -> u64 {
 /// SPIN_LIMIT misses the caller gets the busy signal.
 const SPIN_LIMIT: u32 = 1024;
 
-unsafe fn lock_spin(mutex: PbMutexHandle) -> bool {
+pub(crate) unsafe fn lock_spin(mutex: PbMutexHandle) -> bool {
     let mut acquired: u8 = 0;
     for _ in 0..SPIN_LIMIT {
         if pb_pin_mutex_try_lock(mutex, &mut acquired) != PB_OK {
@@ -210,4 +211,58 @@ pub fn try_drain_newest(max: usize, out: &mut Vec<Event>) -> Option<()> {
 
 pub fn kind_count(kind: usize) -> u64 {
     KIND_COUNTERS[kind].load(Ordering::Relaxed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn numbered(value: u64) -> Event {
+        Event {
+            arg0: value,
+            ..Event::EMPTY
+        }
+    }
+
+    #[test]
+    fn bounded_ring_reports_overwritten_cursor_entries() {
+        let mut ring: Ring<4> = Ring::new();
+        for value in 1..=6 {
+            ring.push(numbered(value));
+        }
+
+        let mut page = Vec::with_capacity(4);
+        let missed = ring.page_into(0, 8, &mut page);
+        assert_eq!(missed, 2);
+        assert_eq!(
+            page.iter().map(|event| event.sequence).collect::<Vec<_>>(),
+            vec![3, 4, 5, 6]
+        );
+        assert_eq!(
+            page.iter().map(|event| event.arg0).collect::<Vec<_>>(),
+            vec![3, 4, 5, 6]
+        );
+    }
+
+    #[test]
+    fn bounded_ring_pages_and_drains_in_sequence_order() {
+        let mut ring: Ring<4> = Ring::new();
+        for value in 1..=6 {
+            ring.push(numbered(value));
+        }
+
+        let mut page = Vec::with_capacity(2);
+        assert_eq!(ring.page_into(4, 2, &mut page), 0);
+        assert_eq!(
+            page.iter().map(|event| event.arg0).collect::<Vec<_>>(),
+            vec![5, 6]
+        );
+
+        let mut newest = Vec::with_capacity(2);
+        ring.drain_newest_into(2, &mut newest);
+        assert_eq!(
+            newest.iter().map(|event| event.arg0).collect::<Vec<_>>(),
+            vec![5, 6]
+        );
+    }
 }

@@ -3,6 +3,8 @@
 
 #include "pinbridge/pinbridge.h"
 
+PbStatus PbBackendAddDetachFunction(
+    PbDetachCallback callback, void* user_data, uint64_t* out_callback);
 PbStatus PbBackendAddDetachFunctionProbed(
     PbDetachProbedCallback callback, void* user_data, uint64_t* out_callback);
 PbStatus PbBackendDetach(void);
