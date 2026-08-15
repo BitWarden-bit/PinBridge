@@ -392,15 +392,16 @@ pub unsafe extern "C" fn on_ins(ins: PbInsHandle, _user_data: *mut c_void) {
         }
     }
 
+    let runtime_hook = crate::hooks::any() && crate::hooks::contains(address);
     let (hook_start, hook_end) = hook_range();
-    if in_range(address, hook_start, hook_end) {
+    if !runtime_hook && in_range(address, hook_start, hook_end) {
         pb_ins_insert_capture_regs(ins, Some(on_hook_regs), core::ptr::null_mut());
     }
 
     // Runtime hook points receive a borrowed Pin context. The callback still
     // emits the normal kind-1 event, then applies any precompiled action rules
     // directly to that context before the application instruction continues.
-    if crate::hooks::any() && crate::hooks::contains(address) {
+    if runtime_hook {
         crate::hooks::mark_return(address, query_bool(ins, pb_ins_is_ret));
         pb_ins_insert_capture_regs_ctx(ins, Some(on_hook_context), core::ptr::null_mut());
     }
@@ -514,7 +515,7 @@ unsafe extern "C" fn on_hook_regs(
     r9: u64,
     _user_data: *mut c_void,
 ) {
-    submit(Event {
+    let event = Event {
         kind: EVENT_HOOK_REGS,
         thread_id,
         address,
@@ -523,7 +524,11 @@ unsafe extern "C" fn on_hook_regs(
         arg2: r8,
         arg3: r9,
         ..Event::EMPTY
-    });
+    };
+    if crate::hooks::observation_enabled() {
+        crate::observation::submit(event);
+    }
+    submit(event);
 }
 
 unsafe extern "C" fn on_hook_context(
@@ -553,14 +558,14 @@ unsafe extern "C" fn on_hook_context(
             );
         }
     }
-    if is_return {
+    let event = if is_return {
         let mut return_value = 0;
         let _ = pb_pin_get_context_reg(
             context as PbConstContextHandle,
             crate::arch::return_reg(),
             &mut return_value,
         );
-        submit(Event {
+        Event {
             kind: EVENT_HOOK_RETURN,
             thread_id,
             address,
@@ -576,9 +581,9 @@ unsafe extern "C" fn on_hook_context(
             arg6: stack_args[1],
             arg7: stack_args[2],
             ..Event::EMPTY
-        });
+        }
     } else {
-        submit(Event {
+        Event {
             kind: EVENT_HOOK_REGS,
             thread_id,
             address,
@@ -591,8 +596,12 @@ unsafe extern "C" fn on_hook_context(
             arg6: stack_args[2],
             arg7: stack_args[3],
             ..Event::EMPTY
-        });
+        }
+    };
+    if crate::hooks::observation_enabled() {
+        crate::observation::submit(event);
     }
+    submit(event);
     let mut changed =
         crate::hooks::apply_rules(address, thread_id, context, [rcx, rdx, r8, r9]) > 0;
     if let Some(response) = crate::sync_intercept::decide_hook(

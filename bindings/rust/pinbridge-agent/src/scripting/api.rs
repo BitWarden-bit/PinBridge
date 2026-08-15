@@ -530,12 +530,13 @@ fn parse_syscall_numbers(
 /// Registers a named asynchronous event handler owned by the current
 /// plugin.  Breakpoints use pb.breakpoint because they are synchronous stop
 /// events with a return action; pb.on handles notification events.
-#[pyfunction(name = "on", signature = (event, callback, *, once=false, numbers=None))]
+#[pyfunction(name = "on", signature = (event, callback, *, once=false, address=None, numbers=None))]
 fn pb_on_event(
     py: Python<'_>,
     event: &str,
     callback: Py<PyAny>,
     once: bool,
+    address: Option<u64>,
     numbers: Option<Vec<u64>>,
 ) -> PyResult<u64> {
     if current_plugin_name().is_none() {
@@ -556,21 +557,66 @@ fn pb_on_event(
             "unknown event {event:?}; use pb.event_names() to list supported names"
         ))
     })?;
+    let is_hook = matches!(
+        selector,
+        EventSelector::Kind(crate::event::EVENT_HOOK_REGS)
+            | EventSelector::Kind(crate::event::EVENT_HOOK_RETURN)
+    );
+    if address.is_some() && !is_hook {
+        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+            "address is valid only for hook.entry and hook.return",
+        ));
+    }
+    if is_hook && address == Some(0) {
+        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+            "Hook observer address must be non-zero",
+        ));
+    }
     if numbers.is_some() && selector != EventSelector::Kind(crate::event::EVENT_SYSCALL) {
         return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
             "numbers is valid only for the syscall event",
         ));
     }
     let syscall_numbers = parse_syscall_numbers(numbers)?;
+    let hook_lease = if let Some(address) = address {
+        let existing = rpc(|client| client.hook_list()).ok_or_else(|| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                "Hook observer could not query native Hook points",
+            )
+        })?;
+        Some((address, !existing.contains(&address)))
+    } else {
+        None
+    };
     if selector.requires_smc_registration() && crate::high_priority::enable_smc() != PB_OK {
         return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
             "Pin rejected SMC callback registration",
         ));
     }
-    let (id, subscription) =
-        EventSubscription::new(selector, callback, once, syscall_numbers);
+    if is_hook {
+        // Existing native Hook points may already be executing, so publish
+        // observation interest before installing the Python subscription.
+        crate::hooks::set_observation_enabled(true);
+    }
+    let (id, subscription) = EventSubscription::new(
+        selector,
+        callback,
+        once,
+        address,
+        syscall_numbers,
+    );
     with_current_plugin_mut(|plugin| plugin.events.insert(id, subscription))
         .ok_or_else(no_plugin)?;
+    if let Some((address, created_by_scripts)) = hook_lease {
+        if !rpc(|client| client.hook_set(address)).unwrap_or(false) {
+            let _ = with_current_plugin_mut(|plugin| plugin.events.remove(&id));
+            mark_native_dirty();
+            return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                "Hook observer could not arm the native Hook point",
+            ));
+        }
+        decisions::acquire_hook(address, created_by_scripts);
+    }
     mark_native_dirty();
     Ok(id)
 }
@@ -578,13 +624,17 @@ fn pb_on_event(
 /// Removes one named event handler from the current plugin.
 #[pyfunction(name = "off")]
 fn pb_off_event(subscription_id: u64) -> PyResult<bool> {
-    let removed =
-        with_current_plugin_mut(|plugin| plugin.events.remove(&subscription_id).is_some())
-            .ok_or_else(no_plugin)?;
-    if removed {
+    let removed = with_current_plugin_mut(|plugin| plugin.events.remove(&subscription_id))
+        .ok_or_else(no_plugin)?;
+    if let Some(subscription) = &removed {
+        if let Some(address) = subscription.hook_address {
+            if decisions::release_hook(address) {
+                decisions::queue_hook_removal(address);
+            }
+        }
         mark_native_dirty();
     }
-    Ok(removed)
+    Ok(removed.is_some())
 }
 
 /// Canonical names accepted by pb.on. Breakpoints use pb.breakpoint because

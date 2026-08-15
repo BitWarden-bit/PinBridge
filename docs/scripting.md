@@ -325,8 +325,10 @@ subscription_id = pb.on("thread.start", thread_started)
 pb.off(subscription_id)
 ```
 
-- `pb.on(name, callback, once=False, numbers=None) -> subscription_id`：当前插件订阅一个异步
-  通知；`numbers` 只适用于 `syscall`，在原生回调进入独立观察环之前过滤；
+- `pb.on(name, callback, once=False, address=None, numbers=None) -> subscription_id`：当前插件订阅
+  一个异步通知；`address` 只适用于 `hook.entry/hook.return`，`numbers` 只适用于 `syscall`；
+- Hook 指定 `address` 时会自动复用或挂载原生点，并在 `pb.off`、`once` 完成或插件卸载时按
+  所有权计数释放；省略地址仍可观察脚本或 CLI 已经挂载的全部 Hook 点；
 - 常驻 syscall 观察应显式传 `numbers=[...]`；`numbers=None` 会接收全部系统调用，独立环也会
   在 Python 长期处理不过来时覆盖旧记录并计入丢失；
 - `pb.off(subscription_id) -> bool`：只移除当前插件拥有的订阅；
@@ -342,8 +344,8 @@ pb.off(subscription_id)
 
 订阅 `instruction`、`memory`、`branch.edge` 或 `syscall` 会把对应的原生采集引擎加入
 脚本需求并在下一次宿主节拍开启。取消订阅不会擅自关闭可能由 CLI/UI 开启的全局引擎。
-`hook.entry`/`hook.return` 只观察已经用 `pb.hook_set`、`pb.hook_rule` 或 CLI 创建的 Hook
-点；订阅本身不会猜测要 Hook 哪个地址。
+`pb.on("hook.entry/return", callback, address=...)` 会直接创建地址绑定的观察点；不传
+`address` 时只观察已经用 `pb.hook_set`、`pb.hook_rule`、同步拦截器或 CLI 创建的 Hook 点。
 
 所有处理函数接收一个字典。公共字段为 `type`、`sequence`、`kind`、
 `kind_name`、`thread_id`/`tid`、`address`/`addr` 和 `a0..a7`。生命周期字段：
@@ -360,6 +362,8 @@ pb.off(subscription_id)
 | `exception` | `reason`, `code`, `ip`, `exception_generation` | 异常边沿向高优先级环和兼容普通环双写；命名回调与旧固定回调各自去重 |
 | `context.change` | `reason`, `info`, `ip`, `exception_generation` | 异常原因携带非零代号并双写；其他上下文切换仍只走普通环，代号为 0 |
 | `syscall` | `number`, `phase`, `args`/`retval`/`errno`, `syscall_generation` | `phase` 为 `enter`/`exit`；原生号码过滤后向 16384 槽观察环和兼容普通环双写并逐处理函数去重 |
+| `hook.entry` | `registers`, `stack_arguments` | 可按绝对地址自动挂载并过滤；快照在同步规则/拦截修改现场前产生 |
+| `hook.return` | `return_value`, `registers`, `stack_arguments` | 地址指向 `ret` 指令；`return_value` 是同步修改前的 `rax/eax` |
 | `code.smc` | `trace_start`, `trace_end` | 第一次订阅时才启用 Pin 的 SMC 跟踪 |
 | `memory.oom` | `requested_size`, `occurrence`, `recovered_from_emergency_slot` | 原生先追加 `pinbridge_oom.log`，存活时再通知 Python；`recovered_from_emergency_slot=True` 表示普通高优先级环未作为唯一投递来源 |
 | `pin.internal_exception` | `ip`, `code`, `exception_address`, `fault_address`, `fault_address_known`, `access_type`, `exception_class` | 先写原生崩溃记录；只有 Pin 仍存活时 Python 才可能收到 |
@@ -396,6 +400,10 @@ Python；退出交接也只有有界确认等待。Python 处理函数统一在�
 `on_event_batch`；双写记录共享 `syscall_generation`，每个 Python 处理函数各自去重。
 不同应用线程可能乱序写入事件环，因此这里不是只记“最大代号”，而是每个处理函数使用
 固定 65536 位滑动窗口；乱序的真实事件不会被误删，状态大小也不会随运行时间增长。
+命名 Hook 观察也使用该 16384 槽观察环；原生点本身就是第一层地址过滤，每个处理函数再按
+自己的 `address` 精确匹配。Hook 的普通环副本仅供 CLI/UI 和 `on_event_batch` 兼容消费，
+不会再次路由到命名回调，因此同一次原生采集只调用一次对应 Python 处理函数。同步和异步
+Hook 订阅共用地址租约，任一 `once` 处理函数完成都不会提前拆除其他订阅仍使用的点。
 内存不足另有不分配 Rust 堆、不加锁的紧急路径：先用预先转换好的固定文件名追加
 `pinbridge_oom.log`，再发布一个原子保底槽并尝试写高优先级环。脚本宿主先处理当次可用的
 环记录，缺失时读取保底槽，并按 `occurrence` 去重迟到的环记录，因此同一次原生回调只调用一次 Python。并发 OOM
@@ -467,7 +475,8 @@ Hook 集合中的对应点；订阅卸载时按所有权计数释放。返回字
 同步 Hook 不停止整个进程，也不占断点槽；命中的应用线程在 16 槽固定通道上限时等待
 脚本线程。槽满、超时、Python 不可用、返回结构错误或多插件补丁冲突时继续原上下文。
 决定回调里 `pb.print` 可用，普通 `pb.*` 目标 RPC 会快速失败。真实回归入口为
-`fixtures/hook_python_demo/run.ps1`，同时验证入口跳过和返回值修改。
+`fixtures/hook_python_demo/run.ps1`，同时验证入口跳过、返回值修改、地址绑定异步观察的
+`once`/常驻语义，以及两类订阅在相反释放顺序下都不会互相提前拆除。
 
 ### 同步系统调用
 

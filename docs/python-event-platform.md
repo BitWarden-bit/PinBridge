@@ -31,8 +31,8 @@ Python 是分析平台的控制面：脚本负责注册事件、设置过滤条�
 
 ### 原生过滤观察
 
-系统调用等中等频率事件不能占用稀有事件队列，也不能被无关指令遥测覆盖。Python 先声明
-号码等选择条件，原生层过滤后写入独立 16384 槽观察环，同时保留普通环兼容记录；两份
+系统调用、Hook 等中等频率事件不能占用稀有事件队列，也不能被无关指令遥测覆盖。Python
+先声明号码或 Hook 地址等选择条件，原生层过滤后写入独立 16384 槽观察环，同时保留普通环兼容记录；系统调用两份
 记录用同一原生代号逐处理函数去重。每个处理函数持有固定 65536 位滑动窗口，允许多应用
 线程乱序发布代号，同时避免去重状态无限增长。生产者仍然只尝试 Pin mutex，拥塞通过
 独立计数暴露。常驻脚本必须按号码收窄；全量订阅在 Python 消费不足时仍会发生明确计数的
@@ -264,8 +264,15 @@ Pin 的跟随子进程回调不调用 Python。原生层在 `CHILD_PROCESS` 句�
 
 ### Hook 同步拦截
 
-Hook 的异步观察继续使用 `pb.on("hook.entry", ...)` / `pb.on("hook.return", ...)`；需要
-在原指令执行前取得 Python 返回值时使用：
+Hook 的异步观察直接绑定地址；注册会自动创建或复用原生点：
+
+```python
+pb.on("hook.entry", observe_entry, address=entry_address)
+pb.on("hook.return", observe_return, address=return_instruction, once=True)
+```
+
+异步快照进入独立观察环，普通环副本只服务 CLI/UI/批处理，不会再次触发命名回调。需要在
+原指令执行前取得 Python 返回值时使用：
 
 ```python
 pb.intercept("hook.entry", on_entry, address=entry_address, once=False)
@@ -282,11 +289,12 @@ pb.intercept("hook.return", on_return, address=return_instruction)
 同一地址可以有多个插件处理函数。补丁字段相同且值一致时合并；同一字段出现不同值、
 回调异常或非法返回结构时，本次拦截不应用任何 Python 补丁并继续原上下文。处理期间
 目标线程在 Pin 回调中限时等待，所以回调只能计算、使用 `pb.print` 并返回补丁，普通
-目标 RPC 快速失败。插件卸载、替换、`once` 完成或 `pb.unintercept` 会释放该插件的
-所有权；若注册前 Hook 点不存在，并且全部脚本订阅都已释放，则延迟移除该原生点。
+目标 RPC 快速失败。异步观察与同步拦截共用地址所有权计数；插件卸载、替换、`once`
+完成、`pb.off` 或 `pb.unintercept` 会释放相应所有权。若注册前 Hook 点不存在，并且全部
+脚本订阅都已释放，则延迟移除该原生点。
 
 真实 Pin 测试同时覆盖入口直接返回（证明原函数未执行）和返回指令改写返回值；Fini
-日志使用 `sync_decisions`、`sync_timeouts`、`sync_busy` 证明原生采用了两次 Python 决定。
+日志使用 `sync_decisions`、`sync_timeouts`、`sync_busy` 证明原生采用了三次 Python 决定。
 
 ### 系统调用同步拦截
 
@@ -541,6 +549,7 @@ pb.instrumentation_set(
 | Pin 分离完成 | `pb.on("pin.detach", ...)` | JIT/Probe 原生接入完成；分离后的即时 Python 调度不承诺 |
 | Pin 重新附加 | `pb.pin_attach_supported/pin_detach/pin_attach` + `pb.on("pin.attach", ...)` | ABI 和统一回调重建链已完成；Windows JIT 由 Pin 3.31 明确不支持并已验证安全拒绝，支持平台的完整往返待验证 |
 | 子进程跟随决策 | `pb.intercept("child.follow", ...)` | 已完成，跟随/不跟随真实 Pin 测试通过；子进程独立控制端口待开发 |
+| Hook 异步观察 | `pb.on("hook.entry/return", ..., address=...)` | 自动挂载/地址过滤、独立观察环和同步/异步共享租约完成，真实 Pin 的 once/常驻及双向释放测试通过 |
 | Hook 同步决定 | `pb.intercept("hook.entry/return", ..., address=...)` | 已完成，入口跳过/返回值改写真实 Pin 测试通过 |
 | 系统调用观察 | `pb.on("syscall", ..., numbers=...)` / `on_syscall` | 独立原生过滤观察环、兼容双写和逐处理函数去重完成，真实 Pin 测试通过且丢失为 0 |
 | 系统调用同步决定 | `pb.intercept("syscall.entry/exit", ..., numbers=...)` | 已完成，入口参数/出口返回值真实 Pin 测试通过 |

@@ -116,21 +116,33 @@ try {
     if (Test-Path -LiteralPath $log) {
         $captured += "`n" + (Get-Content -LiteralPath $log -Raw)
     }
-    foreach ($marker in @("HOOK_INTERCEPT_READY", "HOOK_ENTRY_INTERCEPT_PASS", "HOOK_RETURN_INTERCEPT_PASS")) {
+    foreach ($marker in @(
+        "HOOK_INTERCEPT_READY",
+        "HOOK_ENTRY_INTERCEPT_PASS",
+        "HOOK_RETURN_INTERCEPT_PASS",
+        "HOOK_ENTRY_OBSERVE_PASS",
+        "HOOK_RETURN_OBSERVE_PASS",
+        "HOOK_OBSERVE_EXACT_ONCE"
+    )) {
         if (-not $captured.Contains($marker)) { throw "missing callback marker: $marker" }
     }
-    if (-not $captured.Contains("sync_decisions=2 sync_timeouts=0 sync_busy=0")) {
-        throw "native synchronous Hook counters did not confirm two decisions"
+    if (-not $captured.Contains("sync_decisions=3 sync_timeouts=0 sync_busy=0")) {
+        throw "native synchronous Hook counters did not confirm three decisions"
+    }
+    if (-not $captured.Contains("observation_dropped=0")) {
+        throw "filtered Hook observation lane dropped events"
     }
     $targetOutput = $stdoutTask.Result.Trim()
     $targetError = $stderrTask.Result.Trim()
-    if ($pinProcess.ExitCode -ne 0 -or $targetOutput -notmatch "intercepted=4660/22136 calls=0/1") {
+    if ($pinProcess.ExitCode -ne 0 -or $targetOutput -notmatch "skipped=4660/4660 returned=22136/17 calls=0/2") {
         throw "target failed: exit=$($pinProcess.ExitCode) stdout=$targetOutput stderr=$targetError"
     }
     [ordered]@{
         result = "HOOK_PYTHON_INTERCEPT_PASS"
         target_exit = $pinProcess.ExitCode
-        callbacks = 2
+        sync_decisions = 3
+        named_observers_exact_once = $true
+        observation_dropped = 0
         skipped_original = $true
         target_output = $targetOutput
     } | ConvertTo-Json -Depth 3

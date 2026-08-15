@@ -250,7 +250,11 @@ impl EventSelector {
     /// high-priority copy but must keep a compatibility-ring cursor so that
     /// either try-lock path can recover the other.
     pub fn uses_compatibility_ring(self) -> bool {
-        !self.is_priority()
+        (!self.is_priority()
+            && !matches!(
+                self,
+                Self::Kind(EVENT_HOOK_REGS) | Self::Kind(EVENT_HOOK_RETURN)
+            ))
             || matches!(
                 self,
                 Self::Exception
@@ -270,6 +274,9 @@ pub struct EventSubscription {
     pub callback: Py<PyAny>,
     pub once: bool,
     pub order: u64,
+    /// Optional exact address for a named Hook observer. Supplying one also
+    /// acquires ownership of the corresponding native Hook point.
+    pub hook_address: Option<u64>,
     /// Per-handler native syscall-number interest. None means all numbers.
     /// Other selector kinds always keep this as None.
     pub syscall_numbers: Option<crate::TlsFreeSet<u32>>,
@@ -294,6 +301,7 @@ impl EventSubscription {
         selector: EventSelector,
         callback: Py<PyAny>,
         once: bool,
+        hook_address: Option<u64>,
         syscall_numbers: Option<crate::TlsFreeSet<u32>>,
     ) -> (u64, Self) {
         let id = NEXT_SUBSCRIPTION_ID.fetch_add(1, Ordering::Relaxed);
@@ -324,6 +332,7 @@ impl EventSubscription {
                 callback,
                 once,
                 order: id,
+                hook_address,
                 syscall_numbers,
                 syscall_generations: shared_generation_window(
                     crate::syscall_engine::generation(),
@@ -407,6 +416,36 @@ pub fn build_event_dict(
     row.set_item("a7", event.arg7)?;
 
     match selector {
+        EventSelector::Kind(EVENT_HOOK_REGS) => {
+            let registers = PyDict::new_bound(py);
+            for (index, register) in crate::arch::hook_arg_regs().iter().enumerate() {
+                if let Some(name) = crate::arch::gp_name(*register) {
+                    registers.set_item(
+                        name,
+                        [event.arg0, event.arg1, event.arg2, event.arg3][index],
+                    )?;
+                }
+            }
+            row.set_item("registers", registers)?;
+            row.set_item(
+                "stack_arguments",
+                [event.arg4, event.arg5, event.arg6, event.arg7],
+            )?;
+        }
+        EventSelector::Kind(EVENT_HOOK_RETURN) => {
+            let registers = PyDict::new_bound(py);
+            for (index, register) in crate::arch::hook_arg_regs().iter().enumerate() {
+                if let Some(name) = crate::arch::gp_name(*register) {
+                    registers.set_item(
+                        name,
+                        [event.arg1, event.arg2, event.arg3, event.arg4][index],
+                    )?;
+                }
+            }
+            row.set_item("return_value", event.arg0)?;
+            row.set_item("registers", registers)?;
+            row.set_item("stack_arguments", [event.arg5, event.arg6, event.arg7])?;
+        }
         EventSelector::Exception => {
             row.set_item("reason", event.arg0)?;
             row.set_item("code", event.arg1)?;
@@ -630,6 +669,10 @@ mod tests {
             let selector = EventSelector::parse(name).expect("module selector");
             assert!(selector.is_priority());
             assert!(selector.uses_compatibility_ring());
+        }
+        for name in ["hook.entry", "hook.return"] {
+            let selector = EventSelector::parse(name).expect("Hook selector");
+            assert!(!selector.uses_compatibility_ring());
         }
         assert!(EventSelector::parse("code.smc")
             .expect("SMC selector")

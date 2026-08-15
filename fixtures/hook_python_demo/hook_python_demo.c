@@ -26,12 +26,18 @@ int main(void)
 
     /* Give the runner time to load the Python interceptor. */
     Sleep(4000);
-    const int skipped = skip_api(5);
-    const int returned = return_api(7);
+    const int skipped_first = skip_api(5);
+    const int skipped_second = skip_api(5);
+    const int returned_first = return_api(7);
+    const int returned_second = return_api(7);
     const LONG skip_calls = g_skip_calls;
     const LONG return_calls = g_return_calls;
-    printf("hook_python_demo: intercepted=%d/%d calls=%ld/%ld\n",
-           skipped, returned, skip_calls, return_calls);
-    return skipped == 0x1234 && returned == 0x5678 &&
-           skip_calls == 0 && return_calls == 1 ? 0 : 7;
+    /* Let the asynchronous Hook observers drain before exit preparation. */
+    Sleep(750);
+    printf("hook_python_demo: skipped=%d/%d returned=%d/%d calls=%ld/%ld\n",
+           skipped_first, skipped_second, returned_first, returned_second,
+           skip_calls, return_calls);
+    return skipped_first == 0x1234 && skipped_second == 0x1234 &&
+           returned_first == 0x5678 && returned_second == 17 &&
+           skip_calls == 0 && return_calls == 2 ? 0 : 7;
 }

@@ -18,7 +18,7 @@
 //! technique as bp.rs) so instrumentation re-evaluates it.
 
 use core::ffi::c_void;
-use core::sync::atomic::{AtomicI32, AtomicPtr, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicUsize, Ordering};
 use pinbridge_sys::*;
 
 pub const MAX_HOOK_POINTS: usize = 4096;
@@ -63,6 +63,19 @@ static RETURNS_MASTER: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::n
 static RETURNS_SNAPSHOT: AtomicPtr<Vec<u64>> = AtomicPtr::new(core::ptr::null_mut());
 static RETURNS_RETIRED: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
 static ACTION_TLS_KEY: AtomicI32 = AtomicI32::new(PB_INVALID_TLS_KEY);
+/// Whether named Python Hook observers need the native-filtered observation
+/// copy. The compatibility telemetry record is always retained for CLI/UI
+/// consumers, while Python callbacks consume only this dedicated copy.
+static OBSERVATION_ENABLED: AtomicBool = AtomicBool::new(false);
+
+pub fn set_observation_enabled(enabled: bool) {
+    OBSERVATION_ENABLED.store(enabled, Ordering::Release);
+}
+
+#[inline]
+pub fn observation_enabled() -> bool {
+    OBSERVATION_ENABLED.load(Ordering::Acquire)
+}
 
 fn lock_master() -> std::sync::MutexGuard<'static, Vec<u64>> {
     MASTER.lock().unwrap_or_else(|e| e.into_inner())

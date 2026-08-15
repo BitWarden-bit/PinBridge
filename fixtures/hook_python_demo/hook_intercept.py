@@ -1,6 +1,47 @@
-"""Real-Pin synchronous hook.entry verification."""
+"""Real-Pin synchronous interception and asynchronous Hook observation."""
 
 import pb
+
+
+expected_entry_address = 0
+expected_return_address = 0
+observed_entry = 0
+observed_return = 0
+
+
+def observe_entry(event):
+    global observed_entry
+    if event["address"] != expected_entry_address:
+        raise RuntimeError("hook.entry escaped address filter")
+    if event["registers"].get("rcx") != 5:
+        raise RuntimeError("unexpected observed entry registers %r" % event["registers"])
+    observed_entry += 1
+    pb.print(
+        "HOOK_ENTRY_OBSERVE_PASS tid=%d address=0x%x"
+        % (event["tid"], event["address"])
+    )
+
+
+def observe_return(event):
+    global observed_return
+    if event["address"] != expected_return_address:
+        raise RuntimeError("hook.return escaped address filter")
+    if event["return_value"] != 17:
+        raise RuntimeError("unexpected observed return %r" % event["return_value"])
+    observed_return += 1
+    pb.print(
+        "HOOK_RETURN_OBSERVE_PASS tid=%d address=0x%x return=%d"
+        % (event["tid"], event["address"], event["return_value"])
+    )
+
+
+def verify_observers(event):
+    if (observed_entry, observed_return) != (1, 2):
+        raise RuntimeError(
+            "Hook observers were not exact-once: entry=%d return=%d"
+            % (observed_entry, observed_return)
+        )
+    pb.print("HOOK_OBSERVE_EXACT_ONCE entry=1 return=2")
 
 
 def intercept_skip(event):
@@ -28,6 +69,7 @@ def intercept_return(event):
 
 
 def pb_init():
+    global expected_entry_address, expected_return_address
     main = next((row[3] for row in pb.modules() if row[2]), None)
     if main is None:
         raise RuntimeError("main module not found")
@@ -49,13 +91,29 @@ def pb_init():
     names = pb.decision_names()
     if "hook.entry" not in names or "hook.return" not in names:
         raise RuntimeError("Hook interceptors are not public")
+    expected_entry_address = skip_address
+    expected_return_address = return_address
+    observe_entry_id = pb.on(
+        "hook.entry", observe_entry, address=skip_address, once=True
+    )
+    observe_return_id = pb.on(
+        "hook.return", observe_return, address=return_address, once=False
+    )
+    pb.on("process.prepare_fini", verify_observers, once=True)
     entry_id = pb.intercept(
-        "hook.entry", intercept_skip, address=skip_address, once=True
+        "hook.entry", intercept_skip, address=skip_address, once=False
     )
     return_id = pb.intercept(
         "hook.return", intercept_return, address=return_address, once=True
     )
     pb.print(
-        "HOOK_INTERCEPT_READY entry_id=%d return_id=%d entry=0x%x return=0x%x"
-        % (entry_id, return_id, skip_address, return_address)
+        "HOOK_INTERCEPT_READY entry_id=%d return_id=%d observe=%d/%d entry=0x%x return=0x%x"
+        % (
+            entry_id,
+            return_id,
+            observe_entry_id,
+            observe_return_id,
+            skip_address,
+            return_address,
+        )
     )

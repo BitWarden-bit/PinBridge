@@ -110,6 +110,18 @@ struct HookLease {
     remove_at_zero: bool,
 }
 
+impl HookLease {
+    fn acquire(&mut self, created_by_scripts: bool) {
+        self.subscribers = self.subscribers.saturating_add(1);
+        self.remove_at_zero |= created_by_scripts;
+    }
+
+    fn release(&mut self) -> bool {
+        self.subscribers = self.subscribers.saturating_sub(1);
+        self.subscribers == 0 && self.remove_at_zero
+    }
+}
+
 static mut HOOK_LEASES: Option<TlsFreeMap<u64, HookLease>> = None;
 static mut PENDING_HOOK_REMOVALS: Option<Vec<u64>> = None;
 
@@ -125,10 +137,7 @@ pub fn acquire_hook(address: u64, created_by_scripts: bool) {
     with_hook_leases(|leases| {
         leases
             .entry(address)
-            .and_modify(|lease| {
-                lease.subscribers = lease.subscribers.saturating_add(1);
-                lease.remove_at_zero |= created_by_scripts || revived;
-            })
+            .and_modify(|lease| lease.acquire(created_by_scripts || revived))
             .or_insert(HookLease {
                 subscribers: 1,
                 remove_at_zero: created_by_scripts || revived,
@@ -152,10 +161,7 @@ pub fn release_hook(address: u64) -> bool {
     with_hook_leases(|leases| {
         let remove = leases
             .get_mut(&address)
-            .map(|lease| {
-                lease.subscribers = lease.subscribers.saturating_sub(1);
-                lease.subscribers == 0 && lease.remove_at_zero
-            })
+            .map(HookLease::release)
             .unwrap_or(false);
         if leases
             .get(&address)
@@ -183,6 +189,15 @@ pub fn take_hook_removals() -> Vec<u64> {
         (*core::ptr::addr_of_mut!(PENDING_HOOK_REMOVALS))
             .take()
             .unwrap_or_default()
+    }
+}
+
+pub fn has_hook_removals() -> bool {
+    unsafe {
+        (*core::ptr::addr_of!(PENDING_HOOK_REMOVALS))
+            .as_ref()
+            .map(|pending| !pending.is_empty())
+            .unwrap_or(false)
     }
 }
 
@@ -240,5 +255,24 @@ mod tests {
             Some(DecisionSelector::DebuggerSingleStep)
         );
         assert_eq!(DecisionSelector::parse("unknown"), None);
+    }
+
+    #[test]
+    fn hook_lease_keeps_a_script_owned_point_until_the_last_consumer() {
+        let mut lease = HookLease {
+            subscribers: 1,
+            remove_at_zero: true,
+        };
+        lease.acquire(false);
+        assert!(!lease.release());
+        assert!(lease.release());
+
+        let mut external = HookLease {
+            subscribers: 1,
+            remove_at_zero: false,
+        };
+        external.acquire(false);
+        assert!(!external.release());
+        assert!(!external.release());
     }
 }

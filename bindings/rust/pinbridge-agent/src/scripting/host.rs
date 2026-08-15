@@ -678,6 +678,12 @@ fn retire_plugin(name: &str, reason: &str) {
                 .decisions
                 .values()
                 .filter_map(|subscription| subscription.address)
+                .chain(
+                    plugin
+                        .events
+                        .values()
+                        .filter_map(|subscription| subscription.hook_address),
+                )
                 .collect();
             // Drop every Py callback while the GIL is held.
             drop(plugin);
@@ -907,7 +913,14 @@ fn consumes_observation(p: &Plugin) -> bool {
     p.on_syscall.is_some()
         || p.events
             .values()
-            .any(|subscription| subscription.selector == EventSelector::Kind(EVENT_SYSCALL))
+            .any(|subscription| {
+                matches!(
+                    subscription.selector,
+                    EventSelector::Kind(EVENT_SYSCALL)
+                        | EventSelector::Kind(EVENT_HOOK_REGS)
+                        | EventSelector::Kind(crate::event::EVENT_HOOK_RETURN)
+                )
+            })
 }
 
 fn event_record(event: &crate::event::Event) -> pinbridge_proto::EventRecord {
@@ -996,6 +1009,7 @@ fn tick(pending: &mut Vec<(String, Py<PyAny>)>, port: u16) {
     });
     let knobs_dirty = NATIVE_DIRTY.swap(false, Ordering::AcqRel);
     let pending_native_removals = subscriptions::has_native_removals();
+    let pending_hook_removals = super::decisions::has_hook_removals();
     let exit_delivery_pending = crate::lifecycle::exit_delivery_pending();
     if min_cursor.is_none()
         && min_priority_cursor.is_none()
@@ -1003,6 +1017,7 @@ fn tick(pending: &mut Vec<(String, Py<PyAny>)>, port: u16) {
         && !wants_stop
         && !knobs_dirty
         && !pending_native_removals
+        && !pending_hook_removals
         && !exit_delivery_pending
     {
         return;
@@ -1149,11 +1164,12 @@ fn diag(msg: &str) {
 /// are still recomputed as a union because they are script-owned policy.
 /// Runs on the scripting thread, never in an analysis callback.
 fn recompute_native_knobs(client: &mut TickClient) {
-    let (any, all, union, telemetry) = with_registry(|r| {
+    let (any, all, union, telemetry, hook_observation) = with_registry(|r| {
         let mut any = false;
         let mut all = false;
         let mut union = crate::new_set();
         let mut telemetry = [false; 3]; // memory, exec, branch
+        let mut hook_observation = false;
         for p in r.values() {
             if p.state != STATE_RUNNING {
                 continue;
@@ -1163,6 +1179,10 @@ fn recompute_native_knobs(client: &mut TickClient) {
                     EventSelector::Kind(EVENT_MEMORY) => telemetry[0] = true,
                     EventSelector::Kind(EVENT_EXEC) => telemetry[1] = true,
                     EventSelector::Kind(EVENT_BRANCH_EDGE) => telemetry[2] = true,
+                    EventSelector::Kind(EVENT_HOOK_REGS)
+                    | EventSelector::Kind(crate::event::EVENT_HOOK_RETURN) => {
+                        hook_observation = true
+                    }
                     _ => {}
                 }
             }
@@ -1188,8 +1208,9 @@ fn recompute_native_knobs(client: &mut TickClient) {
                 }
             }
         }
-        (any, all, union, telemetry)
+        (any, all, union, telemetry, hook_observation)
     });
+    crate::hooks::set_observation_enabled(hook_observation);
     for (kind, enabled) in [EVENT_MEMORY, EVENT_EXEC, EVENT_BRANCH_EDGE]
         .into_iter()
         .zip(telemetry)
@@ -1435,6 +1456,7 @@ struct EventHandlerSnapshot {
     callback: Py<PyAny>,
     once: bool,
     order: u64,
+    hook_address: Option<u64>,
     syscall_numbers: Option<crate::TlsFreeSet<u32>>,
     syscall_generations: events::SharedGenerationWindow,
     sticky_delivered: bool,
@@ -1479,6 +1501,7 @@ fn dispatch_one(py: Python<'_>, name: &str, shared: &TickShared) {
                 callback: subscription.callback.clone_ref(py),
                 once: subscription.once,
                 order: subscription.order,
+                hook_address: subscription.hook_address,
                 syscall_numbers: subscription.syscall_numbers.clone(),
                 syscall_generations: subscription.syscall_generations.clone(),
                 sticky_delivered: subscription.sticky_delivered,
@@ -1715,17 +1738,25 @@ fn dispatch_one(py: Python<'_>, name: &str, shared: &TickShared) {
                 if route_event(py, &mut s, event, shared, &mut delivered, &mut failed) {
                     break; // callback failed: plugin marked error below
                 }
-                if route_named_handlers(
-                    py,
-                    &mut s.event_handlers,
-                    event,
-                    shared,
-                    &mut delivered,
-                    &mut failed,
-                    &mut remove_event_handlers,
-                    &mut delivered_sticky_handlers,
+                // Named Hook observers consume only the dedicated native-
+                // filtered copy. The compatibility record remains available
+                // to on_event_batch/CLI/UI without invoking Python twice.
+                if !matches!(
+                    event.kind,
+                    EVENT_HOOK_REGS | crate::event::EVENT_HOOK_RETURN
                 ) {
-                    break;
+                    if route_named_handlers(
+                        py,
+                        &mut s.event_handlers,
+                        event,
+                        shared,
+                        &mut delivered,
+                        &mut failed,
+                        &mut remove_event_handlers,
+                        &mut delivered_sticky_handlers,
+                    ) {
+                        break;
+                    }
                 }
                 if s.on_event_batch.is_some() {
                     if let Some((mask, lo, hi, _batch)) = &s.watch {
@@ -1763,6 +1794,7 @@ fn dispatch_one(py: Python<'_>, name: &str, shared: &TickShared) {
 
     // Write back consumption state (brief mutable access; the plugin may
     // have mutated its own filters from inside a callback — keep those).
+    let mut removed_hook_addresses = Vec::new();
     with_registry_mut(|r| {
         if let Some(p) = r.get_mut(name) {
             p.cursor = s.cursor;
@@ -1789,13 +1821,25 @@ fn dispatch_one(py: Python<'_>, name: &str, shared: &TickShared) {
                 }
             }
             for id in &remove_event_handlers {
-                p.events.remove(id);
+                if let Some(subscription) = p.events.remove(id) {
+                    if let Some(address) = subscription.hook_address {
+                        removed_hook_addresses.push(address);
+                    }
+                }
             }
             if failed.is_some() {
                 p.state = STATE_ERROR;
             }
         }
     });
+    for address in removed_hook_addresses {
+        if super::decisions::release_hook(address) {
+            super::decisions::queue_hook_removal(address);
+        }
+    }
+    if !remove_event_handlers.is_empty() {
+        mark_native_dirty();
+    }
     if failed.is_some() {
         super::publish_list_snapshot();
         super::native_policies::refresh_best_effort("event callback failed");
@@ -1826,6 +1870,16 @@ fn route_named_handlers(
             continue;
         }
         if handler.selector.is_sticky() && handler.sticky_delivered {
+            continue;
+        }
+        if matches!(
+            handler.selector,
+            EventSelector::Kind(EVENT_HOOK_REGS)
+                | EventSelector::Kind(crate::event::EVENT_HOOK_RETURN)
+        ) && handler
+            .hook_address
+            .is_some_and(|address| event.address != address)
+        {
             continue;
         }
         if handler.selector == EventSelector::Kind(EVENT_SYSCALL)
