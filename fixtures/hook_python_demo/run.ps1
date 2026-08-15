@@ -62,12 +62,14 @@ $port = Get-FreePort
 $script:Port = $port
 $script:Cli = $cli
 $log = Join-Path $dir ("hook_python_{0}.agent.log" -f $port)
+$registrationReady = Join-Path $dir "hook_registration.ready"
 $oldPort = $env:PINBRIDGE_AGENT_PORT
 $oldLog = $env:PINBRIDGE_AGENT_LOG
 $oldEngines = $env:PINBRIDGE_AGENT_ENGINES
 $pinProcess = $null
 
 try {
+    Remove-Item -LiteralPath $registrationReady -Force -ErrorAction SilentlyContinue
     $env:PINBRIDGE_AGENT_PORT = $port.ToString()
     $env:PINBRIDGE_AGENT_LOG = $log
     $env:PINBRIDGE_AGENT_ENGINES = "none"
@@ -157,4 +159,5 @@ try {
     else { $env:PINBRIDGE_AGENT_LOG = $oldLog }
     if ($null -eq $oldEngines) { Remove-Item Env:PINBRIDGE_AGENT_ENGINES -ErrorAction SilentlyContinue }
     else { $env:PINBRIDGE_AGENT_ENGINES = $oldEngines }
+    Remove-Item -LiteralPath $registrationReady -Force -ErrorAction SilentlyContinue
 }

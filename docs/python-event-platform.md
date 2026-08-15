@@ -163,6 +163,12 @@ pb.off(sid)
 每个插件可以为同一事件注册多个处理函数，按照注册顺序调用，插件卸载时订阅随插件
 对象一起释放。
 
+宿主在运行插件顶层代码和 `pb_init()` 之前先建立插件级读取游标；每个 `pb.on(...)` 处理函数
+再在注册语句执行时分别记录普通、高优先级和原生过滤观察通道的准确边界。这样既能读取
+初始化期间新产生的记录，又不会把注册之前的旧记录误投给新处理函数。固定旧式回调在
+`pb_init()` 返回、即将发布回调指针时建立自己的代号边界；断点停止代号不会在初始化结束时
+重置。粘性生命周期补发和内存不足保底通知是合成状态，按各自的发生代号去重，不套用环游标。
+
 应用启动是粘性状态：脚本通常在目标入口停住后才加载，因此 `process.start` 会对每个
 新订阅补发一次。`process.exit` 在 `RtlExitUserProcess`/`ExitProcess` 入口提前投递；
 确认完成后，同一安全窗口再投递独立的 `process.prepare_fini`，让 Python 清理逻辑确实
@@ -295,6 +301,8 @@ pb.intercept("hook.return", on_return, address=return_instruction)
 
 真实 Pin 测试同时覆盖入口直接返回（证明原函数未执行）和返回指令改写返回值；Fini
 日志使用 `sync_decisions`、`sync_timeouts`、`sync_busy` 证明原生采用了三次 Python 决定。
+测试目标通过握手文件在订阅全部注册后立即命中第一次 Hook，同时让 `pb_init()` 故意继续
+运行 500ms；一次性异步观察仍必须收到这次初始化窗口内的命中，以回归验证精确注册边界。
 
 ### 系统调用同步拦截
 
@@ -538,6 +546,7 @@ pb.instrumentation_set(
 
 | 功能 | Python 入口 | 当前状态 |
 |---|---|---|
+| 初始化期间事件边界 | `pb.on(...)` / `pb.breakpoint(...)` | 插件级游标在执行前建立，命名处理函数按通道记录精确注册边界；真实 Hook 初始化竞态测试通过 |
 | 精确断点处理 | `pb.breakpoint` | 已完成，真实 Pin 测试通过 |
 | 进程/线程生命周期 | `pb.on(...)` | 已完成，真实 Pin 测试通过 |
 | 退出前 Python 清理 | `pb.on("process.exit/process.prepare_fini", ...)` | 已完成，两阶段顺序派发和原生 PrepareForFini 到达均经真实 Pin 验证 |

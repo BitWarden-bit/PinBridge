@@ -24,10 +24,18 @@ int main(void)
     volatile DemoApiFn skip_api = DemoSkip;
     volatile DemoApiFn return_api = DemoReturn;
 
-    /* Give the runner time to load the Python interceptor. */
-    Sleep(4000);
+    /* Python creates this file only after all handlers are registered, then
+       intentionally keeps pb_init running while the first Hook arrives. */
+    DWORD waited = 0;
+    while (GetFileAttributesA("hook_registration.ready") == INVALID_FILE_ATTRIBUTES &&
+           waited < 15000) {
+        Sleep(1);
+        ++waited;
+    }
+    if (waited == 15000)
+        return 8;
     const int skipped_first = skip_api(5);
-    const int skipped_second = skip_api(5);
+    const int skipped_second = skip_api(6);
     const int returned_first = return_api(7);
     const int returned_second = return_api(7);
     const LONG skip_calls = g_skip_calls;

@@ -286,6 +286,13 @@ pub struct EventSubscription {
     pub callback: Py<PyAny>,
     pub once: bool,
     pub order: u64,
+    /// Per-lane native edges captured at the exact registration point. The
+    /// plugin cursor starts earlier so events arriving during pb_init remain
+    /// readable, while these boundaries suppress records predating this
+    /// specific handler.
+    pub main_start_after: u64,
+    pub priority_start_after: u64,
+    pub observation_start_after: u64,
     /// Optional exact address for a named Hook observer. Supplying one also
     /// acquires ownership of the corresponding native Hook point.
     pub hook_address: Option<u64>,
@@ -342,6 +349,9 @@ impl EventSubscription {
                 callback,
                 once,
                 order: id,
+                main_start_after: crate::ring::ring_total(),
+                priority_start_after: crate::priority::total(),
+                observation_start_after: crate::observation::total(),
                 hook_address,
                 syscall_numbers,
                 syscall_generations: (selector == EventSelector::Kind(EVENT_SYSCALL)).then(|| {

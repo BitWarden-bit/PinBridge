@@ -724,6 +724,27 @@ fn exec_pending(pending: &mut Vec<(String, Py<PyAny>)>, port: u16) {
 
 fn exec_one(name: &str, code: Py<PyAny>, port: u16) {
     crate::diag::heap_check("exec_one pre");
+    // Establish the plugin-wide read boundary before any top-level or
+    // pb_init registration can make an event relevant. Individual pb.on
+    // handlers also capture their own later per-lane boundaries.
+    let (initial_cursor, initial_priority_cursor, initial_observation_cursor, initial_stop_gen) =
+        match TickClient::connect(port) {
+            Some(mut client) => (
+                client.counters_total().unwrap_or(0),
+                crate::priority::total(),
+                crate::observation::total(),
+                client.bp_list().map(|b| b.3).unwrap_or(0),
+            ),
+            None => (
+                0,
+                crate::priority::total(),
+                crate::observation::total(),
+                0,
+            ),
+        };
+    let initial_module_generation = crate::modules::generation();
+    let initial_context_generation = crate::exception::generation();
+    let initial_syscall_generation = crate::syscall_engine::generation();
     Python::with_gil(|py| {
         let module = match PyModule::new_bound(py, name) {
             Ok(module) => module,
@@ -756,18 +777,18 @@ fn exec_one(name: &str, code: Py<PyAny>, port: u16) {
             xed_decode: None,
             breakpoints: crate::new_map(),
             filters: super::Filters::default(),
-            cursor: 0,
-            priority_cursor: 0,
-            observation_cursor: 0,
-            module_generation: 0,
+            cursor: initial_cursor,
+            priority_cursor: initial_priority_cursor,
+            observation_cursor: initial_observation_cursor,
+            module_generation: initial_module_generation,
             exception_generations: events::shared_generation_window(
-                crate::exception::generation(),
+                initial_context_generation,
             ),
             syscall_generations: events::shared_generation_window(
-                crate::syscall_engine::generation(),
+                initial_syscall_generation,
             ),
-            last_stop_gen: 0,
-            last_breakpoint_gen: 0,
+            last_stop_gen: initial_stop_gen,
+            last_breakpoint_gen: initial_stop_gen,
             delivered: 0,
             dropped: 0,
         };
@@ -801,6 +822,15 @@ fn exec_one(name: &str, code: Py<PyAny>, port: u16) {
             super::publish_list_snapshot();
             return;
         }
+        // Fixed callbacks become active only now. Capture their generation
+        // boundaries immediately before publishing the callback pointers;
+        // named pb.on handlers already own exact registration boundaries.
+        let legacy_module_generation = crate::modules::generation();
+        let legacy_context_generation = crate::exception::generation();
+        let legacy_syscall_generation = crate::syscall_engine::generation();
+        let legacy_stop_gen = TickClient::connect(port)
+            .and_then(|mut client| client.bp_list().map(|row| row.3))
+            .unwrap_or(initial_stop_gen);
         // Grab the fixed callbacks, then default-subscribe whatever the
         // plugin defined but did not explicitly register.
         with_registry_mut(|r| {
@@ -820,46 +850,13 @@ fn exec_one(name: &str, code: Py<PyAny>, port: u16) {
                 p.on_event_batch = grab("on_event_batch");
                 p.on_stop = grab("on_stop");
                 p.on_unload = grab("on_unload");
-                default_subscribe(p);
-            }
-        });
-        // Start fresh: events/stops from before the load are not the plugin's.
-        let (cursor, priority_cursor, observation_cursor, gen) = match TickClient::connect(port) {
-            Some(mut client) => (
-                client.counters_total().unwrap_or(0),
-                crate::priority::total(),
-                crate::observation::total(),
-                client.bp_list().map(|b| b.3).unwrap_or(0),
-            ),
-            None => (0, crate::priority::total(), crate::observation::total(), 0),
-        };
-        with_registry_mut(|r| {
-            if let Some(p) = r.get_mut(name) {
-                p.cursor = cursor;
-                p.priority_cursor = priority_cursor;
-                p.observation_cursor = observation_cursor;
-                p.module_generation = crate::modules::generation();
-                let context_generation = crate::exception::generation();
+                p.module_generation = legacy_module_generation;
                 p.exception_generations =
-                    events::shared_generation_window(context_generation);
-                let syscall_generation = crate::syscall_engine::generation();
-                p.syscall_generations = events::shared_generation_window(syscall_generation);
-                for subscription in p.events.values_mut() {
-                    if subscription.selector == EventSelector::Kind(EVENT_SYSCALL) {
-                        subscription.syscall_generations = Some(
-                            events::shared_generation_window(syscall_generation),
-                        );
-                    }
-                    if matches!(
-                        subscription.selector,
-                        EventSelector::Exception | EventSelector::Kind(EVENT_CONTEXT_CHANGE)
-                    ) {
-                        subscription.context_generations = Some(
-                            events::shared_generation_window(context_generation),
-                        );
-                    }
-                }
-                p.last_stop_gen = gen;
+                    events::shared_generation_window(legacy_context_generation);
+                p.syscall_generations =
+                    events::shared_generation_window(legacy_syscall_generation);
+                p.last_stop_gen = legacy_stop_gen;
+                default_subscribe(p);
             }
         });
         output::push(name, "loaded");
@@ -966,8 +963,9 @@ fn tick(pending: &mut Vec<(String, Py<PyAny>)>, port: u16) {
     if !python_ready() {
         return;
     }
-    // A policy can be installed by pb_init before its ring cursor exists.
-    // Replay loaded routines only after exec_pending has established it.
+    // Policies may be installed during pb_init. Replay loaded routines only
+    // after exec_pending has published the plugin callbacks and exact handler
+    // registration boundaries.
     crate::instrumentation_lifecycle::emit_pending_routine_snapshot();
     super::interceptors::dispatch_pending();
     // adapt the pull size to last tick's measured Python cost (routed count)
@@ -1469,6 +1467,9 @@ struct EventHandlerSnapshot {
     callback: Py<PyAny>,
     once: bool,
     order: u64,
+    main_start_after: u64,
+    priority_start_after: u64,
+    observation_start_after: u64,
     hook_address: Option<u64>,
     syscall_numbers: Option<crate::TlsFreeSet<u32>>,
     syscall_generations: Option<events::SharedGenerationWindow>,
@@ -1515,6 +1516,9 @@ fn dispatch_one(py: Python<'_>, name: &str, shared: &TickShared) {
                 callback: subscription.callback.clone_ref(py),
                 once: subscription.once,
                 order: subscription.order,
+                main_start_after: subscription.main_start_after,
+                priority_start_after: subscription.priority_start_after,
+                observation_start_after: subscription.observation_start_after,
                 hook_address: subscription.hook_address,
                 syscall_numbers: subscription.syscall_numbers.clone(),
                 syscall_generations: subscription.syscall_generations.clone(),
@@ -1574,6 +1578,7 @@ fn dispatch_one(py: Python<'_>, name: &str, shared: &TickShared) {
                 py,
                 &mut s.event_handlers,
                 &event,
+                EventLane::Synthetic,
                 shared,
                 &mut delivered,
                 &mut failed,
@@ -1589,6 +1594,7 @@ fn dispatch_one(py: Python<'_>, name: &str, shared: &TickShared) {
                 py,
                 &mut s.event_handlers,
                 &event,
+                EventLane::Synthetic,
                 shared,
                 &mut delivered,
                 &mut failed,
@@ -1606,6 +1612,7 @@ fn dispatch_one(py: Python<'_>, name: &str, shared: &TickShared) {
                 py,
                 &mut s.event_handlers,
                 &event,
+                EventLane::Synthetic,
                 shared,
                 &mut delivered,
                 &mut failed,
@@ -1633,6 +1640,7 @@ fn dispatch_one(py: Python<'_>, name: &str, shared: &TickShared) {
                     py,
                     &mut s.event_handlers,
                     event,
+                    EventLane::Priority,
                     shared,
                     &mut delivered,
                     &mut failed,
@@ -1665,6 +1673,7 @@ fn dispatch_one(py: Python<'_>, name: &str, shared: &TickShared) {
                     py,
                     &mut s.event_handlers,
                     event,
+                    EventLane::Observation,
                     shared,
                     &mut delivered,
                     &mut failed,
@@ -1692,6 +1701,7 @@ fn dispatch_one(py: Python<'_>, name: &str, shared: &TickShared) {
                     py,
                     &mut s.event_handlers,
                     &event,
+                    EventLane::Synthetic,
                     shared,
                     &mut delivered,
                     &mut failed,
@@ -1764,6 +1774,7 @@ fn dispatch_one(py: Python<'_>, name: &str, shared: &TickShared) {
                         py,
                         &mut s.event_handlers,
                         event,
+                        EventLane::Main,
                         shared,
                         &mut delivered,
                         &mut failed,
@@ -1864,6 +1875,92 @@ fn dispatch_one(py: Python<'_>, name: &str, shared: &TickShared) {
     }
 }
 
+#[derive(Copy, Clone)]
+enum EventLane {
+    Synthetic,
+    Priority,
+    Observation,
+    Main,
+}
+
+fn after_handler_registration(
+    handler: &EventHandlerSnapshot,
+    event: &pinbridge_proto::EventRecord,
+    lane: EventLane,
+) -> bool {
+    after_registration_edge(
+        event.sequence,
+        lane,
+        handler.main_start_after,
+        handler.priority_start_after,
+        handler.observation_start_after,
+    )
+}
+
+fn after_registration_edge(
+    sequence: u64,
+    lane: EventLane,
+    main_start_after: u64,
+    priority_start_after: u64,
+    observation_start_after: u64,
+) -> bool {
+    if matches!(lane, EventLane::Synthetic) || sequence == 0 {
+        return true;
+    }
+    let start_after = match lane {
+        EventLane::Synthetic => 0,
+        EventLane::Priority => priority_start_after,
+        EventLane::Observation => observation_start_after,
+        EventLane::Main => main_start_after,
+    };
+    sequence > start_after
+}
+
+#[cfg(test)]
+mod registration_boundary_tests {
+    use super::{after_registration_edge, EventLane};
+
+    #[test]
+    fn each_native_lane_uses_its_exact_registration_edge() {
+        assert!(!after_registration_edge(10, EventLane::Main, 10, 20, 30));
+        assert!(after_registration_edge(11, EventLane::Main, 10, 20, 30));
+        assert!(!after_registration_edge(20, EventLane::Priority, 10, 20, 30));
+        assert!(after_registration_edge(21, EventLane::Priority, 10, 20, 30));
+        assert!(!after_registration_edge(
+            30,
+            EventLane::Observation,
+            10,
+            20,
+            30,
+        ));
+        assert!(after_registration_edge(
+            31,
+            EventLane::Observation,
+            10,
+            20,
+            30,
+        ));
+    }
+
+    #[test]
+    fn synthetic_and_zero_sequence_events_are_replayed_by_contract() {
+        assert!(after_registration_edge(
+            1,
+            EventLane::Synthetic,
+            u64::MAX,
+            u64::MAX,
+            u64::MAX,
+        ));
+        assert!(after_registration_edge(
+            0,
+            EventLane::Main,
+            u64::MAX,
+            u64::MAX,
+            u64::MAX,
+        ));
+    }
+}
+
 /// Routes one event through the plugin's ordered `pb.on(...)` handlers.
 /// The snapshot is mutable only to suppress a duplicate raw lifecycle edge
 /// after a sticky replay during the same tick; registry state is written
@@ -1873,6 +1970,7 @@ fn route_named_handlers(
     py: Python<'_>,
     handlers: &mut [EventHandlerSnapshot],
     event: &pinbridge_proto::EventRecord,
+    lane: EventLane,
     shared: &TickShared,
     delivered: &mut u64,
     failed: &mut Option<String>,
@@ -1880,6 +1978,9 @@ fn route_named_handlers(
     sticky_deliveries: &mut Vec<u64>,
 ) -> bool {
     for handler in handlers {
+        if !after_handler_registration(handler, event, lane) {
+            continue;
+        }
         if !handler.selector.matches(event) {
             continue;
         }

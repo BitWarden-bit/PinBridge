@@ -48,7 +48,7 @@ def intercept_skip(event):
     registers = event["registers"]
     argument_register = "rcx" if "rcx" in registers else "stack0"
     argument = registers.get("rcx", event["arguments"][0])
-    if argument != 5:
+    if argument not in (5, 6):
         raise RuntimeError("unexpected argument %r" % argument)
     pb.print(
         "HOOK_ENTRY_INTERCEPT_PASS tid=%d address=0x%x argument=%d source=%s"
@@ -117,3 +117,9 @@ def pb_init():
             return_address,
         )
     )
+    # Release the target only after every handler is registered, then keep
+    # pb_init active long enough for the first Hook to arrive. This is the
+    # regression for the per-registration event cursor boundary.
+    with open("hook_registration.ready", "wb"):
+        pass
+    pb.sleep(500)
