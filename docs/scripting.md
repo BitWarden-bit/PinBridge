@@ -331,7 +331,7 @@ pb.off(subscription_id)
 - `pb.event_names() -> list[str]`：返回 `pb.on` 接受的规范事件名；
 - 断点是会停止目标的同步事件，必须使用 `pb.breakpoint(address, callback)` 注册。
 
-目前已接入的命名事件：`process.start`、`process.exit`、`thread.start`、
+目前已接入的命名事件：`process.start`、`process.exit`、`process.prepare_fini`、`thread.start`、
 `thread.exit`、`module.load`、`module.unload`、`exception`、`context.change`、
 `syscall`、`hook.entry`、`hook.return`、`instruction`、`instruction.decode`、`memory`、`branch.edge`、
 `code.smc`、`pin.detach`、`pin.attach`、`memory.oom`、`pin.internal_exception`、
@@ -349,7 +349,8 @@ pb.off(subscription_id)
 | 事件 | 专用字段 | 说明 |
 |---|---|---|
 | `process.start` | `phase="start"` | 插件晚于应用启动加载时，每个订阅补发一次当前状态 |
-| `process.exit` | `phase="exiting"`, `exit_code`, `source` | 在用户态退出路径、Pin 最终销毁前通知 |
+| `process.exit` | `phase="exiting"`, `exit_code`, `exit_code_known`, `source` | 在用户态退出 API 入口尽早通知；未捕获该入口时由准备结束边沿尽力补发 |
+| `process.prepare_fini` | `phase="prepare_fini"`, `exit_code`, `exit_code_known`, `had_exit_request`, `trigger`, `native_prepare_reached` | 可执行 Python 清理的预收尾窗口；正常 Windows 路径的 `trigger="exit_api"`，发生在真正的 Pin PrepareForFini 之前 |
 | `thread.start` | `ip`, `flags` | `tid` 是 Pin 线程号，回调不在该应用线程上运行 |
 | `thread.exit` | `ip`, `exit_code` | 退出码按有符号 64 位值提供 |
 | `code.smc` | `trace_start`, `trace_end` | 第一次订阅时才启用 Pin 的 SMC 跟踪 |
@@ -362,17 +363,22 @@ pb.off(subscription_id)
 | `routine.instrument` | `size`, `instruction_count`, `routine_id`, `is_dynamic`, `is_artificial`, `policy_generation` | 策略启用时补当前函数快照，随后接收 Pin 新发现函数 |
 | `basic_block.instrument` | `size`, `instruction_count`, `has_fall_through`, `is_original`, `policy_generation` | Trace 内的基本块静态元数据 |
 
-原生生命周期回调只写固定大小记录，不分配内存、不获取 GIL，也不等待 Python。
-Python 处理函数统一在脚本内部线程按“插件名、注册顺序”稳定调用。处理函数异常只把
+原生生命周期回调只写固定大小记录，不分配内存、不获取 GIL。除退出交接窗口外不等待
+Python；退出交接也只有有界确认等待。Python 处理函数统一在脚本内部线程按“插件名、
+注册顺序”稳定调用。处理函数异常只把
 所属插件置为 error，不会在 Pin 回调栈中传播到目标程序。
 
-原生层在 `RtlExitUserProcess`/`ExitProcess` 入口提前产生 `process.exit`，使 Python 内部
-线程仍有调度机会；`PrepareForFini` 是绕过常规退出 API 时的保底边沿。交接等待默认上限为 1000ms，可在启动前用
-`PINBRIDGE_SCRIPT_EXIT_GRACE_MS=0..5000` 调整。超时后原生层无条件继续退出，Python
-故障不会把被分析进程永久卡在结束阶段。
+原生层在 `RtlExitUserProcess`/`ExitProcess` 入口先产生 `process.exit`，确认派发后再产生
+`process.prepare_fini`，因此 Python 清理代码在 Pin 停止内部脚本线程前实际执行。随后真正
+的 Pin PrepareForFini 只设置原生确认位，最终 Fini 写事件和总结日志；这两个最终阶段不
+虚报为仍能运行 Python。绕过常规退出 API 时，原生 PrepareForFini 仍会尽力投递两个选择器，
+但 Windows 不保证脚本线程还能调度。每个 Python 交接阶段的等待上限默认 1000ms，可在
+启动前用 `PINBRIDGE_SCRIPT_EXIT_GRACE_MS=0..5000` 调整；正常路径最坏合计为两倍该值。
+超时后原生层无条件继续退出，Python 故障不会把被分析进程永久卡在结束阶段。
 
 上述生命周期、SMC、Pin 分离/附加、内存不足、Pin 内部异常和调试器事件使用独立 4096 槽高优先级环，先于
-普通遥测派发。生产回调只执行固定记录和 try-lock，不调用 Python、不做阻塞等待。
+普通遥测派发。生产回调只执行固定记录和 try-lock，不调用 Python；仅上述退出交接使用
+有上限的确认等待。
 `pinbridge-agent.log` 的 Fini 行提供 `priority_total` 和 `priority_dropped`。
 
 ## 同步决定：子进程跟随

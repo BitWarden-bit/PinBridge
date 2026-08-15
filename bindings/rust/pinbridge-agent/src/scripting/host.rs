@@ -1471,10 +1471,27 @@ fn dispatch_one(py: Python<'_>, name: &str, shared: &TickShared) {
                 &mut delivered_sticky_handlers,
             );
         }
-        if failed.is_none() && crate::lifecycle::process_exiting() {
+        if failed.is_none() && crate::lifecycle::process_exit_requested() {
             let mut event = events::synthetic_process_event(crate::event::EVENT_PROCESS_EXIT);
             event.arg0 = crate::lifecycle::process_exit_code() as i64 as u64;
-            event.arg1 = crate::lifecycle::process_exit_source() as u64;
+            event.arg1 = crate::event::PROCESS_EXIT_SOURCE_API;
+            let _ = route_named_handlers(
+                py,
+                &mut s.event_handlers,
+                &event,
+                shared,
+                &mut delivered,
+                &mut failed,
+                &mut remove_event_handlers,
+                &mut delivered_sticky_handlers,
+            );
+        }
+        if failed.is_none() && crate::lifecycle::process_preparing() {
+            let mut event = events::synthetic_process_event(crate::event::EVENT_PROCESS_EXIT);
+            event.arg0 = crate::lifecycle::process_exit_code() as i64 as u64;
+            event.arg1 = crate::event::PROCESS_EXIT_SOURCE_PREPARE_FINI;
+            event.arg2 = crate::lifecycle::process_exit_requested() as u64;
+            event.arg3 = crate::lifecycle::native_prepare_reached() as u64;
             let _ = route_named_handlers(
                 py,
                 &mut s.event_handlers,

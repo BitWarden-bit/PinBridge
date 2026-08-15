@@ -23,7 +23,7 @@ Python 是分析平台的控制面：脚本负责注册事件、设置过滤条�
 
 ### 高优先级通知
 
-异常、线程生命周期、模块生命周期、动态代码修改、进程生命周期等低频事件进入独立的高优先级队列。原生回调只复制固定大小的数据，Python 随后处理，不在 Pin 回调线程等待 Python。
+异常、线程生命周期、模块生命周期、动态代码修改、进程生命周期等低频事件进入独立的高优先级队列。原生回调只复制固定大小的数据，Python 随后处理；只有退出前的两阶段交接使用有上限的确认等待，其余异步事件不在 Pin 回调线程等待 Python。
 
 ### 普通遥测
 
@@ -155,10 +155,13 @@ pb.off(sid)
 对象一起释放。
 
 应用启动是粘性状态：脚本通常在目标入口停住后才加载，因此 `process.start` 会对每个
-新订阅补发一次。`process.exit` 在 `RtlExitUserProcess`/`ExitProcess` 入口提前投递，
-`PrepareForFini` 处理绕过常规退出 API 的路径；原生层等待脚本线程确认，默认最多
-1000ms，超时后继续退出。真正的 `Fini` 仍写入原生事件和总结日志，不虚假承诺 Python
-能在最终销毁阶段运行。
+新订阅补发一次。`process.exit` 在 `RtlExitUserProcess`/`ExitProcess` 入口提前投递；
+确认完成后，同一安全窗口再投递独立的 `process.prepare_fini`，让 Python 清理逻辑确实
+能在 Pin 停止内部线程前运行。两个阶段分别等待脚本线程确认，默认各最多 1000ms，超时
+后继续退出。真实 Windows 回归同时验证了两个 Python 回调、目标正常退出，以及随后原生
+PrepareForFini 确实到达。真正的 PrepareForFini/Fini 只设置原生状态、写最终事件和总结
+日志，不虚假承诺 Python 能在最终销毁阶段运行；绕过常规退出 API 的异常退出路径只能在
+原生 PrepareForFini 尽力补发，Windows 不保证此时脚本线程仍会被调度。
 
 线程和应用回调遵守同一个硬边界：Pin 回调只读取上下文指令地址并提交 POD 事件，绝不
 直接调用 Python。系统调用命名订阅会参加原生开关合并，没有脚本订阅时不为接口表象
@@ -495,6 +498,8 @@ pb.instrumentation_set(
 |---|---|---|
 | 精确断点处理 | `pb.breakpoint` | 已完成，真实 Pin 测试通过 |
 | 进程/线程生命周期 | `pb.on(...)` | 已完成，真实 Pin 测试通过 |
+| 退出前 Python 清理 | `pb.on("process.exit/process.prepare_fini", ...)` | 已完成，两阶段顺序派发和原生 PrepareForFini 到达均经真实 Pin 验证 |
+| 最终退出记录 | 无 Python 回调；原生 Fini 事件和总结日志 | 已完成；该阶段 Pin 已停止脚本调度，不伪装成可执行 Python 回调 |
 | 动态机器码修改 | `pb.on("code.smc", ...)` | 已完成，真实 Pin 测试通过 |
 | 内存不足 | `pb.on("memory.oom", ...)` | 原生接入和契约测试完成，无法安全强制触发 |
 | Pin 内部异常 | `pb.on("pin.internal_exception", ...)` | 原生崩溃记录后投递高优先级快照；仅在进程存活时可到达 Python |

@@ -217,10 +217,11 @@ pinbridge_tool::tool_entry!(agent_main);
 unsafe extern "C" fn on_fini(code: i32, _user_data: *mut c_void) {
     lifecycle::record_fini(code);
     let (exit_probes, exit_hits) = lifecycle::exit_probe_counts();
+    let native_prepare = lifecycle::native_prepare_reached();
     let (child_decisions, child_follow, child_reject) = child_process::decision_counts();
     let (sync_decisions, sync_timeouts, sync_busy) = sync_intercept::stats();
     crate::log::line(&format!(
-        "fini code={code} exit_probes={exit_probes} exit_hits={exit_hits} priority_total={} priority_dropped={} child_decisions={child_decisions} child_follow={child_follow} child_reject={child_reject} child_decision_timeouts={} sync_decisions={sync_decisions} sync_timeouts={sync_timeouts} sync_busy={sync_busy}",
+        "fini code={code} exit_probes={exit_probes} exit_hits={exit_hits} native_prepare={native_prepare} priority_total={} priority_dropped={} child_decisions={child_decisions} child_follow={child_follow} child_reject={child_reject} child_decision_timeouts={} sync_decisions={sync_decisions} sync_timeouts={sync_timeouts} sync_busy={sync_busy}",
         priority::total(),
         priority::dropped(),
         child_process::timeout_count(),

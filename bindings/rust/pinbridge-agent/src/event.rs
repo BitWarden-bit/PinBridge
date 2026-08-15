@@ -52,8 +52,13 @@ pub const EVENT_THREAD_START: u32 = 15;
 pub const EVENT_THREAD_EXIT: u32 = 16;
 /// The application is about to begin executing.
 pub const EVENT_PROCESS_START: u32 = 17;
-/// Pin entered PrepareForFini; this is the last Python-deliverable exit edge.
+/// Python-deliverable exit lifecycle edge. arg1=1 is an early user-mode exit
+/// request; arg1=2 is the pre-Fini Python cleanup phase. Cleanup arg2 says
+/// whether the early edge was observed and arg3 says whether Pin's native
+/// PrepareForFini was already reached (normally false for the usable window).
 pub const EVENT_PROCESS_EXIT: u32 = 18;
+pub const PROCESS_EXIT_SOURCE_API: u64 = 1;
+pub const PROCESS_EXIT_SOURCE_PREPARE_FINI: u64 = 2;
 /// Native-only final fini edge. Python delivery is not promised at this point.
 pub const EVENT_PROCESS_FINI: u32 = 19;
 /// Pin detected self-modifying code. address/arg0=start, arg1=end.

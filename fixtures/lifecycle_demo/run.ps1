@@ -122,9 +122,22 @@ try {
         "LIFECYCLE_PROCESS_START",
         "LIFECYCLE_THREAD_START",
         "LIFECYCLE_THREAD_EXIT",
-        "LIFECYCLE_PROCESS_EXIT"
+        "LIFECYCLE_PROCESS_EXIT",
+        "LIFECYCLE_PREPARE_FINI"
     )) {
         if (-not $captured.Contains($marker)) { throw "missing callback marker: $marker" }
+    }
+    $exitIndex = $captured.IndexOf("LIFECYCLE_PROCESS_EXIT")
+    $prepareIndex = $captured.IndexOf("LIFECYCLE_PREPARE_FINI")
+    if ($exitIndex -lt 0 -or $prepareIndex -le $exitIndex) {
+        throw "exit callbacks were not delivered in process.exit -> process.prepare_fini order"
+    }
+    if (-not $captured.Contains("source=exit_api known=True") -or
+        -not $captured.Contains("trigger=exit_api")) {
+        throw "exit lifecycle fields did not identify the usable exit-API window"
+    }
+    if (-not $captured.Contains("native_prepare=true")) {
+        throw "native Pin PrepareForFini callback was not confirmed"
     }
     $targetOutput = $stdoutTask.Result.Trim()
     $targetError = $stderrTask.Result.Trim()
@@ -138,6 +151,8 @@ try {
         thread_start = $true
         thread_exit = $true
         process_exit = $true
+        process_prepare_fini = $true
+        native_prepare_fini = $true
     } | ConvertTo-Json -Depth 3
 } finally {
     if ($null -ne $pinProcess -and -not $pinProcess.HasExited) {

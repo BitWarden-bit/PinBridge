@@ -12,9 +12,10 @@ use pyo3::types::PyDict;
 const CONTEXT_CHANGE_EXCEPTION: u64 = 4;
 static NEXT_SUBSCRIPTION_ID: AtomicU64 = AtomicU64::new(1);
 
-pub const PUBLIC_EVENT_NAMES: [&str; 26] = [
+pub const PUBLIC_EVENT_NAMES: [&str; 27] = [
     "process.start",
     "process.exit",
+    "process.prepare_fini",
     "thread.start",
     "thread.exit",
     "module.load",
@@ -45,6 +46,8 @@ pub const PUBLIC_EVENT_NAMES: [&str; 26] = [
 pub enum EventSelector {
     Kind(u32),
     Exception,
+    ProcessExit,
+    ProcessPrepareFini,
 }
 
 impl EventSelector {
@@ -70,9 +73,11 @@ impl EventSelector {
             "process.start" | "process_start" | "application.start" => {
                 Self::Kind(EVENT_PROCESS_START)
             }
-            "process.exit" | "process_exit" | "process.exit.prepare" | "prepare_fini" => {
-                Self::Kind(EVENT_PROCESS_EXIT)
-            }
+            "process.exit" | "process_exit" => Self::ProcessExit,
+            "process.prepare_fini"
+            | "process_prepare_fini"
+            | "process.exit.prepare"
+            | "prepare_fini" => Self::ProcessPrepareFini,
             "code.smc" | "smc" | "self_modifying_code" => Self::Kind(EVENT_SMC),
             "pin.detach" | "pin_detach" => Self::Kind(EVENT_PIN_DETACH),
             "pin.attach" | "pin_attach" => Self::Kind(EVENT_PIN_ATTACH),
@@ -102,6 +107,8 @@ impl EventSelector {
     pub fn event_type(self) -> &'static str {
         match self {
             Self::Exception => "exception",
+            Self::ProcessExit => "process.exit",
+            Self::ProcessPrepareFini => "process.prepare_fini",
             Self::Kind(EVENT_HOOK_REGS) => "hook.entry",
             Self::Kind(EVENT_HOOK_RETURN) => "hook.return",
             Self::Kind(EVENT_MEMORY) => "memory",
@@ -133,6 +140,15 @@ impl EventSelector {
 
     pub fn matches(self, event: &EventRecord) -> bool {
         match self {
+            Self::ProcessExit => {
+                event.kind == EVENT_PROCESS_EXIT
+                    && (event.arg1 == PROCESS_EXIT_SOURCE_API
+                        || (event.arg1 == PROCESS_EXIT_SOURCE_PREPARE_FINI && event.arg2 == 0))
+            }
+            Self::ProcessPrepareFini => {
+                event.kind == EVENT_PROCESS_EXIT
+                    && event.arg1 == PROCESS_EXIT_SOURCE_PREPARE_FINI
+            }
             Self::Kind(kind) => event.kind == kind,
             Self::Exception => {
                 event.kind == EVENT_CONTEXT_CHANGE && event.arg0 == CONTEXT_CHANGE_EXCEPTION
@@ -143,17 +159,18 @@ impl EventSelector {
     pub fn is_sticky(self) -> bool {
         matches!(
             self,
-            Self::Kind(EVENT_PROCESS_START) | Self::Kind(EVENT_PROCESS_EXIT)
+            Self::Kind(EVENT_PROCESS_START) | Self::ProcessExit | Self::ProcessPrepareFini
         )
     }
 
     pub fn is_priority(self) -> bool {
         matches!(
             self,
-            Self::Kind(EVENT_THREAD_START)
+            Self::ProcessExit
+                | Self::ProcessPrepareFini
+                | Self::Kind(EVENT_THREAD_START)
                 | Self::Kind(EVENT_THREAD_EXIT)
                 | Self::Kind(EVENT_PROCESS_START)
-                | Self::Kind(EVENT_PROCESS_EXIT)
                 | Self::Kind(EVENT_SMC)
                 | Self::Kind(EVENT_PIN_DETACH)
                 | Self::Kind(EVENT_PIN_ATTACH)
@@ -255,17 +272,34 @@ pub fn build_event_dict(
         EventSelector::Kind(EVENT_PROCESS_START) => {
             row.set_item("phase", "start")?;
         }
-        EventSelector::Kind(EVENT_PROCESS_EXIT) => {
+        EventSelector::ProcessExit => {
             row.set_item("phase", "exiting")?;
             row.set_item("exit_code", event.arg0 as i64)?;
+            row.set_item("exit_code_known", event.arg1 == PROCESS_EXIT_SOURCE_API)?;
             row.set_item(
                 "source",
-                if event.arg1 == 1 {
+                if event.arg1 == PROCESS_EXIT_SOURCE_API {
                     "exit_api"
                 } else {
                     "prepare_fini"
                 },
             )?;
+        }
+        EventSelector::ProcessPrepareFini => {
+            row.set_item("phase", "prepare_fini")?;
+            row.set_item("exit_code", event.arg0 as i64)?;
+            row.set_item("exit_code_known", event.arg2 != 0)?;
+            row.set_item("had_exit_request", event.arg2 != 0)?;
+            row.set_item("native_prepare_reached", event.arg3 != 0)?;
+            row.set_item(
+                "trigger",
+                if event.arg3 != 0 {
+                    "pin_prepare_for_fini"
+                } else {
+                    "exit_api"
+                },
+            )?;
+            row.set_item("source", "prepare_fini")?;
         }
         EventSelector::Kind(EVENT_SMC) => {
             row.set_item("trace_start", event.arg0)?;
@@ -401,6 +435,14 @@ mod tests {
             Some(EventSelector::Exception)
         );
         assert_eq!(EventSelector::parse("not-an-event"), None);
+        assert_eq!(
+            EventSelector::parse("process.exit"),
+            Some(EventSelector::ProcessExit)
+        );
+        assert_eq!(
+            EventSelector::parse("process.prepare_fini"),
+            Some(EventSelector::ProcessPrepareFini)
+        );
         for name in [
             "code.smc",
             "pin.detach",
@@ -415,6 +457,10 @@ mod tests {
             assert!(selector.is_priority());
             assert!(PUBLIC_EVENT_NAMES.contains(&name));
         }
+        assert!(EventSelector::ProcessExit.is_priority());
+        assert!(EventSelector::ProcessPrepareFini.is_priority());
+        assert!(EventSelector::ProcessExit.is_sticky());
+        assert!(EventSelector::ProcessPrepareFini.is_sticky());
         assert!(EventSelector::parse("code.smc")
             .expect("SMC selector")
             .requires_smc_registration());
@@ -442,5 +488,34 @@ mod tests {
         event.arg0 = 1;
         assert!(!EventSelector::Exception.matches(&event));
         assert!(EventSelector::Kind(EVENT_CONTEXT_CHANGE).matches(&event));
+    }
+
+    #[test]
+    fn process_exit_and_prepare_fini_are_distinct_selectors() {
+        let exit_request = EventRecord {
+            kind: EVENT_PROCESS_EXIT,
+            arg1: PROCESS_EXIT_SOURCE_API,
+            ..EventRecord::default()
+        };
+        assert!(EventSelector::ProcessExit.matches(&exit_request));
+        assert!(!EventSelector::ProcessPrepareFini.matches(&exit_request));
+
+        let prepare_after_request = EventRecord {
+            kind: EVENT_PROCESS_EXIT,
+            arg1: PROCESS_EXIT_SOURCE_PREPARE_FINI,
+            arg2: 1,
+            ..EventRecord::default()
+        };
+        assert!(!EventSelector::ProcessExit.matches(&prepare_after_request));
+        assert!(EventSelector::ProcessPrepareFini.matches(&prepare_after_request));
+
+        let prepare_fallback = EventRecord {
+            kind: EVENT_PROCESS_EXIT,
+            arg1: PROCESS_EXIT_SOURCE_PREPARE_FINI,
+            arg2: 0,
+            ..EventRecord::default()
+        };
+        assert!(EventSelector::ProcessExit.matches(&prepare_fallback));
+        assert!(EventSelector::ProcessPrepareFini.matches(&prepare_fallback));
     }
 }
