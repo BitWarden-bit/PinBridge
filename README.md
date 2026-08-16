@@ -1,6 +1,6 @@
 # PinBridge
 
-Windows x64 动态二进制分析平台,基于 Intel Pin 3.31:冻结的 **C ABI**(697 个导出)
+Windows x64/x86 动态二进制分析平台,基于 Intel Pin 3.31:冻结的 **C ABI**(697 个导出)
 把 Pin 的 C++ API 暴露给任何语言;其上是用 Rust 写的**调试 agent**(PinTool)——
 事件引擎、断点/单步、异常与 syscall 观测、全速 trace 录制——并**内嵌 CPython**,
 让分析逻辑成为任意时刻可热加载的 Python 插件;重分析(污点、反混淆)以
@@ -36,7 +36,7 @@ Windows x64 动态二进制分析平台,基于 Intel Pin 3.31:冻结的 **C ABI*
   branch / hook_regs(抓 RCX/RDX/R8/R9)/ syscall(entry/exit 六参+返回值) /
   context_change / module_load/unload;运行时引擎开关、地址范围过滤、
   syscall 号码位图过滤、4096 点运行时 hook(不吃断点槽,"hook 全部 ntdll 导出")
-- **Python 插件**(核心):任意时刻热加载/卸载/同名替换(目标停在断点上也行);
+- **Python 插件**(核心):x64/x86 均可任意时刻热加载/卸载/同名替换(目标停在断点上也行);
   `pb.on` 统一异步事件、`pb.breakpoint` 精确停点处理、`pb.intercept` 同步原生决定
   （子进程、Hook、syscall、异常、调试器事件）;完整动作 API;`pb.print` 输出直达 CLI/TUI
 - **录制与离线重放**:`trace start/stop` 录窗口(档2:指令字节 + 内存读写值),
@@ -52,8 +52,9 @@ Windows x64 动态二进制分析平台,基于 Intel Pin 3.31:冻结的 **C ABI*
 
 ```powershell
 .\Build-Pin.ps1 -Configuration Release -PinRoot <PIN_SDK_ROOT>
-cd bindings\rust; cargo build --release --workspace
-# 产物:target\release\pinbridge_agent.dll(+自动 staged 的 pinbridge.dll、python310.dll)
+cd bindings\rust; .\build-agents.ps1
+# x64: target\release；x86: target\i686-pc-windows-msvc\release
+# 两边都部署 pinbridge_agent.dll、pinbridge.dll 和匹配架构的 CPython 3.10
 ```
 
 跑起来:
@@ -142,7 +143,7 @@ docs/                 scripting.md / taint-roadmap.md
 
 ## 限制与 backlog
 
-- 平台:Windows x64 / Pin 3.31 (build 98869) / Python 3.10;Linux 平台层未做
+- 平台:Windows x64/x86 / Pin 3.31 (build 98869) / Python 3.10;Linux 平台层未做
 - 已知怪癖见 `docs/scripting.md` 末章(稀有类事件在 exec 洪流下会被挤掉——
   等异常/syscall 前先关 exec 类引擎;异常码需 mask 到 u32;……)
 - Backlog:MCP 服务接入(作为客户端接查询协议)、runtime parity 编译期对拍、

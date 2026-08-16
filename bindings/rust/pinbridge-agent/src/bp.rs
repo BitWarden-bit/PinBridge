@@ -1,7 +1,8 @@
 //! Instrumentation breakpoints (no 0xCC, no hardware DR): when Pin JITs an
 //! instruction whose address is in the table, an analysis call (with the
 //! thread context) is inserted. On a hit the thread is redirected into the
-//! park stub via execute_at *before* the bp instruction runs, the breaker
+//! architecture-specific x64/ia32 park stub via execute_at *before* the bp
+//! instruction runs, the breaker
 //! stops the application, and the stopped context is rewound onto the bp
 //! address — the stop is exact and side-effect-free. Set/remove flush the
 //! address range to force re-JIT.
@@ -109,6 +110,17 @@ static STUB_CODE: [u8; 15] = [
     0x74, 0xF7, // je -9 (back to start)
     0xFF, 0x25, 0x01, 0x00, 0x00, 0x00, // jmp qword [rip+1]
 ];
+/// ia32 equivalent (20 bytes total after flag + u32 target):
+///   L0: cmp byte [absolute flag], 0
+///       je L0
+///       jmp dword [absolute target slot]
+/// The two absolute addresses are patched after VirtualAlloc, before the
+/// page is published to analysis callbacks.
+static STUB_CODE_X86: [u8; 15] = [
+    0x80, 0x3D, 0, 0, 0, 0, 0x00, // cmp byte [flag], 0
+    0x74, 0xF7, // je -9 (back to start)
+    0xFF, 0x25, 0, 0, 0, 0, // jmp dword [target slot]
+];
 const STUB_FLAG_OFF: usize = 15;
 const STUB_TARGET_OFF: usize = 16;
 
@@ -121,14 +133,6 @@ static REDIRECT_TID: AtomicU32 = AtomicU32::new(0);
 static REDIRECT_ADDR: AtomicU64 = AtomicU64::new(0);
 
 fn init_stub() {
-    if !crate::arch::is_64() {
-        // The park stub is x86-64 machine code (rip-relative spin + indirect
-        // jmp). An ia32 agent must not plant it: exact stops are unavailable
-        // and breakpoint hits fall back to the inexact-but-safe request_stop
-        // path (redirect_arm sees STUB_BASE == 0 and returns false).
-        crate::log::line("ia32: park stub disabled (x86-64 code); stops fall back to request_stop");
-        return;
-    }
     // MEM_COMMIT|MEM_RESERVE, PAGE_EXECUTE_READWRITE
     let page = unsafe { VirtualAlloc(core::ptr::null_mut(), 4096, 0x3000, 0x40) };
     if page.is_null() {
@@ -136,10 +140,26 @@ fn init_stub() {
         return;
     }
     unsafe {
-        core::ptr::copy_nonoverlapping(STUB_CODE.as_ptr(), page as *mut u8, STUB_CODE.len());
+        if crate::arch::is_64() {
+            core::ptr::copy_nonoverlapping(STUB_CODE.as_ptr(), page as *mut u8, STUB_CODE.len());
+        } else {
+            core::ptr::copy_nonoverlapping(
+                STUB_CODE_X86.as_ptr(),
+                page as *mut u8,
+                STUB_CODE_X86.len(),
+            );
+            let base = page as usize;
+            // x86 addresses are 32-bit by construction; write_unaligned
+            // because the immediate fields begin at byte 2 and byte 11.
+            core::ptr::write_unaligned((base + 2) as *mut u32, (base + STUB_FLAG_OFF) as u32);
+            core::ptr::write_unaligned((base + 11) as *mut u32, (base + STUB_TARGET_OFF) as u32);
+        }
     }
     STUB_BASE.store(page as usize, Ordering::Release);
-    crate::log::line(&format!("park stub at {page:p}"));
+    crate::log::line(&format!(
+        "{} park stub at {page:p}",
+        if crate::arch::is_64() { "x64" } else { "x86" }
+    ));
 }
 
 /// Claims the single park-stub slot for (tid, address). False when another
@@ -159,7 +179,15 @@ fn redirect_arm(tid: u32, address: u64) -> bool {
     REDIRECT_TID.store(tid, Ordering::Release);
     REDIRECT_ADDR.store(address, Ordering::Release);
     unsafe {
-        core::ptr::write_volatile((stub + STUB_TARGET_OFF) as *mut u64, address);
+        if crate::arch::is_64() {
+            core::ptr::write_volatile((stub + STUB_TARGET_OFF) as *mut u64, address);
+        } else {
+            let Ok(address) = u32::try_from(address) else {
+                REDIRECT_ACTIVE.store(false, Ordering::Release);
+                return false;
+            };
+            core::ptr::write_volatile((stub + STUB_TARGET_OFF) as *mut u32, address);
+        }
         core::ptr::write_volatile((stub + STUB_FLAG_OFF) as *mut u8, 0);
     }
     true
@@ -175,8 +203,7 @@ unsafe fn rewind_redirected() {
     let tid = REDIRECT_TID.load(Ordering::Acquire);
     let address = REDIRECT_ADDR.load(Ordering::Acquire);
     let mut context: PbContextHandle = core::ptr::null_mut();
-    if pb_pin_get_stopped_thread_writeable_context(tid, &mut context) == PB_OK
-        && !context.is_null()
+    if pb_pin_get_stopped_thread_writeable_context(tid, &mut context) == PB_OK && !context.is_null()
     {
         pb_pin_set_context_reg(context, crate::arch::instr_ptr_reg(), address);
     }

@@ -36,4 +36,8 @@ fn tool_main(argc: c_int, argv: *mut *mut c_char) -> c_int {
     }
 }
 
+// The Rust test harness owns the executable `main` when Cargo builds this
+// cdylib as a lib-test target. Export Pin's `main` only for the actual tool
+// DLL, otherwise `cargo test --workspace` links two definitions (LNK2005).
+#[cfg(not(test))]
 pinbridge_tool::tool_entry!(tool_main);

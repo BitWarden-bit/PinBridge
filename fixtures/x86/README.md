@@ -80,15 +80,27 @@ pinbridge-cli --port 9001 events --limit 16
 The entry-point stop (`--entry-bp`, default on) gives a deterministic point to
 set breakpoints or arm the trace before the first instruction runs.
 
+## ia32 Python 回归
+
+仓库的 Rust 构建脚本会准备匹配架构的 CPython embeddable 运行时并构建带脚本宿主的 x86
+agent。以下测试在真实 ia32 Pin 下停在 PE 入口，由 x86 Python 读取 EIP、反汇编并注册下一
+落点的精确断点；回调必须收到 `arch="x86"`、`pointer_width=4` 和完整 x86 寄存器后恢复目标：
+
+```powershell
+cd bindings\rust
+.\build-agents.ps1 -BuildX64 $false
+cd ..\..
+.\fixtures\x86\run_python.ps1
+```
+
 ## Limits without an ia32 runtime
 
 `hello32.exe` builds and its PE headers are fully verifiable on any machine
-with an x86 compiler, but **tracing it under Pin requires an ia32 toolchain**
-that this repo does not ship:
+with an x86 compiler, but **在 Pin 下运行仍要求 ia32 运行时**：
 
 - an ia32 Pin kit (`ia32/bin/pin.exe`), and
-- an ia32 agent build (`build/pin/ia32/Release/pinbridge.dll` plus an
-  `ia32/pinbridge_agent.dll` next to the launcher).
+- an ia32 bridge build (`build/pin/ia32/Release/pinbridge.dll`)；Rust agent 和匹配的 x86
+  CPython 可由 `bindings/rust/build-agents.ps1` 生成。
 
 If either is missing, `pinbridge-cli run` fails with a descriptive `x86`
 architecture error instead of faking i686 support. The PE-parser unit tests

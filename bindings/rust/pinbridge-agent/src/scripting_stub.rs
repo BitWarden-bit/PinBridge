@@ -1,8 +1,8 @@
 //! No-Python build of the in-agent scripting host.
 //!
-//! Compiled in place of `scripting` when the `scripting` feature is off
-//! (the i686 x86 build, where pyo3 cannot match a 64-bit CPython). The
-//! query server, breaker, and trace paths keep calling `crate::scripting::*`
+//! Compiled in place of `scripting` when the `scripting` feature is explicitly
+//! disabled with `--no-default-features` on either x64 or x86. The query
+//! server, breaker, and trace paths keep calling `crate::scripting::*`
 //! through this module, which supplies the same names and shapes with fixed
 //! answers: every scripting op reports "python scripting disabled in this
 //! build", while the control plane and trace recording stay fully usable.

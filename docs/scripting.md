@@ -19,7 +19,8 @@ Python 插件在运行时通过控制协议热加载/热卸载（哪怕目标正
   `LoadLibraryW`），之后的 delay-load 解析直接命中这个已加载模块。
 - **LNK1194 绕过**：delay-load 不覆盖 CPython 的 DATA 导入（异常单例、bool 类型、
   None/True/False 等 `__imp_<Name>` 指针单元格）。`scripting/python_data.rs` 自己定义这些
-  单元格，预加载后用 `GetProcAddress` 逐个填充，首个 pyo3 调用之前完成。
+  单元格，预加载后用 `GetProcAddress` 逐个填充，首个 pyo3 调用之前完成。ia32 版本另外按
+  MSVC x86 的前导下划线规则导出精确 IAT 名称，避免把 x64 符号命名假设带进 32 位链接。
 - **线程纪律（神圣不可退）**：所有 Python 只跑在**一条专用脚本线程**（Pin 内部线程）上，
   永不进 Pin 分析回调。插件的每个 `pb.*` 动作都是一次到查询服务线程的 loopback RPC
   （微秒级，每次调用一条短连接——查询服务单线程，长连接会饿死 UI)。宿主 tick ~5ms：
@@ -53,8 +54,21 @@ Python 插件在运行时通过控制协议热加载/热卸载（哪怕目标正
 - `python310.zip`（**可选**嵌入式标准库；存在即切 isolated 配置，module search path =
   zip + agent 目录，完全不需要系统 Python)
 
-agent 的 build.rs 会把 `pinbridge.dll` 和 `python310.dll`（从 `PYTHON_SYS_EXECUTABLE` /
-PATH 上的 python / 标准 per-user 安装目录找）自动摆到 agent 旁边，找不到只告警不报错。
+agent 的 build.rs 会先校验 PE Machine，再把 `pinbridge.dll` 和匹配目标架构的
+`python310.dll`（从 `PINBRIDGE_PYTHON_DIST`、`PYTHON_SYS_EXECUTABLE`、PATH 或标准 per-user
+安装目录找）自动摆到 agent 旁边；嵌入发行版存在 `python310.zip` 时一并部署。找不到只告警
+不报错，绝不会把主机的 64 位 Python 错拷进 x86 输出。
+
+x64 与带 Python 的 x86 agent 可统一构建：
+
+```powershell
+cd bindings\rust
+.\build-agents.ps1
+```
+
+脚本把 Python.org 官方 CPython 3.10.11 x86 embeddable 包放到用户 LocalAppData 缓存并校验
+SHA-256，不把约 7.3 MB 的运行时压缩包提交进 Git；PyO3 使用交叉编译配置生成 x86 import
+library。`--no-default-features` 仍保留为明确选择的无 Python 原生 agent 构建方式。
 
 **python310.dll 缺失时 agent 照常工作**，只是脚本功能不可用（日志一行提示，`script run`
 报 "python unavailable")。
@@ -155,7 +169,7 @@ service-class 高位会在进入事件和过滤器前移除。entry/exit 通过�
 - `pb.read_mem(addr, len) -> bytes | None`（单次 ≤1MB)
 - `pb.write_mem(addr, data: bytes) -> int`（实际写入字节数，0 = 被拒）
 
-寄存器（要求停止状态；18 个 GP 名：rax..r15、rip、rflags):
+寄存器（要求停止状态；x64：rax..r15/rip/rflags，x86：eax..edi/eip/eflags）：
 - `pb.get_reg(tid, name) -> int | None`;`pb.set_reg(tid, name, value) -> bool`
 
 符号、导出与反汇编：

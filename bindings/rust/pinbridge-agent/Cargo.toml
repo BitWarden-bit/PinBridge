@@ -9,10 +9,9 @@ crate-type = ["cdylib"]
 
 [features]
 default = ["scripting"]
-# In-agent CPython scripting host. Disable for the x86 (i686) build: pyo3
-# requires the CPython architecture to match the target, and there is no
-# 32-bit CPython in this tree. Everything else (control plane, trace,
-# breakpoints) keeps working through the scripting_stub module.
+# In-agent CPython scripting host. x86 cross-builds set PYO3_CROSS_* and point
+# PINBRIDGE_PYTHON_DIST at a 32-bit CPython 3.10 embeddable distribution.
+# `--no-default-features` remains the explicit native-only fallback.
 scripting = ["dep:pyo3"]
 
 [dependencies]
@@ -23,7 +22,7 @@ pinbridge-client = { path = "../pinbridge-client" }
 # Embedded CPython for the in-agent scripting host. No auto-initialize: the
 # interpreter is started manually on the scripting thread (PyConfig path) so
 # agent_main never touches the OS loader during Pin's tool-load sequence.
-pyo3 = { version = "0.22", optional = true }
+pyo3 = { version = "0.22", optional = true, features = ["generate-import-lib"] }
 
 [build-dependencies]
 pinbridge-tool = { path = "../pinbridge-tool" }

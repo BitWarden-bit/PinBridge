@@ -1,28 +1,29 @@
 [CmdletBinding()]
 param(
-    [ValidateRange(45, 120)]
-    [int]$TimeoutSec = 75
+    [ValidateRange(20, 120)]
+    [int]$TimeoutSec = 60
 )
 
 $ErrorActionPreference = "Stop"
 $dir = $PSScriptRoot
 $repo = (Resolve-Path -LiteralPath (Join-Path $dir "..\..")).Path
 $bundle = Split-Path -Parent $repo
-$target = Join-Path $dir "hook_action_demo_x64.exe"
-$scriptPath = Join-Path $dir "bound_breakpoint.py"
+$target = Join-Path $dir "hello32.exe"
+$plugin = Join-Path $dir "python_probe.py"
 $cli = Join-Path $repo "bindings\rust\target\release\pinbridge-cli.exe"
-$agent = Join-Path $repo "bindings\rust\target\release\pinbridge_agent.dll"
-$pin = Join-Path $bundle "VMP_Offline_Recovery_Kit_20260803_FINAL\runtime\pin\intel64\bin\pin.exe"
+$agent = Join-Path $repo "bindings\rust\target\i686-pc-windows-msvc\release\pinbridge_agent.dll"
+$pythonDll = Join-Path (Split-Path -Parent $agent) "python310.dll"
+$pythonZip = Join-Path (Split-Path -Parent $agent) "python310.zip"
+$pin = Join-Path $bundle "VMP_Offline_Recovery_Kit_20260803_FINAL\runtime\pin\ia32\bin\pin.exe"
 
-foreach ($path in @($target, $scriptPath, $cli, $agent, $pin)) {
+foreach ($path in @($target, $plugin, $cli, $agent, $pythonDll, $pythonZip, $pin)) {
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
-        throw "required file not found: $path"
+        throw "required x86 Python test file not found: $path"
     }
 }
 
 function Get-FreePort {
-    $listener = [System.Net.Sockets.TcpListener]::new(
-        [System.Net.IPAddress]::Loopback, 0)
+    $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
     try {
         $listener.Start()
         return ([System.Net.IPEndPoint]$listener.LocalEndpoint).Port
@@ -62,14 +63,19 @@ function Invoke-Cli {
 $port = Get-FreePort
 $script:Port = $port
 $script:Cli = $cli
-$oldPort = $env:PINBRIDGE_AGENT_PORT
-$oldEngines = $env:PINBRIDGE_AGENT_ENGINES
-$oldEntry = $env:PINBRIDGE_ENTRY_BP
+$log = Join-Path $dir ("x86_python_{0}.agent.log" -f $port)
+$saved = @{
+    Port = $env:PINBRIDGE_AGENT_PORT
+    Log = $env:PINBRIDGE_AGENT_LOG
+    Engines = $env:PINBRIDGE_AGENT_ENGINES
+    Entry = $env:PINBRIDGE_ENTRY_BP
+}
 $pinProcess = $null
 
 try {
     $env:PINBRIDGE_AGENT_PORT = $port.ToString()
-    $env:PINBRIDGE_AGENT_ENGINES = "syscall"
+    $env:PINBRIDGE_AGENT_LOG = $log
+    $env:PINBRIDGE_AGENT_ENGINES = "none"
     $env:PINBRIDGE_ENTRY_BP = "1"
     $start = [System.Diagnostics.ProcessStartInfo]::new()
     $start.FileName = $pin
@@ -86,63 +92,61 @@ try {
     $stderrTask = $pinProcess.StandardError.ReadToEndAsync()
 
     $deadline = [datetime]::UtcNow.AddSeconds($TimeoutSec)
-    while ([datetime]::UtcNow -lt $deadline) {
-        if ($pinProcess.HasExited) { throw "Pin exited before control plane was ready" }
-        try {
-            if (Invoke-Cli -Command @("ping")) { break }
-        } catch {}
-        Start-Sleep -Milliseconds 150
+    $connected = $false
+    while ([datetime]::UtcNow -lt $deadline -and -not $pinProcess.HasExited) {
+        try { if (Invoke-Cli -Command @("ping")) { $connected = $true; break } } catch {}
+        Start-Sleep -Milliseconds 100
     }
-    if ([datetime]::UtcNow -ge $deadline) { throw "control plane did not become ready" }
+    if (-not $connected) { throw "x86 control plane did not become ready" }
 
     $loaded = $false
     while ([datetime]::UtcNow -lt $deadline -and -not $loaded) {
         try {
-            [void](Invoke-Cli -Command @("script", "run", $scriptPath))
+            [void](Invoke-Cli -Command @("script", "run", $plugin))
             $loaded = $true
         } catch {
             Start-Sleep -Milliseconds 100
         }
     }
-    if (-not $loaded) { throw "bound breakpoint plugin did not compile" }
+    if (-not $loaded) { throw "x86 Python plugin did not compile" }
 
-    $ready = $false
-    while ([datetime]::UtcNow -lt $deadline -and -not $ready -and -not $pinProcess.HasExited) {
-        try {
-            $output = Invoke-Cli -Command @("script", "output")
-            $ready = $ready -or $output.Contains("BOUND_BP_READY")
-        } catch {}
+    $captured = ""
+    while ([datetime]::UtcNow -lt $deadline -and
+           -not $captured.Contains("X86_PYTHON_READY")) {
+        try { $captured = Invoke-Cli -Command @("script", "output") } catch {}
         Start-Sleep -Milliseconds 50
     }
-    if (-not $ready) { throw "bound breakpoint was not registered" }
+    if (-not $captured.Contains("X86_PYTHON_READY")) {
+        throw "x86 Python plugin did not initialize"
+    }
 
     [void](Invoke-Cli -Command @("resume"))
-    $hit = $false
     while ([datetime]::UtcNow -lt $deadline -and -not $pinProcess.HasExited) {
-        try {
-            $output = Invoke-Cli -Command @("script", "output")
-            $hit = $hit -or $output.Contains("BOUND_BP_HIT")
-        } catch {}
-        if ($hit) { break }
+        try { $captured = Invoke-Cli -Command @("script", "output") } catch {}
+        if ($captured.Contains("callback failed")) {
+            throw "x86 Python breakpoint callback reported an error"
+        }
         Start-Sleep -Milliseconds 50
     }
-    if (-not $hit) { throw "bound breakpoint callback was not delivered" }
-
-    while (-not $pinProcess.HasExited -and [datetime]::UtcNow -lt $deadline) {
-        Start-Sleep -Milliseconds 100
-    }
-    if (-not $pinProcess.HasExited) { throw "target did not exit" }
+    if (-not $pinProcess.HasExited) { throw "x86 target did not exit" }
     [void]$pinProcess.WaitForExit()
+    if (Test-Path -LiteralPath $log) {
+        $captured += "`n" + (Get-Content -LiteralPath $log -Raw -Encoding UTF8)
+    }
+    if (-not $captured.Contains("X86_PYTHON_BREAKPOINT_PASS")) {
+        throw "x86 exact Python breakpoint callback did not run"
+    }
     $targetOutput = $stdoutTask.Result.Trim()
     $targetError = $stderrTask.Result.Trim()
-    if ($targetOutput -notmatch "hooked=4660") {
-        throw "callback did not modify the stopped context: $targetOutput $targetError"
+    if ($pinProcess.ExitCode -ne 0 -or $targetOutput -notmatch "hello32: input=pinbridge-ia32") {
+        throw "x86 target failed: exit=$($pinProcess.ExitCode) stdout=$targetOutput stderr=$targetError"
     }
     [ordered]@{
-        result = "BOUND_BREAKPOINT_PASS"
-        port = $port
+        result = "X86_PYTHON_BREAKPOINT_PASS"
         target_exit = $pinProcess.ExitCode
-        callback_seen = $hit
+        control_port = $port
+        python_initialized = $true
+        exact_breakpoint_callback = $true
         target_output = $targetOutput
     } | ConvertTo-Json -Depth 3
 } finally {
@@ -150,19 +154,16 @@ try {
         $pinProcess.Kill()
         $pinProcess.WaitForExit()
     }
-    if ($null -eq $oldPort) {
-        Remove-Item Env:PINBRIDGE_AGENT_PORT -ErrorAction SilentlyContinue
-    } else {
-        $env:PINBRIDGE_AGENT_PORT = $oldPort
-    }
-    if ($null -eq $oldEngines) {
-        Remove-Item Env:PINBRIDGE_AGENT_ENGINES -ErrorAction SilentlyContinue
-    } else {
-        $env:PINBRIDGE_AGENT_ENGINES = $oldEngines
-    }
-    if ($null -eq $oldEntry) {
-        Remove-Item Env:PINBRIDGE_ENTRY_BP -ErrorAction SilentlyContinue
-    } else {
-        $env:PINBRIDGE_ENTRY_BP = $oldEntry
+    foreach ($entry in @(
+        @("PINBRIDGE_AGENT_PORT", $saved.Port),
+        @("PINBRIDGE_AGENT_LOG", $saved.Log),
+        @("PINBRIDGE_AGENT_ENGINES", $saved.Engines),
+        @("PINBRIDGE_ENTRY_BP", $saved.Entry)
+    )) {
+        if ($null -eq $entry[1]) {
+            Remove-Item ("Env:" + $entry[0]) -ErrorAction SilentlyContinue
+        } else {
+            Set-Item ("Env:" + $entry[0]) $entry[1]
+        }
     }
 }
