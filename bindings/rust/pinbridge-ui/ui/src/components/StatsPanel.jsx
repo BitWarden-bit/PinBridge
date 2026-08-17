@@ -22,11 +22,15 @@ export default function StatsPanel() {
     const w = c.clientWidth, h = c.clientHeight;
     ctx.clearRect(0, 0, w, h);
     if (rateHistory.length < 2) return;
-    const max = Math.max(...rateHistory, 1);
+    const chartValues = rateHistory.map((value) => {
+      const number = Number(value);
+      return Number.isSafeInteger(number) && number >= 0 ? number : 0;
+    });
+    const max = Math.max(...chartValues, 1);
     ctx.strokeStyle = "#f2f2f2";
     ctx.lineWidth = 1.5;
     ctx.beginPath();
-    rateHistory.forEach((v, i) => {
+    chartValues.forEach((v, i) => {
       const x = (i / (159 - 1)) * w;
       const y = h - (v / max) * (h - 6) - 3;
       i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
@@ -36,7 +40,22 @@ export default function StatsPanel() {
 
   const s = getSnapshot();
   const t = useT();
-  const fmt = (n) => n.toLocaleString("en-US");
+  // Counters cross the Tauri boundary as decimal strings to preserve u64
+  // precision. Convert only for bounded display/chart arithmetic.
+  const fmt = (n) => {
+    const text = String(n ?? "0");
+    const value = Number(text);
+    return Number.isSafeInteger(value) ? value.toLocaleString("en-US") : text;
+  };
+  const minDecimal = (a, b) => {
+    try {
+      const left = BigInt(String(a ?? "0"));
+      const right = BigInt(String(b ?? "0"));
+      return (left < right ? left : right).toString();
+    } catch {
+      return "0";
+    }
+  };
   const names = ["Hook", "Mem", "Exec", "Branch", "Sys", "Ctx"];
   return (
     <div id="stats">
@@ -50,7 +69,7 @@ export default function StatsPanel() {
         ))}
       </div>
       <div id="ringtext" style={{ color: "var(--dim)", marginTop: 4 }}>
-        ring {fmt(Math.min(s.total, s.capacity))}/{fmt(s.capacity)}
+        ring {fmt(minDecimal(s.total, s.capacity))}/{fmt(s.capacity)}
       </div>
     </div>
   );

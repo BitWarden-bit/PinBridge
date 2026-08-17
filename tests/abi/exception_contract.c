@@ -9,6 +9,8 @@ int main(void){PbExceptionInfoHandle h=0;PbExceptionCode code=0;PbExceptionClass
  if(pb_pin_set_exception_address(h,0x300)!=PB_OK||pb_pin_get_exception_address(h,&v)!=PB_OK||v!=0x300||pb_pin_exception_to_string(h,0,0,&required)!=PB_ERR_BUFFER_TOO_SMALL||pb_pin_exception_to_string(h,text,sizeof(text),&required)!=PB_OK||strstr(text,"mock")==0)return 5;
  if(pb_exception_info_release(h)!=PB_OK)return 6;
  if(pb_pin_init_windows_exception_info(0xdead,0x400,args,2,&h)!=PB_OK||pb_pin_count_windows_exception_arguments(h,&n)!=PB_OK||n!=2||pb_pin_get_windows_exception_code(h,&n)!=PB_OK||n!=0xdead||pb_pin_get_windows_exception_argument(h,1,&v)!=PB_OK||v!=22)return 7;
- if(pb_pin_get_windows_exception_argument(h,2,&v)!=PB_ERR_INVALID_ARGUMENT||pb_exception_info_release(h)!=PB_OK)return 8;
- if(pb_pin_init_exception_info(PB_EXCEPTCODE_WINDOWS,0,&h)!=PB_ERR_INVALID_ARGUMENT||pb_pin_init_windows_exception_info(0,0,args,6,&h)!=PB_ERR_INVALID_ARGUMENT||pb_pin_get_exception_code(0,&code)!=PB_ERR_INVALID_ARGUMENT)return 9;
+ v=1;known=1;type=PB_FAULTY_ACCESS_WRITE;
+ if(pb_pin_get_faulty_access_address(h,&v,&known)!=PB_ERR_INVALID_ARGUMENT||v!=0||known!=0||pb_pin_get_faulty_access_type(h,&type)!=PB_ERR_INVALID_ARGUMENT||type!=PB_FAULTY_ACCESS_TYPE_UNKNOWN)return 8;
+ if(pb_pin_get_windows_exception_argument(h,2,&v)!=PB_ERR_INVALID_ARGUMENT||pb_exception_info_release(h)!=PB_OK)return 9;
+ if(pb_pin_init_exception_info(PB_EXCEPTCODE_WINDOWS,0,&h)!=PB_ERR_INVALID_ARGUMENT||pb_pin_init_windows_exception_info(0,0,args,6,&h)!=PB_ERR_INVALID_ARGUMENT||pb_pin_get_exception_code(0,&code)!=PB_ERR_INVALID_ARGUMENT)return 10;
  return 0;}

@@ -2147,6 +2147,7 @@ unsafe extern "C" {
     pub fn pb_pin_fetch_code(copy_buffer: *mut c_void, address: u64, max_size: u64, exception_info: PbExceptionInfoHandle, out_copied: *mut u64) -> PbStatus;
     pub fn pb_pin_fetch_original_code(copy_buffer: *mut c_void, address: u64, max_size: u64, exception_info: PbExceptionInfoHandle, out_copied: *mut u64) -> PbStatus;
     pub fn pb_pin_add_internal_exception_handler(callback: PbInternalExceptionCallback, user_data: *mut c_void, out_callback: *mut PbCallbackHandle) -> PbStatus;
+    pub fn pb_pin_enable_single_step_passthrough(out_callback: *mut PbCallbackHandle) -> PbStatus;
     pub fn pb_pin_try_start(thread_id: PbThreadId, callback: PbInternalExceptionCallback, user_data: *mut c_void, out_scope: *mut PbCallbackHandle) -> PbStatus;
     pub fn pb_pin_try_end(thread_id: PbThreadId, scope: *mut PbCallbackHandle) -> PbStatus;
     pub fn pb_pin_add_memory_address_trans_function(callback: PbMemoryAddressTransCallback, user_data: *mut c_void) -> PbStatus;

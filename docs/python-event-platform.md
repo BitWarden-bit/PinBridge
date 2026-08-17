@@ -130,6 +130,20 @@ Python 处理函数不能通过返回值绕过其他插件。旧脚本直接调�
   后继地址槽，取消或完成单步绝不能删除普通断点。
 - 单步请求记录目标 Pin 线程编号。其他线程即使先执行到同一后继地址，也不能完成这次
   单步；真正落点仍在指令执行前通过精确停泊交给 Python。
+
+### 目标程序自己的 TF 单步异常
+
+目标通过 `POPF/POPFD/POPFQ` 设置 TF 时，处理规则与平台单步严格分离。PinBridge 在 JIT
+代码缓存真正设置物理 TF 之前模拟 POPF 的用户态标志语义，执行下一条应用指令后，使用
+`PIN_RaiseException` 在应用上下文重新产生 `EXCEPTION_SINGLE_STEP (0x80000004)`：
+
+- 默认交给目标程序原有 VEH/SEH，不得按 Pin 内部崩溃处理；
+- 同一事件仍进入 context-change 高优先级通道，可被 Python 观察或按显式策略接管；
+- 平台断点/单步由自己的所有权表处理，不会误投递给目标；
+- 重投递前先清除原生 pending 状态，避免异常递归。
+
+覆盖测试 `pb_single_step_fixture` 会在运行时生成
+`pushfq; or [rsp],0x100; popfq; nop; ret`，校验 VEH 只收到一次异常且 RIP 位于 RET。
 - 当前停止指令恢复时只抑制目标线程的一次重放。自环跳转第二次回到同一地址必须被视为
   真实落点，不能被重复抑制。
 - x64 流程解码使用 XED 64 位长模式和 RAX/RIP 等寄存器；x86 使用 XED 32 位传统模式和
@@ -235,6 +249,11 @@ Fini 总结同时记录 `oom_total`。
 JIT 和 Probe 的分离完成回调在 C ABI v1.6 中严格分开：
 `pb_pin_add_detach_function` 对应 JIT，`pb_pin_add_detach_function_probed` 对应 Probe；
 C 后端和 agent 都按当前模式选择，避免把 Probe 回调注册到 JIT 启动路径。
+
+Probe 是面向 VMP 等异常敏感目标的兼容执行模式，不是 JIT 的同功能别名。Agent 在该模式
+只注册 Fini、模块、应用启动和 probed detach 回调；内存转换、XED、内部异常、系统调用、
+上下文变化、调试器及逐指令/Trace 回调不会注册。这样目标保持原生异常语义，控制端口和
+Python 宿主仍可使用，但脚本不能在 Probe 会话中要求断点、单步或指令级策略。
 
 平台现在提供 `pb.pin_state/pin_attach_supported/pin_detach/pin_attach`。初始会话和重新附加
 共用同一份注册清单；支持重新附加的平台会重新注册指令、函数/Trace/基本块、异常、系统

@@ -306,3 +306,18 @@ pub fn register() -> PbStatus {
         pb_img_add_instrument_function(Some(on_image_load), core::ptr::null_mut(), &mut image_load)
     }
 }
+
+/// Probe-mode lifecycle registration. Routine call insertion, context-bearing
+/// thread callbacks and prepare-for-fini are intentionally omitted: probe
+/// mode must leave protected application code native and only uses Pin's
+/// documented application-start notification here.
+pub fn register_probe() -> PbStatus {
+    unsafe {
+        let mut application_start = PbCallbackHandle { opaque: 0 };
+        pb_pin_add_application_start_function(
+            Some(on_application_start),
+            core::ptr::null_mut(),
+            &mut application_start,
+        )
+    }
+}

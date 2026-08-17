@@ -21,7 +21,7 @@ export async function callWithError(fn, args = {}) {
 
 export const api = {
   control: (action) => call("cmd_control", { action }),
-  launch: (target) => call("cmd_launch", { target }),
+  launch: (target, options = {}) => call("cmd_launch", { target, ...options }),
   killBackend: () => call("cmd_kill_backend"),
   session: () => call("cmd_session"),
   step: (tid, over) => call("cmd_step", { tid, over }),
@@ -31,10 +31,22 @@ export const api = {
   disasm: (address, count = 64) => call("cmd_disasm", { address, count }),
   disasmUp: (address, count = 64) => call("cmd_disasm_up", { address, count }),
   bpSet: (address) => call("cmd_bp_set", { address }),
-  bpRemove: (id) => call("cmd_bp_remove", { id }),
+  bpRemove: (id) => call("cmd_bp_remove", { id: String(id) }),
   bpList: () => call("cmd_bp_list"),
   modules: () => call("cmd_modules"),
   readMem: (address, size = 256) => call("cmd_read_mem", { address, size }),
   writeMem: (address, data) => call("cmd_write_mem", { address, data }),
   resolve: (addresses) => call("cmd_resolve", { addresses }),
+  // AI control is a thin adapter to the trusted Tauri Human adapter; an
+  // unavailable Hub is surfaced as a connection error, never simulated.
+  // Handoff authorization is injected by trusted Tauri code. React does not
+  // receive, store, or forward an operator token.
+  ai: {
+    controlStatus: () => callWithError("control_status"),
+    handoffToAi: () => callWithError("control_handoff_to_ai"),
+    takeoverManual: () => callWithError("control_takeover_manual"),
+    sessionStatus: () => callWithError("session_status"),
+    activityList: (args = {}) => callWithError("activity_list", { ...args, limit: String(args.limit ?? "100") }),
+    activityGet: (operationId) => callWithError("activity_get", { operation_id: operationId }),
+  },
 };

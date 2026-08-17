@@ -102,8 +102,19 @@ fn agent_main(argc: c_int, argv: *mut *mut c_char) -> c_int {
             arch::name(),
             arch::pointer_width()
         ));
+        // PIN_IsProbeMode is reliable here because the launcher supplies
+        // `-probe 1`. Detect the execution mode before any subsystem can
+        // register a JIT-only global callback.
+        let session_status = pin_session::initialize();
+        log::line(&format!("Pin session initialize -> {session_status}"));
+        if session_status != PB_OK {
+            return 18;
+        }
         emergency::initialize();
-        diag::install(); // Pin APIs inside: must run after pb_pin_init
+        // Pin's internal exception callback is a JIT-mode callback. Keep the
+        // native Windows crash logger in probe mode, but do not register an
+        // API that would make PIN_StartProgramProbed reject the tool.
+        diag::install(!pin_session::is_probe_mode());
         if ring::init() != PB_OK {
             log::line("ring init failed");
             return 3;
@@ -138,7 +149,15 @@ fn agent_main(argc: c_int, argv: *mut *mut c_char) -> c_int {
             return 7;
         }
         engines::configure_from_env();
-        let native_policy_status = scripting::initialize_native_policies();
+        let native_policy_status = if pin_session::is_probe_mode() {
+            // Memory translation and pre-XED decode callbacks are JIT-mode
+            // APIs. Merely registering them makes PIN_StartProgramProbed
+            // reject the whole tool, even while their policies are empty.
+            log::line("python native JIT policies disabled in probe mode");
+            PB_OK
+        } else {
+            scripting::initialize_native_policies()
+        };
         log::line(&format!("python native policies init -> {native_policy_status}"));
         if native_policy_status != PB_OK {
             return 15;
@@ -147,11 +166,6 @@ fn agent_main(argc: c_int, argv: *mut *mut c_char) -> c_int {
         // Finish native session setup before starting the Python host. A user
         // script may call pin_detach() as soon as its top level runs, so no
         // session-scoped callback can be registered after scripting::spawn.
-        let session_status = pin_session::initialize();
-        log::line(&format!("Pin session initialize -> {session_status}"));
-        if session_status != PB_OK {
-            return 18;
-        }
         if let Err(failure) = pin_session::register_callbacks(false) {
             log::line(&format!(
                 "initial Pin session registration failed at {} -> {}",
@@ -159,7 +173,14 @@ fn agent_main(argc: c_int, argv: *mut *mut c_char) -> c_int {
             ));
             return 19;
         }
-        if std::env::var("PINBRIDGE_ENTRY_BP").ok().as_deref() == Some("1") {
+        let probe_mode = pin_session::is_probe_mode();
+        log::line(&format!(
+            "execution mode: {}",
+            if probe_mode { "probe" } else { "jit" }
+        ));
+        if probe_mode && std::env::var("PINBRIDGE_ENTRY_BP").ok().as_deref() == Some("1") {
+            log::line("entry bp disabled: unavailable in probe mode");
+        } else if std::env::var("PINBRIDGE_ENTRY_BP").ok().as_deref() == Some("1") {
             // The main image is not in the image list at tool-init time, so
             // plant the one-shot entry breakpoint from the image-load
             // callback instead (still before the first instruction runs).
@@ -192,9 +213,13 @@ fn agent_main(argc: c_int, argv: *mut *mut c_char) -> c_int {
             return 8;
         }
 
-        log::line("start program");
-
-        pb_pin_start_program_default()
+        if probe_mode {
+            log::line("start program (probe mode)");
+            pb_pin_start_program_probed()
+        } else {
+            log::line("start program (jit mode)");
+            pb_pin_start_program_default()
+        }
     }
 }
 

@@ -41,6 +41,7 @@ struct Config {
     agent: Option<String>,
     target: Vec<String>,
     entry_bp: bool,
+    pin_probe: bool,
 }
 
 fn parse_args() -> Config {
@@ -51,6 +52,7 @@ fn parse_args() -> Config {
         agent: None,
         target: Vec::new(),
         entry_bp: true,
+        pin_probe: false,
     };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -65,6 +67,7 @@ fn parse_args() -> Config {
             "--agent" => config.agent = args.next(),
             "--entry-bp" => config.entry_bp = true,
             "--no-entry-bp" => config.entry_bp = false,
+            "--pin-probe" => config.pin_probe = true,
             "--" => config.target.extend(args.by_ref()),
             other if other.starts_with("--") => {
                 eprintln!("unknown option: {other}");
@@ -122,6 +125,7 @@ fn maybe_spawn_backend(config: &Config) -> Option<Child> {
         arch: None, // auto-detect from the target's PE headers
         port: config.port,
         entry_bp: config.entry_bp,
+        probe_mode: config.pin_probe,
     };
     match launch::launch_for_target(&options, &config.target, STARTUP_TIMEOUT) {
         Ok((child, _port)) => Some(child),

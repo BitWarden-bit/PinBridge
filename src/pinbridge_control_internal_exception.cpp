@@ -31,6 +31,18 @@ PbStatus PB_CALL pb_pin_add_internal_exception_handler(
     });
 }
 
+PbStatus PB_CALL pb_pin_enable_single_step_passthrough(
+    PbCallbackHandle* out_callback)
+{
+    if (out_callback)
+        out_callback->opaque = 0;
+    if (!out_callback)
+        return PB_ERR_INVALID_ARGUMENT;
+    return GuardInternalException([&]() {
+        return PbBackendEnableSingleStepPassthrough(&out_callback->opaque);
+    });
+}
+
 PbStatus PB_CALL pb_pin_try_start(
     PbThreadId thread_id, PbInternalExceptionCallback callback, void* user_data,
     PbCallbackHandle* out_scope)

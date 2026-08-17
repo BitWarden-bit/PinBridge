@@ -133,6 +133,31 @@ $cli = ".\bindings\rust\target\release\pinbridge-cli.exe"
 & $cli --port 9011 events 20
 ```
 
+### VMP / 异常敏感目标
+
+默认 JIT 模式保留断点、单步、系统调用和逐指令插桩。对于通过
+`POPF/POPFD/POPFQ` 打开 TF 的目标，PinBridge 会在应用指令边界虚拟化该 TF，并用应用
+上下文重新抛出 `0x80000004`；异常仍进入目标原有 VEH/SEH，同时经过 PinBridge 的异常
+事件通道。平台自有断点不会走这条重投递链。
+
+只有遇到尚未兼容的代码缓存/反 DBI 行为时，才使用探针保底模式：
+
+```powershell
+& $cli `
+  --pin "$env:PIN_ROOT\intel64\bin\pin.exe" `
+  --agent ".\bindings\rust\target\release\pinbridge_agent.dll" `
+  --pin-probe --no-entry-bp run -- "C:\path\protected.exe"
+```
+
+上面的 `run` 会进入 PinBridge 控制 shell。目标本身也读取控制台输入时，优先使用桌面启动页；
+或在目标终端用 `pin.exe -probe 1 -t <agent> -- <target>` 启动，再从第二个终端连接 CLI，
+避免控制 shell 与目标菜单竞争同一个标准输入。
+
+探针模式让目标机器码原生执行，保留控制端口、Python 宿主、模块加载/卸载、应用启动、
+最终退出和探针分离通知。入口断点、单步、异常上下文接管、系统调用及指令/基本块/Trace
+插桩属于 JIT 能力，在该模式中不启用。桌面启动页的“VMP / 异常兼容探针模式”使用同一
+条启动链路，并自动关闭入口断点。
+
 ## Python 自动化
 
 下面的插件只在目标函数范围内启用运行时指令事件。Python 负责声明和消费，实际过滤与采集由原生层完成。
@@ -238,6 +263,32 @@ tests/                 ABI 契约、控制面与脚本 E2E
 docs/                  设计、脚本 API 与分析路线文档
 tools/                 绑定和代码生成工具
 ```
+
+## Hub 架构与操作模式
+
+默认桌面部署由单个 Tauri 进程内嵌并持有一个 Hub。Hub 是 Agent 传输、会话、控制门禁、动态脚本服务和结构化 activity 时间线的唯一所有者。Tauri 是可信人工适配器，`pinbridge-mcp` 是连接同一 Hub 的 AI stdio 适配器；两者不会分别建立竞争性的 Agent 连接。
+
+`pinbridge-hub` 是面向独立可信人工适配器的 headless 替代部署，不能与 Tauri 内嵌 Hub 使用同一个 endpoint。它只连接已经运行的 Agent；MCP 断开时不会启动、重启或终止目标进程。
+
+支持两种顶层体验：
+
+- 人工主导（“古法”）：人工先启动或附加目标，在 `Manual` 模式下定位、检查和调试，然后明确把控制权交给 AI。
+- AI 主导：可信人工完成交权后，AI 执行有界同步读取；目标和脚本写操作仅在 `AiAutonomous` 下允许。可信人工接管时会先阻止新的 AI 写操作，再尝试暂停 Agent。
+
+动态脚本在当前目标中注入、替换或移除，不会重启目标。两个适配器共享有界、结构化的 activity 时间线、operation ID 和资源引用；日志不保存源码或大型 payload。MCP 提供同步工具和动态脚本能力，但不暴露高频原始事件流。桌面轮询可以使用内部的小型事件快照，但不承诺向 MCP 提供完整事件回调覆盖。
+
+headless 部署应将凭据放在受保护的环境变量中，不要写入命令行或日志：
+
+```powershell
+$env:PINBRIDGE_HUB_HUMAN_SECRET = "<protected-secret-at-least-16-bytes>"
+$env:PINBRIDGE_HUB_AI_SECRET = "<different-protected-secret>"
+cargo run -p pinbridge-hub -- --agent-port 9011 --listen 9444
+
+$env:PINBRIDGE_HUB_ENDPOINT = "127.0.0.1:9444"
+cargo run -p pinbridge-mcp
+```
+
+默认 Tauri 部署从受保护的进程环境中读取 `PINBRIDGE_HUB_HUMAN_SECRET`、`PINBRIDGE_HUB_AI_SECRET`，并从 `PINBRIDGE_HUB_PORT`（或 `--hub-listen`）读取 Hub 监听配置。若任一 secret 缺失或无效，Tauri 仍保持 Manual 模式，但不会启动 Hub IPC，AI 交权也保持禁用；仅当两个 secret 均有效时才监听并允许 MCP 接入。MCP 进程从 `PINBRIDGE_HUB_ENDPOINT`（或 `--hub-endpoint`）读取连接地址。凭据不会写入日志或 MCP 请求。
 
 ## 文档
 

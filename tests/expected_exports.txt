@@ -345,6 +345,7 @@ pb_pin_define_trace_buffer
 pb_pin_delete_thread_data_key
 pb_pin_detach
 pb_pin_detach_probed
+pb_pin_enable_single_step_passthrough
 pb_pin_exception_to_string
 pb_pin_execute_at
 pb_pin_exit_application

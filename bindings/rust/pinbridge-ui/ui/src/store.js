@@ -6,19 +6,19 @@ import { listen } from "@tauri-apps/api/event";
 
 const state = {
   connected: false,
-  abi: [0, 0],
-  pid: 0,
-  total: 0,
-  dropped: 0,
-  capacity: 0,
-  kinds: [0, 0, 0, 0, 0, 0],
-  rate: 0,
+  abi: ["0", "0"],
+  pid: "0",
+  total: "0",
+  dropped: "0",
+  capacity: "0",
+  kinds: ["0", "0", "0", "0", "0", "0"],
+  rate: "0",
   rateHistory: [],
   events: [],
   stopped: false,
-  hitTid: 0,
+  hitTid: "4294967295",
   hitAddr: "0x0",
-  stopGen: 0,
+  stopGen: "0",
   bps: [],
 };
 
@@ -27,7 +27,23 @@ const listeners = new Set();
 listen("snapshot", (e) => {
   const s = e.payload;
   if (!s.connected) {
-    Object.assign(state, { connected: false });
+    Object.assign(state, {
+      connected: false,
+      abi: ["0", "0"],
+      pid: "0",
+      total: "0",
+      dropped: "0",
+      capacity: "0",
+      kinds: ["0", "0", "0", "0", "0", "0"],
+      rate: "0",
+      rateHistory: [],
+      events: [],
+      stopped: false,
+      hitTid: "4294967295",
+      hitAddr: "0x0",
+      stopGen: "0",
+      bps: [],
+    });
   } else {
     state.connected = true;
     state.abi = s.abi;

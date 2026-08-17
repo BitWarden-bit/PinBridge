@@ -13,3 +13,4 @@ tauri-plugin-dialog = "2"
 serde_json = "1"
 pinbridge-client = { path = "../pinbridge-client" }
 pinbridge-proto = { path = "../pinbridge-proto" }
+pinbridge-hub-core = { path = "../pinbridge-hub-core" }

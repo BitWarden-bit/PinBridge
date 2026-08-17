@@ -39,6 +39,10 @@ fn checked(component: &'static str, status: PbStatus) -> Result<(), Registration
 /// startup and reattach so the two sessions cannot silently drift apart.
 pub fn register_callbacks(reattach: bool) -> Result<(), RegistrationFailure> {
     unsafe {
+        if PROBE_MODE.load(Ordering::Acquire) {
+            return register_probe_callbacks();
+        }
+
         if reattach {
             checked("hook.tls", crate::hooks::init())?;
             checked(
@@ -46,6 +50,17 @@ pub fn register_callbacks(reattach: bool) -> Result<(), RegistrationFailure> {
                 crate::scripting::reregister_after_attach(),
             )?;
         }
+
+        // Pin 3.x does not reliably virtualize an application that enables
+        // x86 TF with POPF: the host #DB can escape in the translated code
+        // cache as a Pin-internal exception. Register the native bridge
+        // before the general instruction engine so it can reconstruct the
+        // application single-step at the correct instruction boundary.
+        let mut single_step_compat = PbCallbackHandle { opaque: 0 };
+        checked(
+            "exception.single_step_passthrough",
+            pb_pin_enable_single_step_passthrough(&mut single_step_compat),
+        )?;
 
         let mut instrument = PbCallbackHandle { opaque: 0 };
         checked(
@@ -87,6 +102,25 @@ pub fn register_callbacks(reattach: bool) -> Result<(), RegistrationFailure> {
     Ok(())
 }
 
+/// Probe mode executes the application natively. Register only callbacks
+/// which do not require Pin's JIT code cache or instruction instrumentation.
+/// In particular, context-change, syscall, debugger, TRACE/INS and the
+/// debugger breakpoint engine are deliberately absent from this list.
+unsafe fn register_probe_callbacks() -> Result<(), RegistrationFailure> {
+    let mut fini = PbCallbackHandle { opaque: 0 };
+    checked(
+        "fini",
+        pb_pin_add_fini_function(Some(crate::on_fini), core::ptr::null_mut(), &mut fini),
+    )?;
+    checked("modules", crate::modules::register())?;
+    checked("lifecycle.probe", crate::lifecycle::register_probe())?;
+    checked(
+        "pin.detach.probe",
+        crate::high_priority::register_probe_detach(),
+    )?;
+    Ok(())
+}
+
 pub fn initialize() -> PbStatus {
     let mut probe = 0u8;
     let status = unsafe { pb_pin_is_probe_mode(&mut probe) };
@@ -108,6 +142,10 @@ pub fn state_name() -> &'static str {
         STATE_ATTACH_FAILED => "attach_failed",
         _ => "unknown",
     }
+}
+
+pub fn is_probe_mode() -> bool {
+    PROBE_MODE.load(Ordering::Acquire)
 }
 
 pub fn last_registration_status() -> PbStatus {

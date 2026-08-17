@@ -26,6 +26,9 @@ int main(void)
             PB_OK ||
         callback.opaque != UINT64_C(0x3201) || g_calls != 1u)
         return 1;
+    if (pb_pin_enable_single_step_passthrough(&callback) != PB_OK ||
+        callback.opaque != UINT64_C(0x3203))
+        return 6;
     if (pb_pin_try_start(7u, OnInternalException, &g_calls, &scope) != PB_OK ||
         scope.opaque != UINT64_C(0x3202) || g_calls != 2u)
         return 2;
@@ -35,7 +38,8 @@ int main(void)
             PB_ERR_INVALID_ARGUMENT ||
         callback.opaque != 0 ||
         pb_pin_add_internal_exception_handler(OnInternalException, 0, 0) !=
-            PB_ERR_INVALID_ARGUMENT)
+            PB_ERR_INVALID_ARGUMENT ||
+        pb_pin_enable_single_step_passthrough(0) != PB_ERR_INVALID_ARGUMENT)
         return 4;
     if (pb_pin_try_start(7u, 0, 0, &scope) != PB_ERR_INVALID_ARGUMENT ||
         scope.opaque != 0 ||

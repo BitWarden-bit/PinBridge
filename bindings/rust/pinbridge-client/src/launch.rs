@@ -13,6 +13,65 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
+#[cfg(windows)]
+mod target_process {
+    use core::ffi::c_void;
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+
+    const PROCESS_TERMINATE: u32 = 0x0001;
+    const SYNCHRONIZE: u32 = 0x0010_0000;
+    static HANDLES: OnceLock<Mutex<HashMap<u32, usize>>> = OnceLock::new();
+
+    extern "system" {
+        fn OpenProcess(access: u32, inherit: i32, process_id: u32) -> *mut c_void;
+        fn TerminateProcess(process: *mut c_void, exit_code: u32) -> i32;
+        fn WaitForSingleObject(handle: *mut c_void, milliseconds: u32) -> u32;
+        fn CloseHandle(handle: *mut c_void) -> i32;
+    }
+
+    pub fn remember(backend_pid: u32, target_pid: u32) {
+        let handle = unsafe { OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, 0, target_pid) };
+        if handle.is_null() {
+            return;
+        }
+        let mut handles = HANDLES
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(previous) = handles.insert(backend_pid, handle as usize) {
+            unsafe {
+                CloseHandle(previous as *mut c_void);
+            }
+        }
+    }
+
+    pub fn terminate(backend_pid: u32) {
+        let Some(handles) = HANDLES.get() else {
+            return;
+        };
+        let handle = handles
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&backend_pid);
+        let Some(handle) = handle else {
+            return;
+        };
+        unsafe {
+            let handle = handle as *mut c_void;
+            let _ = TerminateProcess(handle, 1);
+            let _ = WaitForSingleObject(handle, 5_000);
+            let _ = CloseHandle(handle);
+        }
+    }
+}
+
+#[cfg(not(windows))]
+mod target_process {
+    pub fn remember(_backend_pid: u32, _target_pid: u32) {}
+    pub fn terminate(_backend_pid: u32) {}
+}
+
 pub struct BackendConfig {
     pub pin_exe: PathBuf,
     pub agent_dll: PathBuf,
@@ -21,6 +80,10 @@ pub struct BackendConfig {
     /// Plant a one-shot breakpoint on the main module's entry point before
     /// the first instruction runs (debugger-style "break at entry").
     pub entry_bp: bool,
+    /// Run the target natively with Pin probes instead of JIT translation.
+    /// This is the compatibility mode for protectors which depend on native
+    /// exception/single-step semantics.
+    pub probe_mode: bool,
 }
 
 /// The resolved backend for one launch: which architecture, which Pin
@@ -207,6 +270,7 @@ pub fn spawn_backend(config: &BackendConfig, target: &[String]) -> IoResult<Chil
         .ok_or_else(|| Error::new(ErrorKind::NotFound, "agent DLL has no parent dir"))?;
 
     let mut command = Command::new(&config.pin_exe);
+    configure_execution_mode(&mut command, config.probe_mode);
     command
         .arg("-t")
         .arg(&config.agent_dll)
@@ -214,7 +278,7 @@ pub fn spawn_backend(config: &BackendConfig, target: &[String]) -> IoResult<Chil
         .args(target)
         .current_dir(agent_dir)
         .env("PINBRIDGE_AGENT_PORT", config.port.to_string());
-    if config.entry_bp {
+    if config.entry_bp && !config.probe_mode {
         command.env("PINBRIDGE_ENTRY_BP", "1");
     } else {
         // An explicit raw-run request must not inherit a debugger setting
@@ -227,6 +291,12 @@ pub fn spawn_backend(config: &BackendConfig, target: &[String]) -> IoResult<Chil
             format!("failed to spawn {}: {error}", config.pin_exe.display()),
         )
     })
+}
+
+fn configure_execution_mode(command: &mut Command, probe_mode: bool) {
+    if probe_mode {
+        command.arg("-probe").arg("1");
+    }
 }
 
 /// Polls until the agent's query port accepts connections (the agent binds it
@@ -268,8 +338,11 @@ pub fn wait_for_entry_stop(port: u16, timeout: Duration) -> IoResult<(u32, u64)>
     ))
 }
 
-/// Best-effort teardown: kill pin, which takes the target with it.
+/// Best-effort teardown. Probe-mode Pin can exit without taking its natively
+/// running target with it, so terminate the exact process handle captured
+/// from the authenticated agent PING before reaping the Pin launcher.
 pub fn kill_backend(child: &mut Child) {
+    target_process::terminate(child.id());
     let _ = child.kill();
     let _ = child.wait();
 }
@@ -283,6 +356,9 @@ pub struct LaunchOptions {
     pub port: u16,
     /// Stop at the main module entry point on launch.
     pub entry_bp: bool,
+    /// Prefer target compatibility over instruction-level JIT features.
+    /// Probe mode implicitly disables the entry breakpoint.
+    pub probe_mode: bool,
 }
 
 /// Full launch chain for a target: resolve pin, spawn backend, wait for the
@@ -316,6 +392,7 @@ pub fn launch_for_target_full(
         arch: resolved.arch,
         port,
         entry_bp: options.entry_bp,
+        probe_mode: options.probe_mode,
     };
     let mut child = spawn_backend(&backend, target)?;
     if let Err(error) = wait_for_port(port, timeout) {
@@ -324,11 +401,16 @@ pub fn launch_for_target_full(
         return Err(error);
     }
     // Best-effort ABI read before the caller takes over the control plane.
-    let abi = crate::client::Client::connect(port)
+    let ping = crate::client::Client::connect(port)
         .and_then(|mut client| client.ping())
-        .map(|(major, minor, _pid, _total)| (major, minor))
         .ok();
-    if options.entry_bp {
+    let abi = ping.map(|(major, minor, _pid, _total)| (major, minor));
+    if options.probe_mode {
+        if let Some((_major, _minor, target_pid, _total)) = ping {
+            target_process::remember(child.id(), target_pid);
+        }
+    }
+    if options.entry_bp && !options.probe_mode {
         if let Err(error) = wait_for_entry_stop(port, timeout) {
             let _ = child.kill();
             let _ = child.wait();
@@ -362,7 +444,25 @@ mod tests {
             arch: None,
             port: 9001,
             entry_bp: true,
+            probe_mode: false,
         }
+    }
+
+    #[test]
+    fn probe_mode_is_explicit_and_disables_entry_wait() {
+        let mut opts = options();
+        opts.probe_mode = true;
+        assert!(opts.probe_mode);
+        assert!(opts.entry_bp);
+        assert!(!(opts.entry_bp && !opts.probe_mode));
+
+        let mut command = Command::new("pin.exe");
+        configure_execution_mode(&mut command, true);
+        let arguments = command
+            .get_args()
+            .map(|value| value.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(arguments, ["-probe", "1"]);
     }
 
     #[test]

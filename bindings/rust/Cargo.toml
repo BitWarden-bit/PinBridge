@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["pinbridge-sys", "pinbridge-tool", "pinbridge-proto", "pinbridge-agent", "pintool-rs", "pinbridge-client", "pinbridge-tui", "pinbridge-ui", "pinbridge-cli"]
+members = ["pinbridge-sys", "pinbridge-tool", "pinbridge-proto", "pinbridge-agent", "pintool-rs", "pinbridge-client", "pinbridge-tui", "pinbridge-ui", "pinbridge-cli", "pinbridge-mcp", "pinbridge-hub-core", "pinbridge-hub"]
 
 [profile.release]
 # A tool DLL runs inside Pin's process on application threads; unwinding

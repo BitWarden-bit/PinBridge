@@ -5,6 +5,7 @@
 
 PbStatus PbBackendAddInternalExceptionHandler(
     PbInternalExceptionCallback callback, void* user_data, uint64_t* out_callback);
+PbStatus PbBackendEnableSingleStepPassthrough(uint64_t* out_callback);
 PbStatus PbBackendTryStart(
     PbThreadId thread_id, PbInternalExceptionCallback callback, void* user_data,
     uint64_t* out_scope);

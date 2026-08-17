@@ -658,6 +658,30 @@ fn qs_trace(op_code: u8, entry: bool) {
     ));
 }
 
+fn requires_jit(op_code: u8) -> bool {
+    matches!(
+        op_code,
+        proto::op::STOP
+            | proto::op::RESUME
+            | proto::op::BP_SET
+            | proto::op::BP_REMOVE
+            | proto::op::CONTEXT_GET
+            | proto::op::CONTEXT_SET
+            | proto::op::ENGINE_SET
+            | proto::op::EXC_POLICY_SET
+            | proto::op::STEP
+            | proto::op::SYSCALL_FILTER
+            | proto::op::TRACE_START
+            | proto::op::TRACE_START_SPEC
+            | proto::op::TRACE_EXTEND
+            | proto::op::HOOK_SET
+            | proto::op::HOOK_REMOVE
+            | proto::op::HOOK_CLEAR
+            | proto::op::HOOK_RULE_SET
+            | proto::op::HOOK_RULE_CLEAR
+    )
+}
+
 fn serve_client(stream: &mut TcpStream) {
     let _ = stream.set_nodelay(true);
     loop {
@@ -667,7 +691,13 @@ fn serve_client(stream: &mut TcpStream) {
             Err(_) => return, // client went away or sent garbage: drop it
         };
         qs_trace(op_code, true);
-        let (status, body) = match op_code {
+        let (status, body) = if crate::pin_session::is_probe_mode() && requires_jit(op_code) {
+            (
+                proto::STATUS_BAD_REQUEST,
+                b"operation unavailable in probe mode".to_vec(),
+            )
+        } else {
+            match op_code {
             proto::op::PING => (proto::STATUS_OK, handle_ping()),
             proto::op::COUNTERS => (proto::STATUS_OK, handle_counters()),
             proto::op::RING_PAGE => match handle_ring_page(&payload) {
@@ -781,7 +811,8 @@ fn serve_client(stream: &mut TcpStream) {
                 Ok(body) => (proto::STATUS_OK, body),
                 Err(code) => (code, Vec::new()),
             },
-            _ => (proto::STATUS_BAD_REQUEST, Vec::new()),
+                _ => (proto::STATUS_BAD_REQUEST, Vec::new()),
+            }
         };
         qs_trace(op_code, false);
         // TEMP hunt aid: per-op heap validation (PINBRIDGE_HEAP_CHECK_FAST=1).
@@ -790,6 +821,37 @@ fn serve_client(stream: &mut TcpStream) {
         }
         if proto::write_frame(stream, op_code, status, &body).is_err() {
             return;
+        }
+    }
+}
+
+#[cfg(test)]
+mod probe_mode_tests {
+    use super::*;
+
+    #[test]
+    fn probe_profile_rejects_jit_control_but_keeps_observation_and_scripts() {
+        for op in [
+            proto::op::STOP,
+            proto::op::BP_SET,
+            proto::op::STEP,
+            proto::op::ENGINE_SET,
+            proto::op::SYSCALL_FILTER,
+            proto::op::HOOK_SET,
+        ] {
+            assert!(requires_jit(op));
+        }
+        for op in [
+            proto::op::PING,
+            proto::op::COUNTERS,
+            proto::op::RING_PAGE,
+            proto::op::READ_MEM,
+            proto::op::WRITE_MEM,
+            proto::op::MODULES,
+            proto::op::SCRIPT_LOAD,
+            proto::op::SCRIPT_LIST,
+        ] {
+            assert!(!requires_jit(op));
         }
     }
 }

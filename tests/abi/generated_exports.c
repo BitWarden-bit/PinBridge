@@ -83,6 +83,7 @@ static const char* const kRequiredSymbols[] = {
     "pb_pin_add_fetch_function",
     "pb_pin_fetch_code",
     "pb_pin_add_internal_exception_handler",
+    "pb_pin_enable_single_step_passthrough",
     "pb_pin_try_end",
     "pb_pin_try_start",
     "pb_pin_add_memory_address_trans_function",

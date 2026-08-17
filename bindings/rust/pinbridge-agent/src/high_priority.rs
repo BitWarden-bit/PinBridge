@@ -145,3 +145,16 @@ pub fn register() -> (PbStatus, PbStatus) {
         (oom, detach)
     }
 }
+
+/// Probe compatibility uses the probe-specific detach edge. The OOM callback
+/// is intentionally kept out of the conservative probe callback set.
+pub fn register_probe_detach() -> PbStatus {
+    unsafe {
+        let mut detach_handle = PbCallbackHandle { opaque: 0 };
+        pb_pin_add_detach_function_probed(
+            Some(on_detach),
+            core::ptr::null_mut(),
+            &mut detach_handle,
+        )
+    }
+}

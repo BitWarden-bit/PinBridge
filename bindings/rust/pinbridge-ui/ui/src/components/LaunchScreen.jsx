@@ -11,6 +11,7 @@ export default function LaunchScreen({ onLaunched }) {
   const [target, setTarget] = useState(() => localStorage.getItem("pb-target") || "");
   const [pin, setPin] = useState(() => localStorage.getItem("pb-pin") || "");
   const [entryBp, setEntryBp] = useState(() => localStorage.getItem("pb-entry-bp") !== "0");
+  const [probeMode, setProbeMode] = useState(() => localStorage.getItem("pb-probe-mode") === "1");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
 
@@ -29,7 +30,13 @@ export default function LaunchScreen({ onLaunched }) {
     localStorage.setItem("pb-target", target);
     if (pin) localStorage.setItem("pb-pin", pin);
     localStorage.setItem("pb-entry-bp", entryBp ? "1" : "0");
-    const result = await callWithError("cmd_launch", { target, pin: pin || null, entryBp });
+    localStorage.setItem("pb-probe-mode", probeMode ? "1" : "0");
+    const result = await callWithError("cmd_launch", {
+      target,
+      pin: pin || null,
+      entryBp: probeMode ? false : entryBp,
+      probeMode,
+    });
     setBusy(false);
     if (!result.ok) {
       setError(result.error); // show the real reason (pin path, agent DLL, spawn…)
@@ -64,11 +71,22 @@ export default function LaunchScreen({ onLaunched }) {
           <input
             type="checkbox"
             checked={entryBp}
+            disabled={probeMode}
             onChange={(e) => setEntryBp(e.target.checked)}
             style={{ width: "auto", margin: 0 }}
           />
           {t("entryBp")}
         </label>
+        <label style={{ display: "flex", gap: 6, alignItems: "center", margin: "4px 0 10px", cursor: "pointer" }}>
+          <input
+            type="checkbox"
+            checked={probeMode}
+            onChange={(e) => setProbeMode(e.target.checked)}
+            style={{ width: "auto", margin: 0 }}
+          />
+          {t("probeMode")}
+        </label>
+        {probeMode && <div className="launch-hint" style={{ marginBottom: 10 }}>{t("probeModeHint")}</div>}
         <button className="primary" id="launch-btn" onClick={launch} disabled={busy || !target}>
           <IconGo /> {busy ? t("launching") : t("launch")}
         </button>

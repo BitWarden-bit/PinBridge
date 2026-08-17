@@ -134,6 +134,10 @@ set_property(TARGET pb_runtime_fixture PROPERTY C_STANDARD 11)
 if(WIN32)
     add_executable(pb_rpc_fixture tests/runtime/rpc_fixture.c)
     set_property(TARGET pb_rpc_fixture PROPERTY C_STANDARD 11)
+
+    add_executable(pb_single_step_fixture tests/runtime/single_step_fixture.c)
+    set_property(TARGET pb_single_step_fixture PROPERTY C_STANDARD 11)
+    add_test(NAME runtime.single_step.native COMMAND pb_single_step_fixture)
 endif()
 
 if(WIN32)

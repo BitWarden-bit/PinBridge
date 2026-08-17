@@ -31,6 +31,7 @@ struct Config {
     /// Explicit --arch override; None means auto-detect from the target's PE.
     arch: Option<Arch>,
     entry_bp: bool,
+    pin_probe: bool,
 }
 
 fn parse_args() -> Result<Config, String> {
@@ -44,6 +45,7 @@ fn parse_args() -> Result<Config, String> {
         agent: None,
         arch: None,
         entry_bp: true,
+        pin_probe: false,
     };
     let mut args = std::env::args().skip(1).peekable();
     while let Some(arg) = args.next() {
@@ -69,6 +71,7 @@ fn parse_args() -> Result<Config, String> {
             }
             "--entry-bp" => config.entry_bp = true,
             "--no-entry-bp" => config.entry_bp = false,
+            "--pin-probe" => config.pin_probe = true,
             // subcommand flags that belong to the command, not the top level
             "--follow" => config.args.push(arg.clone()),
             "--" => config.target.extend(args.by_ref()),
@@ -82,7 +85,7 @@ fn parse_args() -> Result<Config, String> {
 
 fn usage() {
     eprintln!(
-        "pinbridge-cli [--port N] [--limit N] [--pin P] [--agent A] [--arch auto|x86|x64] [--entry-bp|--no-entry-bp] [command] [-- target args...]\n\
+        "pinbridge-cli [--port N] [--limit N] [--pin P] [--agent A] [--arch auto|x86|x64] [--pin-probe] [--entry-bp|--no-entry-bp] [command] [-- target args...]\n\
          commands: ping | counters | events | hookrule | shell (default when omitted)\n\
          a target after `--` is launched first (backend reaped on exit).\n\
          shell reads one command per line from stdin: ping|counters|events [N]|limit N|help|quit"
@@ -701,6 +704,7 @@ fn main() {
             arch: config.arch,
             port: config.port,
             entry_bp: config.entry_bp,
+            probe_mode: config.pin_probe,
         };
         match launch::launch_for_target(&options, &config.target, STARTUP_TIMEOUT) {
             Ok((child, _port)) => backend = Some(child),

@@ -1524,6 +1524,13 @@ PB_API PbStatus PB_CALL pb_pin_fetch_original_code(
 PB_API PbStatus PB_CALL pb_pin_add_internal_exception_handler(
     PbInternalExceptionCallback callback, void* user_data,
     PbCallbackHandle* out_callback);
+/* Windows/JIT compatibility for application code that enables the x86 trap
+   flag with POPF/POPFD/POPFQ. Pin 3.x otherwise receives the resulting #DB
+   in its translated code cache as an internal exception. The bridge
+   virtualizes that one instruction boundary and raises the single-step back
+   in the application context, preserving normal VEH/SEH delivery. */
+PB_API PbStatus PB_CALL pb_pin_enable_single_step_passthrough(
+    PbCallbackHandle* out_callback);
 PB_API PbStatus PB_CALL pb_pin_try_start(
     PbThreadId thread_id, PbInternalExceptionCallback callback, void* user_data,
     PbCallbackHandle* out_scope);

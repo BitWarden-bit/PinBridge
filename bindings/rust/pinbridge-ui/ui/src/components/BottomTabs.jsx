@@ -3,6 +3,7 @@ import { api } from "../api";
 import { getSnapshot, subscribe } from "../store";
 import { useT } from "../i18n";
 import { resolveInto } from "../resolve";
+import { addAddress, normalizeAddress } from "../address";
 
 export default function BottomTabs({ tid, stopTick, onGoto }) {
   const t = useT();
@@ -34,7 +35,7 @@ function MemoryTab() {
   const [size, setSize] = useState("256");
   const [hex, setHex] = useState("");
   const [edit, setEdit] = useState(null); // { off, value } byte being edited
-  const base = parseInt(addr, 16) || 0;
+  const base = normalizeAddress(addr) || "0x0";
 
   const refresh = async (a = addr, s = size) => {
     const data = await api.readMem(a, parseInt(s) || 256);
@@ -49,7 +50,8 @@ function MemoryTab() {
     const value = edit.value.replace(/\s+/g, "").toLowerCase();
     // batch: any even-length run overwrites consecutive bytes from the edit point
     if (/^([0-9a-f]{2})+$/.test(value)) {
-      const at = "0x" + (base + edit.off / 2).toString(16);
+      const at = addAddress(base, BigInt(edit.off / 2));
+      if (!at) return;
       const written = await api.writeMem(at, value);
       if (written !== undefined) {
         const next = hex.substr(0, edit.off) + value + hex.substr(edit.off + value.length);
@@ -70,7 +72,7 @@ function MemoryTab() {
           onKeyDown={(e) => e.key === "Enter" && refresh()} placeholder="0x address" />
         <input value={size} onChange={(e) => setSize(e.target.value)} style={{ width: 70 }} />
         <button onClick={() => refresh()}>{t("read")}</button>
-        <span style={{ color: "var(--dim)", alignSelf: "center" }}>点击字节直接输入,可连续覆盖多个字节,回车写入</span>
+        <span style={{ color: "var(--dim)", alignSelf: "center" }}>{t("memoryEditHint")}</span>
       </div>
       <table><tbody>
         {rows.map((r) => {
@@ -83,7 +85,7 @@ function MemoryTab() {
           });
           return (
             <tr key={r.off}>
-              <td style={{ color: "var(--addr)" }}>0x{(base + r.off / 2).toString(16)}</td>
+              <td style={{ color: "var(--addr)" }}>{addAddress(base, BigInt(r.off / 2))}</td>
               <td className="c-bytes">
                 {bytes.map((b, bi) => {
                   const off = r.off + bi * 2;
@@ -124,13 +126,15 @@ function StackTab({ tid, stopTick, onGoto }) {
     if (tid == null) return;
     const regs = await api.context(tid);
     if (!regs) return;
-    const rsp = parseInt(regs.find((r) => r.reg === 6).value, 16);
-    const hex = await api.readMem("0x" + rsp.toString(16), 256);
+    const rsp = normalizeAddress(regs.find((r) => r.reg === 6).value);
+    if (!rsp) return;
+    const hex = await api.readMem(rsp, 256);
     if (hex === undefined) return;
     const out = [];
     for (let off = 0; off < hex.length; off += 16) {
       const le = hex.substr(off, 16).match(/../g).reverse().join("");
-      out.push({ addr: "0x" + (rsp + off / 2).toString(16), value: "0x" + le });
+      const addr = addAddress(rsp, BigInt(off / 2));
+      if (addr) out.push({ addr, value: "0x" + le });
     }
     setRows(out);
     // symbolize whatever points into a module (return addresses etc.)
@@ -209,7 +213,7 @@ function EventsTab() {
     const addrs = [];
     events.forEach((e) => {
       addrs.push(e.address);
-      if (e.kind === 4) addrs.push(e.arg0); // branch target
+      if (Number(e.kind) === 4) addrs.push(e.arg0); // branch target; kind is a small enum string at the bridge boundary
     });
     resolveInto(addrs).then((c) =>
       setNames(Object.fromEntries(addrs.map((a) => [a, c.get(a)])))
@@ -227,7 +231,7 @@ function EventsTab() {
 function eventLine(e, names = {}) {
   const ip = names[e.address] ? `${e.address} ${names[e.address]}` : e.address;
   const tgt = names[e.arg0] ? `${e.arg0} ${names[e.arg0]}` : e.arg0;
-  switch (e.kind) {
+  switch (Number(e.kind)) {
     case 1: return `#${e.sequence} Hook   Tid=${e.thread_id} Ip=${ip} Rcx=${e.arg0} Rdx=${e.arg1}`;
     case 2: return `#${e.sequence} Mem    Tid=${e.thread_id} Ip=${ip} Ea=${e.arg0} Size=${e.arg1} Acc=${e.arg2}`;
     case 4: return `#${e.sequence} Branch Tid=${e.thread_id} Ip=${ip} Target=${tgt} Taken=${e.arg1}`;

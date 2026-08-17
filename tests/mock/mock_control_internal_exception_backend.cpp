@@ -18,6 +18,12 @@ PbStatus PbBackendAddInternalExceptionHandler(
     return PB_OK;
 }
 
+PbStatus PbBackendEnableSingleStepPassthrough(uint64_t* out_callback)
+{
+    *out_callback = UINT64_C(0x3203);
+    return PB_OK;
+}
+
 PbStatus PbBackendTryStart(
     PbThreadId thread_id, PbInternalExceptionCallback callback, void* user_data,
     uint64_t* out_scope)

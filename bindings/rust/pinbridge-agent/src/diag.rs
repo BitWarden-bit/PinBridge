@@ -297,7 +297,7 @@ unsafe extern "system" fn on_fault(pointers: *mut ExceptionPointers) -> i32 {
     0 // keep searching: Pin's own dispatcher still reports and kills
 }
 
-pub fn install() {
+pub fn install(install_pin_handler: bool) {
     // Pre-widen the crash path: the vectored handler must stay allocation-
     // free, and CreateFileA's A->W conversion allocates from the process heap.
     unsafe {
@@ -309,6 +309,10 @@ pub fn install() {
     // sequence; LoadLibrary here killed the process (ntdll TPP fault).
     let handler = unsafe { AddVectoredExceptionHandler(1, on_fault as *mut c_void) };
     crate::log::line(&format!("crash dump handler -> {handler:p}"));
+    if !install_pin_handler {
+        crate::log::line("pin crash handler disabled in probe mode");
+        return;
+    }
     // Pin's own chain: the UPC dispatcher swallows tool-internal exceptions
     // before the Windows vectored chain, so ALSO hook the Pin-level handler.
     let mut pin_handle = pinbridge_sys::PbCallbackHandle { opaque: 0 };
@@ -337,14 +341,20 @@ unsafe extern "C" fn on_pin_fault(
     let _ = pinbridge_sys::pb_pin_get_exception_class(code, &mut exception_class);
     let mut fault_address = 0u64;
     let mut fault_address_known = 0u8;
-    let _ = pinbridge_sys::pb_pin_get_faulty_access_address(
-        exception_info,
-        &mut fault_address,
-        &mut fault_address_known,
-    );
     let mut access_type: pinbridge_sys::PbFaultyAccessType =
         pinbridge_sys::PB_FAULTY_ACCESS_TYPE_UNKNOWN;
-    let _ = pinbridge_sys::pb_pin_get_faulty_access_type(exception_info, &mut access_type);
+    // Pin asserts inside PIN_GetFaultyAccessAddress/Type when the exception
+    // is not an access fault.  Internal-exception handlers also receive OS,
+    // debug, invalid-instruction and arithmetic exceptions, so classify the
+    // borrowed EXCEPTION_INFO before asking for access-fault-only fields.
+    if exception_class == pinbridge_sys::PB_EXCEPTCLASS_ACCESS_FAULT {
+        let _ = pinbridge_sys::pb_pin_get_faulty_access_address(
+            exception_info,
+            &mut fault_address,
+            &mut fault_address_known,
+        );
+        let _ = pinbridge_sys::pb_pin_get_faulty_access_type(exception_info, &mut access_type);
+    }
     // Snapshot the exact physical IP/SP before doing any file I/O. The
     // borrowed physical context is valid only for this Pin callback.
     let instr_ptr = crate::arch::instr_ptr_reg();

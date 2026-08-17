@@ -2422,6 +2422,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "pinbridge-hub"
+version = "0.1.0"
+dependencies = [
+ "pinbridge-hub-core",
+ "serde_json",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "pinbridge-hub-core"
+version = "0.1.0"
+dependencies = [
+ "pinbridge-client",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
+name = "pinbridge-mcp"
+version = "0.1.0"
+dependencies = [
+ "pinbridge-hub-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "pinbridge-proto"
 version = "0.1.0"
 
@@ -2448,6 +2476,7 @@ name = "pinbridge-ui"
 version = "0.1.0"
 dependencies = [
  "pinbridge-client",
+ "pinbridge-hub-core",
  "pinbridge-proto",
  "serde_json",
  "tauri",
