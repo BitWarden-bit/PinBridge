@@ -331,7 +331,7 @@ pub fn instrument_step(ins: PbInsHandle, candidate_index: usize) {
     }
 }
 
-unsafe fn exact_stop(context: PbContextHandle, tid: u32, address: u64) {
+pub(crate) unsafe fn exact_stop(context: PbContextHandle, tid: u32, address: u64) {
     LAST_HIT_TID.store(tid, Ordering::Release);
     LAST_HIT_ADDR.store(address, Ordering::Release);
     let armed = !context.is_null() && redirect_arm(tid, address);
@@ -505,7 +505,8 @@ unsafe extern "C" fn breaker_main(_argument: *mut c_void) {
                     // still mutating stopped contexts — a get_context racing
                     // the rewind crashes inside Pin's VM.
                     crate::control::STOPPED.store(true, Ordering::Release);
-                    STOP_GEN.fetch_add(1, Ordering::AcqRel);
+                    let stop_generation = STOP_GEN.fetch_add(1, Ordering::AcqRel) + 1;
+                    crate::execution_trap::publish_stopped(stop_generation);
                 }
             }
         }
@@ -525,7 +526,8 @@ unsafe extern "C" fn breaker_main(_argument: *mut c_void) {
                     clear_step_bps();
                     // publish last (see above)
                     crate::control::STOPPED.store(true, Ordering::Release);
-                    STOP_GEN.fetch_add(1, Ordering::AcqRel);
+                    let stop_generation = STOP_GEN.fetch_add(1, Ordering::AcqRel) + 1;
+                    crate::execution_trap::publish_stopped(stop_generation);
                 }
                 good
             } else {
@@ -536,6 +538,7 @@ unsafe extern "C" fn breaker_main(_argument: *mut c_void) {
                 if good {
                     crate::control::STOPPED.store(false, Ordering::Release);
                     crate::stepper::end_suspend();
+                    crate::execution_trap::on_resume();
                     LAST_HIT_TID.store(NO_HIT_TID, Ordering::Release);
                     LAST_HIT_ADDR.store(0, Ordering::Release);
                 }

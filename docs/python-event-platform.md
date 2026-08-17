@@ -150,6 +150,17 @@ Python 处理函数不能通过返回值绕过其他插件。旧脚本直接调�
   EAX/EIP 等寄存器，地址计算按 32 位回绕。`0x40` 在 x86 中必须解码为 `INC EAX`，不能
   被当作 x64 REX 前缀。
 
+### 通用执行区间监控
+
+`pb.execution_trap(start, end, once=True, thread_id=None)` 把半开地址范围发布给原生引擎。
+匹配指令尚未执行时，引擎复用精确断点的全局停泊路径；只有目标进入稳定停止状态后，才
+向专用脚本线程投递 `execution.trap`。事件包含监控编号、范围、命中地址/线程、命中次数和
+停止代号。Python 不进入 Pin 插桩或分析回调，常规指令洪流也不会进入事件队列。
+
+该能力故意没有 `oep_arm` 或 `vmp_*` 原生接口。OEP、解密完成、壳版本与 Dump 都是上层
+策略语义，应由外置 Python 根据系统调用、内存属性、模块和现场组合判断。PinBridge 核心
+只保证通用监控的精确性、线程语义、资源所有权和插件卸载清理。
+
 ## 模块边界
 
 - `scripting/subscriptions.rs`：订阅数据、断点所有权和动作类型；
@@ -158,6 +169,7 @@ Python 处理函数不能通过返回值绕过其他插件。旧脚本直接调�
 - `scripting/instrumentation.rs`：合并各插件拥有的高频采集规则并发布原生快照；
 - `scripting/memory_translation.rs`：地址映射所有权、冲突检查和原生转换快照；
 - `scripting/native_policies.rs`：插件失败或卸载时统一刷新全部原生策略；
+- `execution_trap.rs`：通用执行区间表、原生匹配和精确停机后的高优先级事件发布；
 - `scripting/interceptors/`：同步决定总调度，以及相互独立的
   `child`、`hook`、`syscall`、`exception` 处理与补丁合并；
 - `context.rs` / 查询协议：提供一次性寄存器快照；
@@ -594,6 +606,7 @@ pb.instrumentation_set(
 | 初始化期间事件边界 | `pb.on(...)` / `pb.breakpoint(...)` | 插件级游标在执行前建立，命名处理函数按通道记录精确注册边界；真实 Hook 初始化竞态测试通过 |
 | 精确断点处理 | `pb.breakpoint` | 已完成，真实 Pin 测试通过 |
 | 单步落点隔离 | 回调返回 `step_into/step_over` 或 `pb.step` | 单步使用独立后继槽并严格匹配线程；不会占用、删除或提前完成普通断点，容量/线程/重放规则有 Rust 单测 |
+| 执行区间精确停机 | `pb.execution_trap` + `pb.on("execution.trap", ...)` | 已完成；原生热路径匹配、插件所有权清理和稳定停止后投递已接入，通用真实 Pin fixture 通过 |
 | 进程/线程生命周期 | `pb.on(...)` | 已完成，真实 Pin 测试通过 |
 | 退出前 Python 清理 | `pb.on("process.exit/process.prepare_fini", ...)` | 已完成，两阶段顺序派发和原生 PrepareForFini 到达均经真实 Pin 验证 |
 | 最终退出记录 | 无 Python 回调；原生 Fini 事件和总结日志 | 已完成；该阶段 Pin 已停止脚本调度，不伪装成可执行 Python 回调 |

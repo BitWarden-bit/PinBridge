@@ -372,6 +372,13 @@ pub unsafe extern "C" fn on_ins(ins: PbInsHandle, _user_data: *mut c_void) {
         crate::bp::instrument_step(ins, candidate);
     }
 
+    // Script strategies can arm a generic half-open execution range. The
+    // native callback performs the hot-path match and exact pre-instruction
+    // stop; Python receives only the resulting low-frequency stop event.
+    if crate::execution_trap::wants(address) {
+        crate::execution_trap::instrument(ins);
+    }
+
     let runtime_hook = crate::hooks::any() && crate::hooks::contains(address);
     let (hook_start, hook_end) = hook_range();
     if !runtime_hook && in_range(address, hook_start, hook_end) {

@@ -138,7 +138,11 @@ kinds 合法值:`hook`/`hook_regs`、`mem`/`memory`、`exec`、`branch`/`branch_
 syscall 的 `number` 在 x86/x64 都是 0..0xfff 的本机序号；IA-32 Pin 原始值携带的
 service-class 高位会在进入事件和过滤器前移除。entry/exit 通过线程 TLS 保持同一编号。
 
-### 动作函数（每次调用一次 loopback RPC)
+### 动作函数
+
+大部分控制动作通过 loopback 控制协议执行。`pb.read_mem`、`pb.memory_region`、
+`pb.modules`、`pb.resolve_name` 以及原生策略发布接口在 Agent 进程内直接执行，因此可在
+同步拦截处理函数中使用，不会让正在等待 Python 决定的应用线程反向等待控制服务器。
 
 控制与状态：
 - `pb.stop() / pb.resume() -> bool`;`pb.step(tid, over=False) -> bool`
@@ -161,6 +165,13 @@ service-class 高位会在进入事件和过滤器前移除。entry/exit 通过�
   `step_into` 或 `step_over`。不返回等同于 `stay`，回调异常也保持停止。
 - `pb.breakpoint_remove(id) -> bool`：只删除当前插件对该断点的绑定。插件卸载时自动
   释放其全部绑定；多个插件可共享同一原生断点。
+- `pb.execution_trap(start, end, once=True, thread_id=None) -> id`：注册半开执行区间
+  `[start,end)`。原生层在匹配指令执行前精确停机；全部应用上下文稳定后，脚本线程收到
+  `execution.trap`。最多 64 槽，可选线程过滤，默认首次命中后自动撤销。
+- `pb.execution_trap_remove(id) -> bool`：只移除当前插件拥有的执行监控；插件卸载或隔离时
+  自动清理。
+- `pb.execution_traps() -> [(id,start,end,thread_id|None,once,hits), ...]`：列出当前原生
+  执行监控快照。
 - `pb.hook_set(addr) -> bool`(False = 满了);`pb.hook_remove(addr) -> bool`;`pb.hook_clear() -> bool`
 - `pb.hook_rule(addr, set_reg, set_value, match_reg=None, match_mask=0, match_value=0, thread_id=None)`：在 Hook 命中时由原生回调同步修改上下文寄存器；可选条件按寄存器掩码匹配。`stack0`/`stack1` 等虚拟寄存器表示 ABI 栈参数（x86 从 `[ESP+4]` 起，x64 从 `[RSP+0x28]` 起）。
 - `pb.hook_rules_clear()`：清除修改规则但保留 Hook 点。规则执行在 Pin 应用线程，不调用 Python 热路径。
@@ -168,6 +179,8 @@ service-class 高位会在进入事件和过滤器前移除。entry/exit 通过�
 内存（写要求目标处于停止状态）:
 - `pb.read_mem(addr, len) -> bytes | None`（单次 ≤1MB)
 - `pb.write_mem(addr, data: bytes) -> int`（实际写入字节数，0 = 被拒）
+- `pb.memory_region(addr) -> (base,size,allocation_base,protect,state,type) | None`：直接查询
+  地址所在的 Windows 虚拟内存区域。
 
 寄存器（要求停止状态；x64：rax..r15/rip/rflags，x86：eax..edi/eip/eflags）：
 - `pb.get_reg(tid, name) -> int | None`;`pb.set_reg(tid, name, value) -> bool`
@@ -373,7 +386,7 @@ pb.off(subscription_id)
 `syscall`、`hook.entry`、`hook.return`、`instruction`、`instruction.decode`、`memory`、`branch.edge`、
 `code.smc`、`pin.detach`、`pin.attach`、`memory.oom`、`pin.internal_exception`、
 `debugger.breakpoint`、`debugger.single_step`、`debugger.async_break`、
-`trace.instrument`、`routine.instrument`、`basic_block.instrument`。
+`trace.instrument`、`routine.instrument`、`basic_block.instrument`、`execution.trap`。
 
 订阅 `instruction`、`memory`、`branch.edge` 或 `syscall` 会把对应的原生采集引擎加入
 脚本需求并在下一次宿主节拍开启。取消订阅不会擅自关闭可能由 CLI/UI 开启的全局引擎。
@@ -403,6 +416,7 @@ pb.off(subscription_id)
 | `pin.detach` | `phase="detached"` | 已接入 JIT/Probe 原生完成回调；分离后不承诺 Python 仍被调度 |
 | `pin.attach` | `phase="attached"` | 支持的平台在全部会话回调重建并再次 application-start 后投递；Pin 3.31 Windows JIT 不支持重附加 |
 | `debugger.breakpoint` / `debugger.single_step` / `debugger.async_break` | `ip`, `debugging_event`, `stack_pointer`, `flags`, `return_value` | Pin 准备把停止事件报告给应用调试器时产生；这里只观察，不改变处理结果 |
+| `execution.trap` | `id`, `start`, `end`, `hits`, `stop_generation`, `once`, `thread_filter` | 匹配指令尚未执行；目标已经精确停止且上下文稳定。处理函数不主动恢复时保持停止 |
 | `instruction` | `size`, `next_address`, `policy_generation` | 指令实际执行时产生；版本号来自完成原生范围/线程匹配的同一份不可变策略快照 |
 | `memory` | `memory_address`, `size`, `access`, `policy_generation` | 指令的每个内存操作数实际访问时产生 |
 | `branch.edge` | `target`, `taken`, `policy_generation` | 分支、调用或返回的实际控制流边沿 |
@@ -414,6 +428,18 @@ pb.off(subscription_id)
 Python；退出交接也只有有界确认等待。Python 处理函数统一在脚本内部线程按“插件名、
 注册顺序”稳定调用。处理函数异常只把
 所属插件置为 error，不会在 Pin 回调栈中传播到目标程序。
+
+### 调试器原语与分析策略的边界
+
+`execution.trap` 是通用调试器原语，不包含 OEP、壳类型或 Dump 语义。原生层只负责：按
+地址和线程过滤、在指令执行前停机、保存稳定上下文、投递一次高优先级事件。为何布置该
+区间、命中是否代表 OEP、随后读取什么或何时恢复，全部由 Python 插件决定。
+
+`examples/python/vmp_oep.py` 是一份外置策略示例：它解析主映像 `.text`，只同步观察
+`NtProtectVirtualMemory` 对应的系统调用退出；发现代码段经历“可写”并恢复“可执行且
+不可写”后，再注册一次性执行区间监控。这个判断可以随壳版本或 AI 分析结果直接替换，
+不需要修改、重编译 PinBridge。逐指令匹配仍在原生热路径完成，Python 只参与低频决策和
+停机后的现场处理。
 
 原生层在 `RtlExitUserProcess`/`ExitProcess` 入口先产生 `process.exit`，确认派发后再产生
 `process.prepare_fini`，因此 Python 清理代码在 Pin 停止内部脚本线程前实际执行。随后真正

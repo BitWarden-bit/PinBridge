@@ -76,11 +76,12 @@ fn pb_log(msg: &str) {
 // ---- target actions (one loopback RPC each) ----
 
 #[pyfunction(name = "read_mem")]
-fn pb_read_mem(addr: u64, len: u64) -> Option<Vec<u8>> {
+fn pb_read_mem(py: Python<'_>, addr: u64, len: u64) -> Option<Py<PyBytes>> {
     if len == 0 || len > (1 << 20) {
         return None;
     }
-    rpc(|c| c.read_memory(addr, len))
+    let data = crate::control::read_memory(addr, len);
+    Some(PyBytes::new_bound(py, &data).unbind())
 }
 
 #[pyfunction(name = "write_mem")]
@@ -202,6 +203,60 @@ fn pb_breakpoint_remove(id: u32) -> PyResult<bool> {
     Ok(true)
 }
 
+/// Arms a generic half-open execution range. The native engine stops before
+/// the first matching instruction and publishes `execution.trap` only after
+/// all application contexts are stable. Protector/OEP policy belongs in the
+/// Python plugin; this primitive has no unpacking semantics.
+#[pyfunction(
+    name = "execution_trap",
+    signature = (start, end, *, once=true, thread_id=None)
+)]
+fn pb_execution_trap(
+    start: u64,
+    end: u64,
+    once: bool,
+    thread_id: Option<u32>,
+) -> PyResult<u32> {
+    if current_plugin_name().is_none() {
+        return Err(no_plugin());
+    }
+    if start == 0 || start >= end {
+        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+            "execution trap must be a non-empty half-open range",
+        ));
+    }
+    if thread_id == Some(PB_INVALID_THREAD_ID) {
+        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+            "thread_id uses the reserved invalid-thread sentinel",
+        ));
+    }
+    let id = crate::execution_trap::set(start, end, once, thread_id).map_err(|status| {
+        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+            "failed to arm native execution trap: status {status}"
+        ))
+    })?;
+    with_current_plugin_mut(|plugin| plugin.execution_traps.insert(id)).ok_or_else(no_plugin)?;
+    Ok(id)
+}
+
+/// Removes only an execution trap owned by the current plugin.
+#[pyfunction(name = "execution_trap_remove")]
+fn pb_execution_trap_remove(id: u32) -> PyResult<bool> {
+    let owned = with_current_plugin_mut(|plugin| plugin.execution_traps.remove(&id))
+        .ok_or_else(no_plugin)?;
+    if !owned {
+        return Ok(false);
+    }
+    Ok(crate::execution_trap::remove(id))
+}
+
+/// Lists active native execution traps as
+/// `(id,start,end,thread_id|None,once,hits)` tuples.
+#[pyfunction(name = "execution_traps")]
+fn pb_execution_traps() -> Vec<(u32, u64, u64, Option<u32>, bool, u64)> {
+    crate::execution_trap::list()
+}
+
 #[pyfunction(name = "hit")]
 fn pb_hit() -> (Option<u32>, u64) {
     match rpc(|c| c.bp_list()) {
@@ -296,7 +351,7 @@ fn pb_resolve(addr: u64) -> Option<String> {
 
 #[pyfunction(name = "resolve_name")]
 fn pb_resolve_name(spec: &str) -> Option<u64> {
-    rpc(|c| c.resolve_name(spec)).filter(|addr| *addr != 0)
+    crate::resolve::resolve_name(spec).filter(|addr| *addr != 0)
 }
 
 #[pyfunction(name = "disasm")]
@@ -312,7 +367,7 @@ fn pb_disasm(addr: u64, count: u64) -> Option<Vec<(u64, u32, u32, u64, String)>>
 
 #[pyfunction(name = "modules")]
 fn pb_modules() -> Vec<(u64, u64, bool, String)> {
-    rpc(|c| c.modules()).unwrap_or_default()
+    crate::control::modules()
 }
 
 #[pyfunction(name = "threads")]
@@ -494,17 +549,15 @@ fn pb_trace_extend(ranges: Vec<(u64, u64)>) -> bool {
 /// virtual region containing an address, or None when it is unmapped.
 #[pyfunction(name = "memory_region")]
 fn pb_memory_region(address: u64) -> Option<(u64, u64, u64, u32, u32, u32)> {
-    rpc(|c| c.memory_region(address)).and_then(|region| {
-        region.map(|r| {
-            (
-                r.base,
-                r.size,
-                r.allocation_base,
-                r.protect,
-                r.state,
-                r.kind,
-            )
-        })
+    crate::control::memory_region(address).map(|region| {
+        (
+            region.base,
+            region.size,
+            region.allocation_base,
+            region.protect,
+            region.state,
+            region.kind,
+        )
     })
 }
 
@@ -1448,6 +1501,9 @@ fn pb(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(pb_bp_remove, m)?)?;
     m.add_function(wrap_pyfunction!(pb_breakpoint, m)?)?;
     m.add_function(wrap_pyfunction!(pb_breakpoint_remove, m)?)?;
+    m.add_function(wrap_pyfunction!(pb_execution_trap, m)?)?;
+    m.add_function(wrap_pyfunction!(pb_execution_trap_remove, m)?)?;
+    m.add_function(wrap_pyfunction!(pb_execution_traps, m)?)?;
     m.add_function(wrap_pyfunction!(pb_hit, m)?)?;
     m.add_function(wrap_pyfunction!(pb_is_stopped, m)?)?;
     m.add_function(wrap_pyfunction!(pb_stop, m)?)?;

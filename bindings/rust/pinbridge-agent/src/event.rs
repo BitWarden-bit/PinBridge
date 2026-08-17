@@ -112,6 +112,11 @@ pub const EVENT_ROUTINE_INSTRUMENT: u32 = 30;
 /// arg1=instruction count, arg2=fall-through, arg3=original,
 /// arg7=policy generation.
 pub const EVENT_BBL_INSTRUMENT: u32 = 31;
+/// A generic script-owned execution range stopped before its matching
+/// instruction. address=application IP, arg0=trap id, arg1=start, arg2=end,
+/// arg3=hit count, arg4=stop generation, arg5=option flags, arg6=thread
+/// filter (u32::MAX means all threads).
+pub const EVENT_EXECUTION_TRAP: u32 = 32;
 
 pub const EVENT_KIND_COUNT: usize = 9;
 
@@ -197,6 +202,7 @@ pub fn kind_name(kind: u32) -> &'static str {
         EVENT_TRACE_INSTRUMENT => "trace_instrument",
         EVENT_ROUTINE_INSTRUMENT => "routine_instrument",
         EVENT_BBL_INSTRUMENT => "basic_block_instrument",
+        EVENT_EXECUTION_TRAP => "execution_trap",
         _ => "unknown",
     }
 }

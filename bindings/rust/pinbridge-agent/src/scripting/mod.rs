@@ -170,6 +170,9 @@ pub struct Plugin {
     /// New-style callbacks bound to exact native breakpoint ids.  Legacy
     /// `on_bp_hit` remains separate and receives every stop notification.
     pub breakpoints: TlsFreeMap<u32, subscriptions::BreakpointSubscription>,
+    /// Generic native execution-range traps owned by this plugin. The VMP/OEP
+    /// meaning, if any, remains entirely in the external Python strategy.
+    pub execution_traps: TlsFreeSet<u32>,
     pub filters: Filters,
     /// Ring cursor: events with sequence <= cursor are consumed already.
     pub cursor: u64,

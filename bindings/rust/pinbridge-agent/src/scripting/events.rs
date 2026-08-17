@@ -84,7 +84,7 @@ pub fn context_reason_name(reason: u64) -> &'static str {
     }
 }
 
-pub const PUBLIC_EVENT_NAMES: [&str; 27] = [
+pub const PUBLIC_EVENT_NAMES: [&str; 28] = [
     "process.start",
     "process.exit",
     "process.prepare_fini",
@@ -112,6 +112,7 @@ pub const PUBLIC_EVENT_NAMES: [&str; 27] = [
     "trace.instrument",
     "routine.instrument",
     "basic_block.instrument",
+    "execution.trap",
 ];
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -172,6 +173,9 @@ impl EventSelector {
             }
             "basic_block.instrument" | "basic_block_instrument" | "bbl.instrument"
             | "bbl_instrument" => Self::Kind(EVENT_BBL_INSTRUMENT),
+            "execution.trap" | "execution_trap" | "exec.trap" | "exec_trap" => {
+                Self::Kind(EVENT_EXECUTION_TRAP)
+            }
             _ => return None,
         })
     }
@@ -206,6 +210,7 @@ impl EventSelector {
             Self::Kind(EVENT_TRACE_INSTRUMENT) => "trace.instrument",
             Self::Kind(EVENT_ROUTINE_INSTRUMENT) => "routine.instrument",
             Self::Kind(EVENT_BBL_INSTRUMENT) => "basic_block.instrument",
+            Self::Kind(EVENT_EXECUTION_TRAP) => "execution.trap",
             Self::Kind(_) => "unknown",
         }
     }
@@ -255,6 +260,7 @@ impl EventSelector {
                 | Self::Kind(EVENT_DEBUGGER_BREAKPOINT)
                 | Self::Kind(EVENT_DEBUGGER_SINGLE_STEP)
                 | Self::Kind(EVENT_DEBUGGER_ASYNC_BREAK)
+                | Self::Kind(EVENT_EXECUTION_TRAP)
         )
     }
 
@@ -585,6 +591,19 @@ pub fn build_event_dict(
             row.set_item("is_original", event.arg3 != 0)?;
             row.set_item("policy_generation", event.arg7)?;
         }
+        EventSelector::Kind(EVENT_EXECUTION_TRAP) => {
+            row.set_item("id", event.arg0)?;
+            row.set_item("start", event.arg1)?;
+            row.set_item("end", event.arg2)?;
+            row.set_item("hits", event.arg3)?;
+            row.set_item("stop_generation", event.arg4)?;
+            row.set_item("once", event.arg5 & 1 != 0)?;
+            if event.arg5 & 2 != 0 {
+                row.set_item("thread_filter", event.arg6)?;
+            } else {
+                row.set_item("thread_filter", py.None())?;
+            }
+        }
         EventSelector::Kind(EVENT_MODULE_LOAD) => {
             row.set_item("base", event.arg0)?;
             row.set_item("end", event.arg1)?;
@@ -721,6 +740,7 @@ mod tests {
             "debugger.breakpoint",
             "debugger.single_step",
             "debugger.async_break",
+            "execution.trap",
         ] {
             let selector = EventSelector::parse(name).expect("public event must parse");
             assert!(selector.is_priority());

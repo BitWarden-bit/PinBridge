@@ -659,6 +659,7 @@ fn cmd_unload(name: &str) {
 #[derive(Default)]
 struct NativeOwnership {
     breakpoint_ids: Vec<u32>,
+    execution_trap_ids: Vec<u32>,
     // Deliberately retains duplicates: every event/decision subscription
     // acquired one lease, even when several subscriptions share an address.
     hook_addresses: Vec<u64>,
@@ -670,6 +671,7 @@ struct NativeOwnership {
 fn drain_runtime_ownership(plugin: &mut Plugin) -> NativeOwnership {
     let ownership = NativeOwnership {
         breakpoint_ids: plugin.breakpoints.keys().copied().collect(),
+        execution_trap_ids: plugin.execution_traps.iter().copied().collect(),
         hook_addresses: plugin
             .decisions
             .values()
@@ -683,6 +685,7 @@ fn drain_runtime_ownership(plugin: &mut Plugin) -> NativeOwnership {
             .collect(),
     };
     plugin.breakpoints.clear();
+    plugin.execution_traps.clear();
     plugin.decisions.clear();
     plugin.events.clear();
     plugin.instrumentation = None;
@@ -703,6 +706,9 @@ fn release_native_ownership(ownership: NativeOwnership) {
         if super::decisions::release_hook(address) {
             super::decisions::queue_hook_removal(address);
         }
+    }
+    for id in ownership.execution_trap_ids {
+        let _ = crate::execution_trap::remove(id);
     }
 }
 
@@ -738,16 +744,17 @@ fn quarantine_error_plugins(reason: &str) {
     }
     for (name, ownership) in quarantined {
         let breakpoint_count = ownership.breakpoint_ids.len();
+        let execution_trap_count = ownership.execution_trap_ids.len();
         let hook_lease_count = ownership.hook_addresses.len();
         release_native_ownership(ownership);
         output::push(
             &name,
             &format!(
-                "quarantined after {reason}: released {breakpoint_count} breakpoints and {hook_lease_count} Hook leases"
+                "quarantined after {reason}: released {breakpoint_count} breakpoints, {execution_trap_count} execution traps and {hook_lease_count} Hook leases"
             ),
         );
         crate::log::line(&format!(
-            "plugin quarantined after {reason}: {name} breakpoints={breakpoint_count} hook_leases={hook_lease_count}"
+            "plugin quarantined after {reason}: {name} breakpoints={breakpoint_count} execution_traps={execution_trap_count} hook_leases={hook_lease_count}"
         ));
     }
     super::interceptors::publish_interests();
@@ -894,6 +901,7 @@ fn exec_one(name: &str, code: Py<PyAny>, port: u16) {
             code_fetch: None,
             xed_decode: None,
             breakpoints: crate::new_map(),
+            execution_traps: crate::new_set(),
             filters: super::Filters::default(),
             cursor: initial_cursor,
             priority_cursor: initial_priority_cursor,

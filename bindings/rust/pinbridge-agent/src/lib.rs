@@ -16,6 +16,7 @@ mod emergency;
 mod engines;
 mod event;
 mod event_channel;
+mod execution_trap;
 mod exception;
 mod hooks;
 mod high_priority;
@@ -131,6 +132,13 @@ fn agent_main(argc: c_int, argv: *mut *mut c_char) -> c_int {
         log::line(&format!("breakpoint engine init -> {bp_status}"));
         if bp_status != PB_OK {
             return 5;
+        }
+        let execution_trap_status = execution_trap::init();
+        log::line(&format!(
+            "execution-range trap engine init -> {execution_trap_status}"
+        ));
+        if execution_trap_status != PB_OK {
+            return 22;
         }
         let hook_status = hooks::init();
         log::line(&format!("hook action engine init -> {hook_status}"));

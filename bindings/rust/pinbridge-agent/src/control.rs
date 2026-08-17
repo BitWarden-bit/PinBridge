@@ -38,6 +38,48 @@ struct MemoryBasicInformation {
     kind: u32,
 }
 
+#[derive(Copy, Clone)]
+pub struct MemoryRegion {
+    pub base: u64,
+    pub size: u64,
+    pub allocation_base: u64,
+    pub protect: u32,
+    pub state: u32,
+    pub kind: u32,
+}
+
+/// Same-process VirtualQuery primitive. Unlike the loopback control request,
+/// this can be used by a synchronous Python decision callback while the
+/// application thread is waiting for that decision.
+pub fn memory_region(address: u64) -> Option<MemoryRegion> {
+    let mut info = MemoryBasicInformation {
+        base_address: core::ptr::null_mut(),
+        allocation_base: core::ptr::null_mut(),
+        allocation_protect: 0,
+        #[cfg(target_pointer_width = "64")]
+        partition_id: 0,
+        region_size: 0,
+        state: 0,
+        protect: 0,
+        kind: 0,
+    };
+    let found = unsafe {
+        VirtualQuery(
+            address as *const c_void,
+            &mut info,
+            core::mem::size_of::<MemoryBasicInformation>(),
+        ) == core::mem::size_of::<MemoryBasicInformation>()
+    };
+    found.then_some(MemoryRegion {
+        base: info.base_address as u64,
+        size: info.region_size as u64,
+        allocation_base: info.allocation_base as u64,
+        protect: info.protect,
+        state: info.state,
+        kind: info.kind,
+    })
+}
+
 pub fn is_stopped() -> bool {
     STOPPED.load(Ordering::Acquire)
 }
@@ -66,13 +108,7 @@ pub fn handle_resume() -> Vec<u8> {
 
 pub const READ_MEM_MAX: u64 = 65536;
 
-pub fn handle_read_mem(payload: &[u8]) -> Result<Vec<u8>, u8> {
-    let mut reader = proto::Reader::new(payload);
-    let address = reader.u64().ok_or(proto::STATUS_BAD_REQUEST)?;
-    let size = reader.u64().ok_or(proto::STATUS_BAD_REQUEST)?;
-    if size == 0 || size > READ_MEM_MAX {
-        return Err(proto::STATUS_BAD_REQUEST);
-    }
+pub fn read_memory(address: u64, size: u64) -> Vec<u8> {
     let mut buffer = vec![0u8; size as usize];
     let mut copied: u64 = 0;
     unsafe {
@@ -84,6 +120,18 @@ pub fn handle_read_mem(payload: &[u8]) -> Result<Vec<u8>, u8> {
         );
     }
     buffer.truncate(copied as usize);
+    buffer
+}
+
+pub fn handle_read_mem(payload: &[u8]) -> Result<Vec<u8>, u8> {
+    let mut reader = proto::Reader::new(payload);
+    let address = reader.u64().ok_or(proto::STATUS_BAD_REQUEST)?;
+    let size = reader.u64().ok_or(proto::STATUS_BAD_REQUEST)?;
+    if size == 0 || size > READ_MEM_MAX {
+        return Err(proto::STATUS_BAD_REQUEST);
+    }
+    let buffer = read_memory(address, size);
+    let copied = buffer.len() as u64;
     let mut out = Vec::with_capacity(16 + buffer.len());
     proto::put_u64(&mut out, address);
     proto::put_u64(&mut out, copied);
@@ -96,30 +144,13 @@ pub fn handle_read_mem(payload: &[u8]) -> Result<Vec<u8>, u8> {
 pub fn handle_memory_region(payload: &[u8]) -> Result<Vec<u8>, u8> {
     let mut reader = proto::Reader::new(payload);
     let address = reader.u64().ok_or(proto::STATUS_BAD_REQUEST)?;
-    let mut info = MemoryBasicInformation {
-        base_address: core::ptr::null_mut(),
-        allocation_base: core::ptr::null_mut(),
-        allocation_protect: 0,
-        #[cfg(target_pointer_width = "64")]
-        partition_id: 0,
-        region_size: 0,
-        state: 0,
-        protect: 0,
-        kind: 0,
-    };
-    let found = unsafe {
-        VirtualQuery(
-            address as *const c_void,
-            &mut info,
-            core::mem::size_of::<MemoryBasicInformation>(),
-        ) == core::mem::size_of::<MemoryBasicInformation>()
-    };
+    let info = memory_region(address);
     let mut out = Vec::with_capacity(1 + 8 * 3 + 4 * 3);
-    out.push(found as u8);
-    if found {
-        proto::put_u64(&mut out, info.base_address as u64);
-        proto::put_u64(&mut out, info.region_size as u64);
-        proto::put_u64(&mut out, info.allocation_base as u64);
+    out.push(info.is_some() as u8);
+    if let Some(info) = info {
+        proto::put_u64(&mut out, info.base);
+        proto::put_u64(&mut out, info.size);
+        proto::put_u64(&mut out, info.allocation_base);
         proto::put_u32(&mut out, info.protect);
         proto::put_u32(&mut out, info.state);
         proto::put_u32(&mut out, info.kind);
@@ -164,19 +195,16 @@ pub fn handle_write_mem(payload: &[u8]) -> Result<Vec<u8>, u8> {
 
 const MAX_MODULES: usize = 512;
 
-pub fn handle_modules() -> Vec<u8> {
-    let mut out = Vec::with_capacity(4096);
-    let mut count: u32 = 0;
+pub fn modules() -> Vec<(u64, u64, bool, String)> {
     let mut entries = Vec::new();
     unsafe {
         let mut img = PbImgHandle { opaque: 0 };
         if pb_app_img_head(&mut img) != PB_OK {
-            proto::put_u32(&mut out, 0);
-            return out;
+            return entries;
         }
         let mut valid: u8 = 0;
         pb_img_valid(img, &mut valid);
-        while valid != 0 && count as usize <= MAX_MODULES {
+        while valid != 0 && entries.len() < MAX_MODULES {
             let mut low: u64 = 0;
             let mut high: u64 = 0;
             let mut is_main: u8 = 0;
@@ -192,8 +220,7 @@ pub fn handle_modules() -> Vec<u8> {
             } else {
                 String::new()
             };
-            entries.push((low, high, is_main, name));
-            count += 1;
+            entries.push((low, high, is_main != 0, name));
             let mut next = PbImgHandle { opaque: 0 };
             if pb_img_next(img, &mut next) != PB_OK {
                 break;
@@ -203,11 +230,17 @@ pub fn handle_modules() -> Vec<u8> {
             pb_img_valid(img, &mut valid);
         }
     }
-    proto::put_u32(&mut out, count);
+    entries
+}
+
+pub fn handle_modules() -> Vec<u8> {
+    let mut out = Vec::with_capacity(4096);
+    let entries = modules();
+    proto::put_u32(&mut out, entries.len() as u32);
     for (low, high, is_main, name) in entries {
         proto::put_u64(&mut out, low);
         proto::put_u64(&mut out, high);
-        out.push(is_main);
+        out.push(is_main as u8);
         let bytes = name.as_bytes();
         proto::put_u32(&mut out, bytes.len() as u32);
         out.extend_from_slice(bytes);

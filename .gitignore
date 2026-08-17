@@ -60,3 +60,6 @@ fixtures/code_fetch_python_demo/*.exe
 fixtures/code_fetch_python_demo/*.exp
 fixtures/code_fetch_python_demo/*.lib
 fixtures/code_fetch_python_demo/*.ready
+fixtures/execution_trap_python_demo/*.exe
+fixtures/execution_trap_python_demo/*.exp
+fixtures/execution_trap_python_demo/*.lib
