@@ -718,8 +718,15 @@ def run_forward(window, decoder, sources, extra_sinks, max_sink_lines=50):
     regstate = RegState(decoder.arch)
     shadow = {}                       # ea byte -> taint entry
     sink_hits = []
+    sink_hits_total = 0
     unknown_mnemonics = {}
     event_sourced = 0
+
+    def record_sink(seq, ip, text, kind, entry):
+        nonlocal sink_hits_total
+        sink_hits_total += 1
+        if max_sink_lines is None or len(sink_hits) < max_sink_lines:
+            sink_hits.append((seq, ip, text, kind, entry))
 
     mem_sources = [s for s in sources if s.kind == "mem"]
 
@@ -739,6 +746,11 @@ def run_forward(window, decoder, sources, extra_sinks, max_sink_lines=50):
         return None
 
     sink_ranges = [s for s in extra_sinks if s[0] == "mem"]
+    # RIP/EIP is the built-in control-flow sink below.  Other register sinks
+    # fire only when the current instruction deposits taint into an
+    # overlapping register byte; merely retaining old taint is not a hit.
+    sink_registers = [s[1] for s in extra_sinks
+                      if s[0] == "reg" and s[1] != decoder.arch.ip]
 
     for inst in window.insns:
         insn = decoder.decode(inst.ip, inst.rec)
@@ -792,13 +804,17 @@ def run_forward(window, decoder, sources, extra_sinks, max_sink_lines=50):
         cf_taint = read_taint(transfer.cf_uses)
         if cf_taint[0]:
             # built-in control-flow sink (a); --sink reg:RIP selects the same
-            sink_hits.append((inst.seq, inst.ip, insn.text,
-                              "control-flow", cf_taint))
+            record_sink(inst.seq, inst.ip, insn.text,
+                        "control-flow", cf_taint)
 
         # apply steps, collecting per-write-event taint for the data sink
-        written_entries = {}    # byte -> entry deposited this instruction
-        for step in transfer.steps:
-            src = read_taint(step.uses)
+        written_entries = {}    # memory byte -> entry deposited this instruction
+        written_reg_entries = {}  # register byte key -> deposited entry
+        # Every architectural input is read from the pre-instruction state.
+        # Applying one output before evaluating the next corrupts multi-output
+        # semantics such as xchg (the second side would read the first write).
+        step_sources = [read_taint(step.uses) for step in transfer.steps]
+        for step, src in zip(transfer.steps, step_sources):
             if src[0]:
                 src = (src[0], src[1] + 1)
             for k in step.def_full:
@@ -811,6 +827,7 @@ def run_forward(window, decoder, sources, extra_sinks, max_sink_lines=50):
                     written_entries[k[1]] = ent
                 else:
                     regstate._bank(k[1])[k[2]] = ent
+                    written_reg_entries[k] = ent
 
         if fired_labels and not events["reads"]:
             for ea, size in events["writes"]:
@@ -829,11 +846,20 @@ def run_forward(window, decoder, sources, extra_sinks, max_sink_lines=50):
             custom = any(lo <= ea and ea + size <= hi
                          for _k, lo, hi in sink_ranges)
             if custom:
-                sink_hits.append((inst.seq, inst.ip, insn.text,
-                                  "custom-mem-write", ent))
+                record_sink(inst.seq, inst.ip, insn.text,
+                            "custom-mem-write", ent)
             elif not in_source:
-                sink_hits.append((inst.seq, inst.ip, insn.text,
-                                  "data-write", ent))
+                record_sink(inst.seq, inst.ip, insn.text,
+                            "data-write", ent)
+
+        for name in sink_registers:
+            sink_keys = regstate.reg_bytes(name)
+            ent = taint_union([written_reg_entries[k]
+                               for k in sink_keys
+                               if k in written_reg_entries])
+            if ent[0]:
+                record_sink(inst.seq, inst.ip, insn.text,
+                            "custom-reg-write", ent)
 
     stats = {
         "unknown_mnemonics": unknown_mnemonics,
@@ -841,6 +867,7 @@ def run_forward(window, decoder, sources, extra_sinks, max_sink_lines=50):
         "unpaired_mem": window.unpaired_mem,
         "insns": len(window.insns),
         "event_sourced": event_sourced,
+        "sink_hits": sink_hits_total,
     }
     state = {"regs": regstate, "shadow": shadow}
     return sink_hits, stats, state
@@ -898,22 +925,27 @@ def run_slice(window, decoder, at_seq, operand):
         size = rest[0] if rest else decoder.arch.pointer_size
         demand = {("m", a1 + i) for i in range(size)}
 
+    def resolve_transfer_demand(demand, transfer):
+        """Resolve all outputs against one pre-instruction demand snapshot."""
+        before = set(demand)
+        matching = [step for step in transfer.steps if step.def_full & before]
+        if not matching:
+            return before, False
+        definitions = set()
+        uses = set()
+        for step in matching:
+            definitions |= step.def_full
+            uses |= step.uses
+        return (before - definitions) | uses, True
+
     in_slice = {target.idx}
     # if the target instruction itself defines the operand, resolve through it
     # first (covers slicing at the producing instruction, not just a use site)
-    for step in target.transfer.steps:
-        if step.def_full & demand:
-            demand -= step.def_full
-            demand |= step.uses
+    demand, _ = resolve_transfer_demand(demand, target.transfer)
     i = target.idx - 1
     while i >= 0 and demand:
         tr = window.insns[i].transfer
-        hit = False
-        for step in tr.steps:
-            if step.def_full & demand:
-                demand -= step.def_full
-                demand |= step.uses
-                hit = True
+        demand, hit = resolve_transfer_demand(demand, tr)
         # control-flow uses: the target instruction's input (e.g. jmp rax)
         # reads those bytes; nothing to resolve backwards beyond marking.
         if hit:
@@ -938,6 +970,8 @@ def _fmt_labels(entry):
 
 
 def cmd_forward(args, trace):
+    if args.max_sink_lines < 0:
+        raise SystemExit("--max-sink-lines must be >= 0")
     arch = architecture_from_meta(trace.meta)
     sources = [Source("s%d" % i, spec, arch)
                for i, spec in enumerate(args.source or [])]
@@ -946,7 +980,8 @@ def cmd_forward(args, trace):
     extra_sinks = [parse_sink(s, arch) for s in (args.sink or [])]
     decoder = Decoder(args.pe, args.base, arch)
     window = build_window(trace, args.thread, args.max_events)
-    sink_hits, stats, state = run_forward(window, decoder, sources, extra_sinks)
+    sink_hits, stats, state = run_forward(
+        window, decoder, sources, extra_sinks, args.max_sink_lines)
     print("== forward taint ==")
     print("window: thread=%d insns=%d records_consumed=%d"
           % (window.tid, stats["insns"], window.records_consumed))
@@ -962,10 +997,12 @@ def cmd_forward(args, trace):
     print("sources:")
     for s in sources:
         print("  %s" % s.describe())
-    print("sink hits: %d%s" % (len(sink_hits),
-                                 " (showing first %d)" % args.max_sink_lines
-                                 if len(sink_hits) > args.max_sink_lines else ""))
-    for seq, ip, text, kind, ent in sink_hits[:args.max_sink_lines]:
+    total_sink_hits = stats["sink_hits"]
+    print("sink hits: %d%s" % (
+        total_sink_hits,
+        " (showing first %d)" % len(sink_hits)
+        if total_sink_hits > len(sink_hits) else ""))
+    for seq, ip, text, kind, ent in sink_hits:
         print("  [seq %-8d] 0x%012x  %-32s %-16s labels=%s chain=%d"
               % (seq, ip, text, kind, _fmt_labels(ent), ent[1]))
     if stats["unknown_mnemonics"]:

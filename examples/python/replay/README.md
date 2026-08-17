@@ -161,7 +161,13 @@ python taint.py win.pbtr slice --at 2711833 --operand mem:0x7ff6e6e53128:4 \
   `event:#N` (labels the Nth memory event of the window).
 - Sinks (built-in): (a) control-flow — taint reaches a jmp/call/ret target;
   (b) data — tainted memory write to an EA outside every source range.
-  Extra `--sink mem:LO-HI` / `reg:RIP` on top.
+  Extra `--sink mem:LO-HI` reports a tainted write fully contained in that
+  range. `--sink reg:NAME` reports when an instruction writes taint into any
+  overlapping byte of that register (so `reg:EAX` also observes an `AL`
+  write); `reg:RIP` / `reg:EIP` selects the built-in control-flow sink without
+  emitting a duplicate hit. `--max-sink-lines N` keeps an exact total but
+  retains only the first N detailed hits, so large replays have bounded result
+  memory.
 - Slice: demand-set walk backwards from `--at` over `--operand`; memory demand
   resolves through concrete write EAs (exact, no alias analysis); unresolved
   demand at window start is reported as `source outside window: ...`.
@@ -175,8 +181,11 @@ python test_taint.py     # pure offline tests, no Pin
 Cover: reader round-trip/gaps/truncated tail/unknown kinds; x86/x64 decode and
 register models; same-IP SMC byte changes; mem→reg
 propagation; xor-reg,reg kill; ALU label union; push/pop round-trip through
-concrete stack EAs; 32-bit subregister zero-extend kill; control-flow & data
-sink firing; conservative unknown-mnemonic handling; slice contributor
+concrete stack EAs; simultaneous `xchg` forward/slice semantics; 32-bit
+subregister zero-extend kill; control-flow & data
+sink firing; x86/x64 register-sink aliases and clean-write suppression;
+bounded sink sampling with exact totals; conservative unknown-mnemonic
+handling; slice contributor
 exactness, entry-boundary demand, stack propagation, xor-kill cut.
 
 ## Current limitations (v1)

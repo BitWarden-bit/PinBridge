@@ -32,6 +32,7 @@ B_MOV_RAX_RDX = b"\x48\x89\xD0"               # mov rax, rdx
 B_XOR_RAX_RAX = b"\x48\x31\xC0"               # xor rax, rax
 B_ADD_RAX_RCX = b"\x48\x01\xC8"               # add rax, rcx
 B_MOV_EAX_ECX = b"\x89\xC8"                   # mov eax, ecx (zero-extends!)
+B_XCHG_RAX_RCX = b"\x48\x91"                  # xchg rax, rcx
 B_PUSH_RAX = b"\x50"                          # push rax
 B_POP_RCX = b"\x59"                           # pop rcx
 B_JMP_RAX = b"\xFF\xE0"                       # jmp rax
@@ -371,6 +372,17 @@ class ForwardTaintTests(unittest.TestCase):
             for i in range(4, 8):
                 self.assertEqual(bank[i], taint.CLEAN)
 
+    def test_xchg_reads_both_operands_before_writing_either(self):
+        with tempfile.TemporaryDirectory() as d:
+            trace = build_trace(os.path.join(d, "t.pbtr"), [
+                (B_XCHG_RAX_RCX, []),
+            ])
+            _hits, _stats, state = forward(trace, ["reg:rax", "reg:rcx"])
+            self.assertEqual(state["regs"].read("rax")[0],
+                             frozenset({"s1"}))
+            self.assertEqual(state["regs"].read("rcx")[0],
+                             frozenset({"s0"}))
+
     def test_control_flow_and_data_sinks_fire(self):
         with tempfile.TemporaryDirectory() as d:
             trace = build_trace(os.path.join(d, "t.pbtr"), [
@@ -385,6 +397,91 @@ class ForwardTaintTests(unittest.TestCase):
             cf = [h for h in hits if h[3] == "control-flow"][0]
             self.assertIn("jmp", cf[2])
             self.assertEqual(cf[4][0], frozenset({"s0"}))
+
+    def test_custom_register_sink_fires_on_tainted_alias_write(self):
+        with tempfile.TemporaryDirectory() as d:
+            trace = build_trace(os.path.join(d, "t.pbtr"), [
+                (B_MOV_RAX_RBXP, [(EA_SRC, 8, pbtrace.ACCESS_READ, 0)]),
+                (B_MOV_RCX_RAX, []),
+            ])
+            arch = taint.architecture_from_meta(trace.meta)
+            decoder = taint.Decoder(arch=arch)
+            hits, _stats, _state = taint.run_forward(
+                taint.build_window(trace, None), decoder,
+                [taint.Source("s0", "mem:0x%x:8" % EA_SRC, arch)],
+                [taint.parse_sink("reg:ecx", arch)],
+            )
+            reg_hits = [h for h in hits if h[3] == "custom-reg-write"]
+            self.assertEqual(len(reg_hits), 1)
+            self.assertIn("mov rcx, rax", reg_hits[0][2])
+            self.assertEqual(reg_hits[0][4][0], frozenset({"s0"}))
+
+    def test_custom_register_sink_ignores_clean_overwrite(self):
+        with tempfile.TemporaryDirectory() as d:
+            trace = build_trace(os.path.join(d, "t.pbtr"), [
+                (B_XOR_RAX_RAX, []),
+            ])
+            arch = taint.architecture_from_meta(trace.meta)
+            decoder = taint.Decoder(arch=arch)
+            hits, _stats, state = taint.run_forward(
+                taint.build_window(trace, None), decoder,
+                [taint.Source("s0", "reg:rax", arch)],
+                [taint.parse_sink("reg:rax", arch)],
+            )
+            self.assertEqual([h for h in hits
+                              if h[3] == "custom-reg-write"], [])
+            self.assertEqual(state["regs"].read("rax"), taint.CLEAN)
+
+    def test_x86_custom_register_sink_uses_x86_aliases(self):
+        with tempfile.TemporaryDirectory() as d:
+            trace = build_trace(
+                os.path.join(d, "x86-sink.pbtr"),
+                [(B_X86_MOV_EAX_MEM_EBX,
+                  [(EA_SRC, 4, pbtrace.ACCESS_READ, 0)])],
+                meta_extra={"arch": "x86", "pointer_width": 4},
+            )
+            arch = taint.architecture_from_meta(trace.meta)
+            decoder = taint.Decoder(arch=arch)
+            hits, _stats, _state = taint.run_forward(
+                taint.build_window(trace, None), decoder,
+                [taint.Source("s0", "mem:0x%x:4" % EA_SRC, arch)],
+                [taint.parse_sink("reg:ax", arch)],
+            )
+            reg_hits = [h for h in hits if h[3] == "custom-reg-write"]
+            self.assertEqual(len(reg_hits), 1)
+            self.assertEqual(reg_hits[0][4][0], frozenset({"s0"}))
+
+    def test_instruction_pointer_sink_reuses_control_flow_hit(self):
+        with tempfile.TemporaryDirectory() as d:
+            trace = build_trace(os.path.join(d, "t.pbtr"), [
+                (B_JMP_RAX, []),
+            ])
+            arch = taint.architecture_from_meta(trace.meta)
+            decoder = taint.Decoder(arch=arch)
+            hits, _stats, _state = taint.run_forward(
+                taint.build_window(trace, None), decoder,
+                [taint.Source("s0", "reg:rax", arch)],
+                [taint.parse_sink("reg:rip", arch)],
+            )
+            self.assertEqual([h[3] for h in hits], ["control-flow"])
+
+    def test_sink_samples_are_bounded_while_total_stays_exact(self):
+        with tempfile.TemporaryDirectory() as d:
+            trace = build_trace(os.path.join(d, "t.pbtr"), [
+                (B_JMP_RAX, []),
+                (B_JMP_RAX, []),
+                (B_JMP_RAX, []),
+                (B_JMP_RAX, []),
+            ])
+            arch = taint.architecture_from_meta(trace.meta)
+            decoder = taint.Decoder(arch=arch)
+            hits, stats, _state = taint.run_forward(
+                taint.build_window(trace, None), decoder,
+                [taint.Source("s0", "reg:rax", arch)], [],
+                max_sink_lines=2,
+            )
+            self.assertEqual(len(hits), 2)
+            self.assertEqual(stats["sink_hits"], 4)
 
     def test_write_inside_source_range_is_not_a_data_sink(self):
         with tempfile.TemporaryDirectory() as d:
@@ -428,6 +525,18 @@ class ForwardTaintTests(unittest.TestCase):
 
 
 class BackwardSliceTests(unittest.TestCase):
+    def test_slice_through_xchg_uses_pre_instruction_operand(self):
+        with tempfile.TemporaryDirectory() as d:
+            trace = build_trace(os.path.join(d, "t.pbtr"), [
+                (B_XCHG_RAX_RCX, []),
+            ])
+            window = taint.build_window(trace, None)
+            in_slice, reg_demand, mem_demand, _target = taint.run_slice(
+                window, taint.Decoder(), window.insns[0].seq, ("reg", "rcx"))
+            self.assertEqual(in_slice, {0})
+            self.assertEqual(reg_demand, {"rax": set(range(8))})
+            self.assertEqual(mem_demand, [])
+
     def test_e_slice_marks_only_contributors(self):
         with tempfile.TemporaryDirectory() as d:
             trace = build_trace(os.path.join(d, "t.pbtr"), [
