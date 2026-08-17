@@ -13,6 +13,7 @@ import ModeBar from "./features/ai/ModeBar";
 import AiWorkbench from "./features/ai/AiWorkbench";
 import AiEmptyState from "./features/ai/AiEmptyState";
 import { normalizeAddress } from "./address";
+import UnifiedWorkbench from "./features/workspace/UnifiedWorkbench";
 
 function formatCounter(value) {
   const text = String(value ?? "0");
@@ -21,6 +22,12 @@ function formatCounter(value) {
 }
 
 export default function App() {
+  return <UnifiedWorkbench />;
+}
+
+// Kept intact while the unified workspace is reviewed. The existing debugger
+// backend and its current UI remain available for the integration phase.
+export function LegacyDebuggerApp() {
   const t = useT();
   const [session, setSession] = useState({ running: false, target: null });
   const [status, setStatus] = useState({ text: "", err: false });
