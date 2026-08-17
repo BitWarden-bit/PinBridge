@@ -1,23 +1,16 @@
 #include "pin.H"
 
+#include "persistent_callback_state.h"
 #include "trace_instrumentation_backend.h"
-
-#include <cstdlib>
 
 namespace
 {
 
-struct AnalysisState
-{
-    PbTraceAnalysisCallback callback;
-    void* user_data;
-};
+typedef PbPersistentCallbackState<PbTraceAnalysisCallback> AnalysisState;
+typedef PbPersistentCallbackState<PbTracePredicateCallback> PredicateState;
 
-struct PredicateState
-{
-    PbTracePredicateCallback callback;
-    void* user_data;
-};
+AnalysisState* g_analysis_states = 0;
+PredicateState* g_predicate_states = 0;
 
 VOID OnAnalysis(VOID* raw_state)
 {
@@ -31,19 +24,6 @@ ADDRINT OnPredicate(VOID* raw_state)
     return static_cast<ADDRINT>(state->callback(state->user_data));
 }
 
-PbStatus NewAnalysisState(
-    PbTraceAnalysisCallback callback, void* user_data, AnalysisState** out_state)
-{
-    AnalysisState* state =
-        static_cast<AnalysisState*>(std::malloc(sizeof(AnalysisState)));
-    if (!state)
-        return PB_ERR_OUT_OF_MEMORY;
-    state->callback = callback;
-    state->user_data = user_data;
-    *out_state = state;
-    return PB_OK;
-}
-
 } // namespace
 
 PbStatus PbBackendTraceInsertCallBefore(
@@ -51,10 +31,10 @@ PbStatus PbBackendTraceInsertCallBefore(
 {
     if (PIN_IsProbeMode())
         return PB_ERR_INVALID_STATE;
-    AnalysisState* state = 0;
-    const PbStatus status = NewAnalysisState(callback, user_data, &state);
-    if (status != PB_OK)
-        return status;
+    AnalysisState* state = PbInternPersistentCallbackState(
+        g_analysis_states, callback, user_data);
+    if (!state)
+        return PB_ERR_OUT_OF_MEMORY;
     TRACE_InsertCall(
         reinterpret_cast<TRACE>(trace), IPOINT_BEFORE, AFUNPTR(OnAnalysis),
         IARG_PTR, state, IARG_END);
@@ -66,12 +46,10 @@ PbStatus PbBackendTraceInsertIfCallBefore(
 {
     if (PIN_IsProbeMode())
         return PB_ERR_INVALID_STATE;
-    PredicateState* state =
-        static_cast<PredicateState*>(std::malloc(sizeof(PredicateState)));
+    PredicateState* state = PbInternPersistentCallbackState(
+        g_predicate_states, callback, user_data);
     if (!state)
         return PB_ERR_OUT_OF_MEMORY;
-    state->callback = callback;
-    state->user_data = user_data;
     TRACE_InsertIfCall(
         reinterpret_cast<TRACE>(trace), IPOINT_BEFORE, AFUNPTR(OnPredicate),
         IARG_PTR, state, IARG_END);
@@ -83,10 +61,10 @@ PbStatus PbBackendTraceInsertThenCallBefore(
 {
     if (PIN_IsProbeMode())
         return PB_ERR_INVALID_STATE;
-    AnalysisState* state = 0;
-    const PbStatus status = NewAnalysisState(callback, user_data, &state);
-    if (status != PB_OK)
-        return status;
+    AnalysisState* state = PbInternPersistentCallbackState(
+        g_analysis_states, callback, user_data);
+    if (!state)
+        return PB_ERR_OUT_OF_MEMORY;
     TRACE_InsertThenCall(
         reinterpret_cast<TRACE>(trace), IPOINT_BEFORE, AFUNPTR(OnAnalysis),
         IARG_PTR, state, IARG_END);

@@ -1,29 +1,18 @@
 #include "pin.H"
 
 #include "ins_instrumentation_backend.h"
-
-#include <cstdlib>
+#include "persistent_callback_state.h"
 
 namespace
 {
 
-struct AnalysisState
-{
-    PbInsAnalysisCallback callback;
-    void* user_data;
-};
+typedef PbPersistentCallbackState<PbInsAnalysisCallback> AnalysisState;
+typedef PbPersistentCallbackState<PbInsContextAnalysisCallback> ContextAnalysisState;
+typedef PbPersistentCallbackState<PbInsPredicateCallback> PredicateState;
 
-struct ContextAnalysisState
-{
-    PbInsContextAnalysisCallback callback;
-    void* user_data;
-};
-
-struct PredicateState
-{
-    PbInsPredicateCallback callback;
-    void* user_data;
-};
+AnalysisState* g_analysis_states = 0;
+ContextAnalysisState* g_context_analysis_states = 0;
+PredicateState* g_predicate_states = 0;
 
 INS ToIns(PbInsHandle handle)
 {
@@ -55,33 +44,6 @@ ADDRINT OnPredicate(VOID* raw_state)
     return static_cast<ADDRINT>(state->callback(state->user_data));
 }
 
-PbStatus NewAnalysisState(
-    PbInsAnalysisCallback callback, void* user_data, AnalysisState** out_state)
-{
-    AnalysisState* state =
-        static_cast<AnalysisState*>(std::malloc(sizeof(AnalysisState)));
-    if (!state)
-        return PB_ERR_OUT_OF_MEMORY;
-    state->callback = callback;
-    state->user_data = user_data;
-    *out_state = state;
-    return PB_OK;
-}
-
-PbStatus NewPredicateState(
-    PbInsPredicateCallback callback, void* user_data,
-    PredicateState** out_state)
-{
-    PredicateState* state =
-        static_cast<PredicateState*>(std::malloc(sizeof(PredicateState)));
-    if (!state)
-        return PB_ERR_OUT_OF_MEMORY;
-    state->callback = callback;
-    state->user_data = user_data;
-    *out_state = state;
-    return PB_OK;
-}
-
 } // namespace
 
 PbStatus PbBackendInsInsertCallBefore(
@@ -89,10 +51,10 @@ PbStatus PbBackendInsInsertCallBefore(
 {
     if (PIN_IsProbeMode())
         return PB_ERR_INVALID_STATE;
-    AnalysisState* state = 0;
-    const PbStatus status = NewAnalysisState(callback, user_data, &state);
-    if (status != PB_OK)
-        return status;
+    AnalysisState* state = PbInternPersistentCallbackState(
+        g_analysis_states, callback, user_data);
+    if (!state)
+        return PB_ERR_OUT_OF_MEMORY;
     INS_InsertCall(ToIns(ins), IPOINT_BEFORE, AFUNPTR(OnAnalysis),
                    IARG_PTR, state, IARG_END);
     return PB_OK;
@@ -103,12 +65,10 @@ PbStatus PbBackendInsInsertCallBeforeCtx(
 {
     if (PIN_IsProbeMode())
         return PB_ERR_INVALID_STATE;
-    ContextAnalysisState* state =
-        static_cast<ContextAnalysisState*>(std::malloc(sizeof(ContextAnalysisState)));
+    ContextAnalysisState* state = PbInternPersistentCallbackState(
+        g_context_analysis_states, callback, user_data);
     if (!state)
         return PB_ERR_OUT_OF_MEMORY;
-    state->callback = callback;
-    state->user_data = user_data;
     INS_InsertCall(ToIns(ins), IPOINT_BEFORE, AFUNPTR(OnContextAnalysis),
                    IARG_CONTEXT, IARG_PTR, state, IARG_END);
     return PB_OK;
@@ -119,10 +79,10 @@ PbStatus PbBackendInsInsertIfCallBefore(
 {
     if (PIN_IsProbeMode())
         return PB_ERR_INVALID_STATE;
-    PredicateState* state = 0;
-    const PbStatus status = NewPredicateState(callback, user_data, &state);
-    if (status != PB_OK)
-        return status;
+    PredicateState* state = PbInternPersistentCallbackState(
+        g_predicate_states, callback, user_data);
+    if (!state)
+        return PB_ERR_OUT_OF_MEMORY;
     INS_InsertIfCall(ToIns(ins), IPOINT_BEFORE, AFUNPTR(OnPredicate),
                      IARG_PTR, state, IARG_END);
     return PB_OK;
@@ -133,10 +93,10 @@ PbStatus PbBackendInsInsertThenCallBefore(
 {
     if (PIN_IsProbeMode())
         return PB_ERR_INVALID_STATE;
-    AnalysisState* state = 0;
-    const PbStatus status = NewAnalysisState(callback, user_data, &state);
-    if (status != PB_OK)
-        return status;
+    AnalysisState* state = PbInternPersistentCallbackState(
+        g_analysis_states, callback, user_data);
+    if (!state)
+        return PB_ERR_OUT_OF_MEMORY;
     INS_InsertThenCall(ToIns(ins), IPOINT_BEFORE, AFUNPTR(OnAnalysis),
                        IARG_PTR, state, IARG_END);
     return PB_OK;
@@ -147,10 +107,10 @@ PbStatus PbBackendInsInsertPredicatedCallBefore(
 {
     if (PIN_IsProbeMode())
         return PB_ERR_INVALID_STATE;
-    AnalysisState* state = 0;
-    const PbStatus status = NewAnalysisState(callback, user_data, &state);
-    if (status != PB_OK)
-        return status;
+    AnalysisState* state = PbInternPersistentCallbackState(
+        g_analysis_states, callback, user_data);
+    if (!state)
+        return PB_ERR_OUT_OF_MEMORY;
     INS_InsertPredicatedCall(ToIns(ins), IPOINT_BEFORE, AFUNPTR(OnAnalysis),
                              IARG_PTR, state, IARG_END);
     return PB_OK;
@@ -161,10 +121,10 @@ PbStatus PbBackendInsInsertIfPredicatedCallBefore(
 {
     if (PIN_IsProbeMode())
         return PB_ERR_INVALID_STATE;
-    PredicateState* state = 0;
-    const PbStatus status = NewPredicateState(callback, user_data, &state);
-    if (status != PB_OK)
-        return status;
+    PredicateState* state = PbInternPersistentCallbackState(
+        g_predicate_states, callback, user_data);
+    if (!state)
+        return PB_ERR_OUT_OF_MEMORY;
     INS_InsertIfPredicatedCall(
         ToIns(ins), IPOINT_BEFORE, AFUNPTR(OnPredicate),
         IARG_PTR, state, IARG_END);
@@ -176,10 +136,10 @@ PbStatus PbBackendInsInsertThenPredicatedCallBefore(
 {
     if (PIN_IsProbeMode())
         return PB_ERR_INVALID_STATE;
-    AnalysisState* state = 0;
-    const PbStatus status = NewAnalysisState(callback, user_data, &state);
-    if (status != PB_OK)
-        return status;
+    AnalysisState* state = PbInternPersistentCallbackState(
+        g_analysis_states, callback, user_data);
+    if (!state)
+        return PB_ERR_OUT_OF_MEMORY;
     INS_InsertThenPredicatedCall(
         ToIns(ins), IPOINT_BEFORE, AFUNPTR(OnAnalysis),
         IARG_PTR, state, IARG_END);

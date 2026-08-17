@@ -1,60 +1,31 @@
 #include "pin.H"
 
 #include "ins_capture_backend.h"
+#include "persistent_callback_state.h"
 #include "reg_mapping_pin.h"
-
-#include <cstdlib>
 
 namespace
 {
 
-struct CaptureRegsState
-{
-    PbInsCaptureRegsCallback callback;
-    void* user_data;
-};
+typedef PbPersistentCallbackState<PbInsCaptureRegsCallback> CaptureRegsState;
+typedef PbPersistentCallbackState<PbInsContextCaptureRegsCallback>
+    ContextCaptureRegsState;
+typedef PbPersistentCallbackState<PbInsMemoryOperandCallback> MemoryOperandState;
+typedef PbPersistentCallbackState<PbInsMemoryTranslateCallback> MemoryTranslateState;
+typedef PbPersistentCallbackState<PbInsExecCallback> ExecState;
+typedef PbPersistentCallbackState<PbInsBranchEdgeCallback> BranchEdgeState;
+typedef PbPersistentCallbackState<PbInsExecBytesCallback> ExecBytesState;
+typedef PbPersistentCallbackState<PbInsMemoryOperandValueCallback>
+    MemoryOperandValueState;
 
-struct ContextCaptureRegsState
-{
-    PbInsContextCaptureRegsCallback callback;
-    void* user_data;
-};
-
-struct MemoryOperandState
-{
-    PbInsMemoryOperandCallback callback;
-    void* user_data;
-};
-
-struct MemoryTranslateState
-{
-    PbInsMemoryTranslateCallback callback;
-    void* user_data;
-};
-
-struct ExecState
-{
-    PbInsExecCallback callback;
-    void* user_data;
-};
-
-struct BranchEdgeState
-{
-    PbInsBranchEdgeCallback callback;
-    void* user_data;
-};
-
-struct ExecBytesState
-{
-    PbInsExecBytesCallback callback;
-    void* user_data;
-};
-
-struct MemoryOperandValueState
-{
-    PbInsMemoryOperandValueCallback callback;
-    void* user_data;
-};
+CaptureRegsState* g_capture_regs_states = 0;
+ContextCaptureRegsState* g_context_capture_regs_states = 0;
+MemoryOperandState* g_memory_operand_states = 0;
+MemoryTranslateState* g_memory_translate_states = 0;
+ExecState* g_exec_states = 0;
+BranchEdgeState* g_branch_edge_states = 0;
+ExecBytesState* g_exec_bytes_states = 0;
+MemoryOperandValueState* g_memory_operand_value_states = 0;
 
 INS ToIns(PbInsHandle handle)
 {
@@ -242,12 +213,10 @@ PbStatus PbBackendInsInsertCaptureRegs(
 {
     if (PIN_IsProbeMode())
         return PB_ERR_INVALID_STATE;
-    CaptureRegsState* state =
-        static_cast<CaptureRegsState*>(std::malloc(sizeof(CaptureRegsState)));
+    CaptureRegsState* state = PbInternPersistentCallbackState(
+        g_capture_regs_states, callback, user_data);
     if (!state)
         return PB_ERR_OUT_OF_MEMORY;
-    state->callback = callback;
-    state->user_data = user_data;
     INS_InsertPredicatedCall(
         ToIns(ins), IPOINT_BEFORE, AFUNPTR(OnCaptureRegs),
         IARG_INST_PTR, IARG_THREAD_ID,
@@ -269,12 +238,10 @@ PbStatus PbBackendInsInsertCaptureRegsCtx(
 {
     if (PIN_IsProbeMode())
         return PB_ERR_INVALID_STATE;
-    ContextCaptureRegsState* state = static_cast<ContextCaptureRegsState*>(
-        std::malloc(sizeof(ContextCaptureRegsState)));
+    ContextCaptureRegsState* state = PbInternPersistentCallbackState(
+        g_context_capture_regs_states, callback, user_data);
     if (!state)
         return PB_ERR_OUT_OF_MEMORY;
-    state->callback = callback;
-    state->user_data = user_data;
     INS_InsertPredicatedCall(
         ToIns(ins), IPOINT_BEFORE, AFUNPTR(OnContextCaptureRegs),
         IARG_INST_PTR, IARG_THREAD_ID, IARG_CONTEXT,
@@ -294,12 +261,10 @@ PbStatus PbBackendInsInsertMemoryOperands(
 {
     if (PIN_IsProbeMode())
         return PB_ERR_INVALID_STATE;
-    MemoryOperandState* state =
-        static_cast<MemoryOperandState*>(std::malloc(sizeof(MemoryOperandState)));
+    MemoryOperandState* state = PbInternPersistentCallbackState(
+        g_memory_operand_states, callback, user_data);
     if (!state)
         return PB_ERR_OUT_OF_MEMORY;
-    state->callback = callback;
-    state->user_data = user_data;
     const INS pins = ToIns(ins);
     const UINT32 count = INS_MemoryOperandCount(pins);
     UINT32 read_count = 0;
@@ -343,12 +308,10 @@ PbStatus PbBackendInsInsertMemoryAddressTranslation(
         return PB_ERR_UNSUPPORTED;
     if (count == 0)
         return PB_OK;
-    MemoryTranslateState* state =
-        static_cast<MemoryTranslateState*>(std::malloc(sizeof(MemoryTranslateState)));
+    MemoryTranslateState* state = PbInternPersistentCallbackState(
+        g_memory_translate_states, callback, user_data);
     if (!state)
         return PB_ERR_OUT_OF_MEMORY;
-    state->callback = callback;
-    state->user_data = user_data;
     for (UINT32 operand = 0; operand < count; ++operand)
     {
         const UINT32 operation = INS_MemoryOperandIsWritten(pins, operand)
@@ -369,11 +332,10 @@ PbStatus PbBackendInsInsertExec(
 {
     if (PIN_IsProbeMode())
         return PB_ERR_INVALID_STATE;
-    ExecState* state = static_cast<ExecState*>(std::malloc(sizeof(ExecState)));
+    ExecState* state = PbInternPersistentCallbackState(
+        g_exec_states, callback, user_data);
     if (!state)
         return PB_ERR_OUT_OF_MEMORY;
-    state->callback = callback;
-    state->user_data = user_data;
     const INS pins = ToIns(ins);
     INS_InsertPredicatedCall(
         pins, IPOINT_BEFORE, AFUNPTR(OnExec),
@@ -388,12 +350,10 @@ PbStatus PbBackendInsInsertBranchEdge(
 {
     if (PIN_IsProbeMode())
         return PB_ERR_INVALID_STATE;
-    BranchEdgeState* state =
-        static_cast<BranchEdgeState*>(std::malloc(sizeof(BranchEdgeState)));
+    BranchEdgeState* state = PbInternPersistentCallbackState(
+        g_branch_edge_states, callback, user_data);
     if (!state)
         return PB_ERR_OUT_OF_MEMORY;
-    state->callback = callback;
-    state->user_data = user_data;
     INS_InsertPredicatedCall(
         ToIns(ins), IPOINT_BEFORE, AFUNPTR(OnBranchEdge),
         IARG_INST_PTR, IARG_THREAD_ID,
@@ -407,12 +367,10 @@ PbStatus PbBackendInsInsertCaptureExecBytes(
 {
     if (PIN_IsProbeMode())
         return PB_ERR_INVALID_STATE;
-    ExecBytesState* state =
-        static_cast<ExecBytesState*>(std::malloc(sizeof(ExecBytesState)));
+    ExecBytesState* state = PbInternPersistentCallbackState(
+        g_exec_bytes_states, callback, user_data);
     if (!state)
         return PB_ERR_OUT_OF_MEMORY;
-    state->callback = callback;
-    state->user_data = user_data;
     const INS pins = ToIns(ins);
     INS_InsertPredicatedCall(
         pins, IPOINT_BEFORE, AFUNPTR(OnExecBytes),
@@ -427,12 +385,10 @@ PbStatus PbBackendInsInsertMemoryOperandsValues(
 {
     if (PIN_IsProbeMode())
         return PB_ERR_INVALID_STATE;
-    MemoryOperandValueState* state =
-        static_cast<MemoryOperandValueState*>(std::malloc(sizeof(MemoryOperandValueState)));
+    MemoryOperandValueState* state = PbInternPersistentCallbackState(
+        g_memory_operand_value_states, callback, user_data);
     if (!state)
         return PB_ERR_OUT_OF_MEMORY;
-    state->callback = callback;
-    state->user_data = user_data;
     const INS pins = ToIns(ins);
     const UINT32 count = INS_MemoryOperandCount(pins);
     const BOOL after_ok = INS_IsValidForIpointAfter(pins);
