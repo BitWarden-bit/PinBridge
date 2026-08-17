@@ -18,6 +18,7 @@ if not PIN:
         "pin.exe not found: set PINBRIDGE_PIN_EXE to the full path of pin.exe "
         "(or PIN_ROOT to your Pin 3.31 SDK root)")
 INFO = REL + r"\rpc_fixture_info.txt"
+TRACE = REL + r"\control_e2e_trace.pbtr"
 PORT = "9011"
 
 
@@ -55,6 +56,8 @@ def main():
     kill_target_tree()
     if os.path.exists(INFO):
         os.remove(INFO)
+    if os.path.exists(TRACE):
+        os.remove(TRACE)
     env = dict(**os.environ, PINBRIDGE_AGENT_PORT=PORT)
     pin = subprocess.Popen(
         [PIN, "-t", AGENT, "--", FIXTURE, "--pinbridge-rpc-info", INFO],
@@ -145,6 +148,19 @@ def main():
         assert not after["stopped"], "still stopped after resume"
         print("RESUME_OK running again")
 
+        cli("trace", "start", "exec", hex(tick), hex(tick + 0x100), TRACE)
+        time.sleep(0.5)
+        trace_stop = cli("trace", "stop")
+        assert trace_stop["recorded"] > 0, "native recorder captured no instructions"
+        assert trace_stop["dropped"] == 0, f"native recorder dropped: {trace_stop}"
+        trace_status = cli("trace", "status")
+        assert trace_status["state"] == "complete" and not trace_status["recording"], (
+            f"unexpected completed recorder state: {trace_status}")
+        with open(TRACE, "rb") as stream:
+            assert stream.read(4) == b"PBTR", "bad recorder file header"
+        os.remove(TRACE)
+        print(f"TRACE_STATE_OK recorded={trace_stop['recorded']} state=complete dropped=0")
+
         stopped = cli("stop")
         assert stopped["stopped"], "stop failed"
         again = cli("bps")
@@ -156,6 +172,48 @@ def main():
         tid = cli("threads")["thread_ids"][0]
         rip0 = int(cli("context", str(tid))["registers"]["rip"], 16)
         assert rip0 != 0
+
+        # A decoded single-step successor may already have a user breakpoint.
+        # The step must land through that breakpoint without consuming or
+        # deleting its independently owned slot.
+        overlap_start = rip0
+        overlap_row = None
+        for _ in range(16):
+            row = cli("disasm", hex(overlap_start), "1")["insns"][0]
+            if row["kind"] == 0 and row["size"] > 0:
+                overlap_row = row
+                break
+            assert cli("si", str(tid))["ok"], "setup si failed"
+            for _ in range(50):
+                if cli("bps")["stopped"]:
+                    break
+                time.sleep(0.1)
+            else:
+                raise AssertionError("setup si never stopped")
+            overlap_start = int(cli("context", str(tid))["registers"]["rip"], 16)
+        assert overlap_row is not None, "could not find a linear instruction for overlap test"
+        overlap_address = overlap_start + overlap_row["size"]
+        overlap_id = cli("bp", hex(overlap_address))["id"]
+        assert cli("si", str(tid))["ok"], "overlap si failed"
+        for _ in range(50):
+            overlap_state = cli("bps")
+            if overlap_state["stopped"]:
+                break
+            time.sleep(0.1)
+        else:
+            raise AssertionError("overlap si never stopped")
+        overlap_rip = int(cli("context", str(tid))["registers"]["rip"], 16)
+        overlap_bp = next(
+            (entry for entry in overlap_state["breakpoints"] if entry["id"] == overlap_id),
+            None,
+        )
+        assert overlap_rip == overlap_address, (
+            f"overlap step stopped at {hex(overlap_rip)}, expected {hex(overlap_address)}")
+        assert overlap_bp and overlap_bp["hits"] >= 1, "overlap breakpoint was consumed by step"
+        assert cli("bc", str(overlap_id))["removed"] == overlap_id
+        print(f"STEP_BP_OWNERSHIP_OK id={overlap_id} rip={hex(overlap_rip)}")
+
+        rip0 = overlap_rip
         assert cli("si", str(tid))["ok"], "si failed"
         for _ in range(50):
             if cli("bps")["stopped"]:
@@ -230,6 +288,8 @@ def main():
     finally:
         pin.kill()
         kill_target_tree()
+        if os.path.exists(TRACE):
+            os.remove(TRACE)
 
 
 if __name__ == "__main__":

@@ -30,10 +30,20 @@ uint32_t Classify(const xed_decoded_inst_t* xedd)
 namespace
 {
 
+void SetDecodeMode(xed_decoded_inst_t* xedd)
+{
+#if defined(TARGET_IA32E)
+    xed_decoded_inst_set_mode(xedd, XED_MACHINE_MODE_LONG_64, XED_ADDRESS_WIDTH_64b);
+#else
+    xed_decoded_inst_set_mode(xedd, XED_MACHINE_MODE_LEGACY_32, XED_ADDRESS_WIDTH_32b);
+#endif
+}
+
 int32_t FlowRegToPb(xed_reg_enum_t reg)
 {
     switch (reg)
     {
+#if defined(TARGET_IA32E)
     case XED_REG_RAX: return (int32_t)PB_REG_RAX;
     case XED_REG_RCX: return (int32_t)PB_REG_RCX;
     case XED_REG_RDX: return (int32_t)PB_REG_RDX;
@@ -51,6 +61,17 @@ int32_t FlowRegToPb(xed_reg_enum_t reg)
     case XED_REG_R14: return (int32_t)PB_REG_R14;
     case XED_REG_R15: return (int32_t)PB_REG_R15;
     case XED_REG_RIP: return (int32_t)PB_REG_RIP;
+#else
+    case XED_REG_EAX: return (int32_t)PB_REG_EAX;
+    case XED_REG_ECX: return (int32_t)PB_REG_ECX;
+    case XED_REG_EDX: return (int32_t)PB_REG_EDX;
+    case XED_REG_EBX: return (int32_t)PB_REG_EBX;
+    case XED_REG_ESP: return (int32_t)PB_REG_ESP;
+    case XED_REG_EBP: return (int32_t)PB_REG_EBP;
+    case XED_REG_ESI: return (int32_t)PB_REG_ESI;
+    case XED_REG_EDI: return (int32_t)PB_REG_EDI;
+    case XED_REG_EIP: return (int32_t)PB_REG_EIP;
+#endif
     default: return -1;
     }
 }
@@ -62,7 +83,7 @@ PbStatus PbBackendDisassembleFlow(
 {
     xed_decoded_inst_t xedd;
     xed_decoded_inst_zero(&xedd);
-    xed_decoded_inst_set_mode(&xedd, XED_MACHINE_MODE_LONG_64, XED_ADDRESS_WIDTH_64b);
+    SetDecodeMode(&xedd);
     if (xed_decode(&xedd, bytes, static_cast<unsigned int>(size)) != XED_ERROR_NONE)
         return PB_ERR_INVALID_ARGUMENT;
     out->address = address;
@@ -86,8 +107,14 @@ PbStatus PbBackendDisassembleFlow(
     {
         // direct branch/call: target = next-instruction address + displacement
         out->has_target = 1;
-        out->target = address + out->size +
+        const uint64_t target = address + out->size +
             static_cast<int64_t>(xed_decoded_inst_get_branch_displacement(&xedd));
+#if defined(TARGET_IA32E)
+        out->target = target;
+#else
+        // Near IA-32 control flow wraps EIP at 32 bits.
+        out->target = static_cast<uint32_t>(target);
+#endif
         return PB_OK;
     }
     if (out->kind == 1 || out->kind == 2) // indirect branch / call
@@ -123,7 +150,7 @@ PbStatus PbBackendDisassemble(
     {
         xed_decoded_inst_t xedd;
         xed_decoded_inst_zero(&xedd);
-        xed_decoded_inst_set_mode(&xedd, XED_MACHINE_MODE_LONG_64, XED_ADDRESS_WIDTH_64b);
+        SetDecodeMode(&xedd);
         const xed_error_enum_t error = xed_decode(
             &xedd, bytes + offset, static_cast<unsigned int>(size - offset));
         if (error != XED_ERROR_NONE)

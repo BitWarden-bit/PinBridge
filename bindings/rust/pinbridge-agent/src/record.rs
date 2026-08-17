@@ -13,11 +13,11 @@
 //! fixed at the FIRST trace_start; later sessions reuse the slab.
 //!
 //! Producer protocol (analysis callbacks, hot path — no allocation, no std
-//! locks, no I/O): claim = CLAIM.fetch_add; drop (counted) when the claim
-//! lapped the drainer by a full buffer; re-check ARMED post-claim and
-//! abandon the slot when stop raced us (the drainer skips the hole after a
-//! bounded wait); write the 88-byte payload, then the tag (claim + 1) with
-//! Release ordering.
+//! locks, no I/O): reserve with a bounded compare/exchange only while the
+//! slab has capacity; a full slab increments DROPPED without consuming a
+//! sequence number; after reservation the producer always writes the 88-byte
+//! payload and publishes the tag (claim + 1) with Release ordering. Stop
+//! waits for in-flight producers, so the drainer never guesses across holes.
 //!
 //! Drainer (Pin internal thread, std io allowed there): polls tags in
 //! order, appends 88-byte wire-layout records (pinbridge-proto EventRecord)
@@ -181,18 +181,30 @@ struct Slab {
 static SLAB: AtomicPtr<Slab> = AtomicPtr::new(core::ptr::null_mut());
 static SLAB_CAP: AtomicUsize = AtomicUsize::new(0);
 
-/// Claims issued this session (producers).
+/// Successfully reserved sequence slots this session (producers).
 static CLAIM: AtomicU64 = AtomicU64::new(0);
-/// Drainer cursor: slots consumed (or hole-skipped) this session.
+/// Drainer cursor: slots consumed this session.
 static DRAINED: AtomicU64 = AtomicU64::new(0);
-/// Overflow drops + abandoned/hole-skipped slots this session.
+/// Capacity/IO drops this session. A capacity drop never advances CLAIM.
 static DROPPED: AtomicU64 = AtomicU64::new(0);
 /// Logical capture events drained this session (before kind-12 RLE).
 static WRITTEN: AtomicU64 = AtomicU64::new(0);
 /// Recording live: producers may claim. Cleared by trace_stop.
 static ARMED: AtomicBool = AtomicBool::new(false);
 /// Drainer finished (file closed, caught up). Set once per session.
-static DRAIN_DONE: AtomicBool = AtomicBool::new(false);
+static DRAIN_DONE: AtomicBool = AtomicBool::new(true);
+/// Producers that entered submit(). Stop/drain waits for all pre-disarm
+/// reservations to publish before declaring the sequence stream complete.
+static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+/// Terminal health of the last/current session. Capacity overflow is reported
+/// by DROPPED; this flag is reserved for an incomplete/corrupt output stream.
+static FAILED: AtomicBool = AtomicBool::new(false);
+static SESSION_STARTED: AtomicBool = AtomicBool::new(false);
+pub const SESSION_IDLE: u8 = 0;
+pub const SESSION_RECORDING: u8 = 1;
+pub const SESSION_DRAINING: u8 = 2;
+pub const SESSION_COMPLETE: u8 = 3;
+pub const SESSION_FAILED: u8 = 4;
 /// Sticky instrumentation flag: once a session armed, record insertions
 /// keep landing in newly JITted code for the armed range (inert while
 /// ARMED is down — the analysis-time re-check gates them).
@@ -270,38 +282,66 @@ pub unsafe fn submit_global(context: PbConstContextHandle, mut event: Event) {
     submit(event);
 }
 
-/// Hot-path entry point: record one event into the slab. Never blocks;
-/// overflow and post-stop claims drop (counted).
+#[inline]
+fn try_reserve(claim: &AtomicU64, drained: &AtomicU64, cap: u64) -> Option<u64> {
+    if cap == 0 {
+        return None;
+    }
+    let mut current = claim.load(Ordering::Relaxed);
+    loop {
+        if current.wrapping_sub(drained.load(Ordering::Acquire)) >= cap {
+            return None;
+        }
+        match claim.compare_exchange_weak(
+            current,
+            current.wrapping_add(1),
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return Some(current),
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+/// Hot-path entry point: record one event into the slab. Never blocks. A full
+/// slab drops without consuming a sequence number, so the drainer never has
+/// to wait through artificial overflow holes.
 #[inline]
 pub fn submit(mut event: Event) -> bool {
     let slab = SLAB.load(Ordering::Acquire);
-    if slab.is_null() {
+    if slab.is_null() || !ARMED.load(Ordering::Acquire) {
         return false;
     }
-    let cap = SLAB_CAP.load(Ordering::Relaxed);
-    let claim = CLAIM.fetch_add(1, Ordering::Relaxed);
-    if claim.wrapping_sub(DRAINED.load(Ordering::Acquire)) >= cap as u64 {
-        // buffer lapped: the drainer is a full slab behind — drop.
-        DROPPED.fetch_add(1, Ordering::Relaxed);
-        return false;
-    }
-    if !ARMED.load(Ordering::Acquire) {
-        // stop raced this claim: abandon the slot (hole-skipped by drainer).
-        DROPPED.fetch_add(1, Ordering::Relaxed);
-        return false;
-    }
-    event.sequence = claim + 1;
-    let slot = (claim % cap as u64) as usize;
-    unsafe {
-        let slab = &*slab;
-        let dst = slab.payloads.as_ptr().add(slot * SLOT_WORDS) as *mut Event;
-        // 8-aligned by construction; the consumer reads only after the tag
-        // lands (Release/Acquire), so the payload write happens-first.
-        core::ptr::write(dst, event);
-        let tag = &*(slab.tags.as_ptr().add(slot) as *const AtomicU64);
-        tag.store(claim + 1, Ordering::Release);
-    }
-    true
+    IN_FLIGHT.fetch_add(1, Ordering::AcqRel);
+    let recorded = (|| {
+        // Close the race with trace_stop after the optimistic entry check.
+        if !ARMED.load(Ordering::Acquire) {
+            return false;
+        }
+        let cap = SLAB_CAP.load(Ordering::Relaxed);
+        let Some(claim) = try_reserve(&CLAIM, &DRAINED, cap as u64) else {
+            // No CLAIM increment: capacity drops cannot create sequence holes.
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            return false;
+        };
+        // Once reserved, always publish. trace_stop waits for IN_FLIGHT before
+        // allowing the drainer to close the file.
+        event.sequence = claim + 1;
+        let slot = (claim % cap as u64) as usize;
+        unsafe {
+            let slab = &*slab;
+            let dst = slab.payloads.as_ptr().add(slot * SLOT_WORDS) as *mut Event;
+            // 8-aligned by construction; the consumer reads only after the tag
+            // lands (Release/Acquire), so the payload write happens-first.
+            core::ptr::write(dst, event);
+            let tag = &*(slab.tags.as_ptr().add(slot) as *const AtomicU64);
+            tag.store(claim + 1, Ordering::Release);
+        }
+        true
+    })();
+    IN_FLIGHT.fetch_sub(1, Ordering::Release);
+    recorded
 }
 
 pub unsafe extern "C" fn on_rec_exec_bytes(
@@ -619,6 +659,20 @@ pub fn status() -> (bool, u64, u64) {
     )
 }
 
+pub fn session_state() -> u8 {
+    if ARMED.load(Ordering::Acquire) {
+        SESSION_RECORDING
+    } else if !DRAIN_DONE.load(Ordering::Acquire) {
+        SESSION_DRAINING
+    } else if FAILED.load(Ordering::Acquire) {
+        SESSION_FAILED
+    } else if SESSION_STARTED.load(Ordering::Acquire) {
+        SESSION_COMPLETE
+    } else {
+        SESSION_IDLE
+    }
+}
+
 /// Allocates the slab once (first trace_start). try_reserve keeps an OOM
 /// from aborting the target process.
 fn ensure_slab() -> Result<(), String> {
@@ -654,6 +708,7 @@ fn ensure_slab() -> Result<(), String> {
 
 struct DrainArgs {
     path: String,
+    writer: Option<std::io::BufWriter<std::fs::File>>,
     kinds_mask: u32,
     lo: u64,
     hi: u64,
@@ -687,6 +742,9 @@ pub fn start_spec(
     if ARMED.load(Ordering::Acquire) {
         return Err("already recording".to_string());
     }
+    if !DRAIN_DONE.load(Ordering::Acquire) {
+        return Err("previous recording is still draining".to_string());
+    }
     if kinds_mask == 0 || kinds_mask & !RECORDABLE_MASK != 0 {
         return Err(format!(
             "bad kinds mask 0x{kinds_mask:x} (recordable: 0x{RECORDABLE_MASK:x})"
@@ -705,6 +763,10 @@ pub fn start_spec(
         return Err("empty path".to_string());
     }
     ensure_slab()?;
+    // Open synchronously so trace_start cannot report success for a path the
+    // drain thread will never be able to create.
+    let file = std::fs::File::create(&path)
+        .map_err(|error| format!("trace file create {path} failed: {error}"))?;
     // session reset: counters first, then the tag array (drainer only
     // trusts tags after CLAIM/DRAINED are republished)
     CLAIM.store(0, Ordering::Relaxed);
@@ -712,6 +774,9 @@ pub fn start_spec(
     DROPPED.store(0, Ordering::Relaxed);
     WRITTEN.store(0, Ordering::Relaxed);
     DRAIN_DONE.store(false, Ordering::Relaxed);
+    IN_FLIGHT.store(0, Ordering::Relaxed);
+    FAILED.store(false, Ordering::Relaxed);
+    SESSION_STARTED.store(true, Ordering::Relaxed);
     reset_context_state();
     unsafe {
         let slab = &*SLAB.load(Ordering::Acquire);
@@ -737,6 +802,7 @@ pub fn start_spec(
     let flush_ranges = ranges.clone();
     let args = Box::new(DrainArgs {
         path,
+        writer: Some(std::io::BufWriter::with_capacity(1 << 20, file)),
         kinds_mask,
         lo,
         hi,
@@ -745,25 +811,53 @@ pub fn start_spec(
     });
     let mut thread_id: PbThreadId = 0;
     let mut thread_uid: PbPinThreadUid = 0;
+    // Publish the producer gate before spawning: the drainer must never see a
+    // false gate and exit before start_spec finishes launching it.
+    ARMED.store(true, Ordering::Release);
+    let raw_args = Box::into_raw(args);
     let status = unsafe {
         pb_pin_spawn_internal_thread(
             Some(drain_main),
-            Box::into_raw(args) as *mut c_void,
+            raw_args as *mut c_void,
             0,
             &mut thread_id,
             &mut thread_uid,
         )
     };
     if status != PB_OK {
+        ARMED.store(false, Ordering::Release);
+        FAILED.store(true, Ordering::Release);
+        // A callback may have passed the producer gate between ARMED being
+        // published and the spawn failure. Do not expose the slab for reuse
+        // until every such producer has published its reserved slot.
+        while IN_FLIGHT.load(Ordering::Acquire) != 0 {
+            unsafe {
+                pb_pin_sleep(1);
+            }
+        }
+        let claim = CLAIM.load(Ordering::Acquire);
+        let drained = DRAINED.load(Ordering::Acquire);
+        if claim > drained {
+            DROPPED.fetch_add(claim - drained, Ordering::Relaxed);
+            DRAINED.store(claim, Ordering::Release);
+        }
+        unsafe {
+            drop(Box::from_raw(raw_args));
+        }
+        DRAIN_DONE.store(true, Ordering::Release);
         return Err(format!("drain thread spawn failed -> {status}"));
     }
-    // Arm BEFORE the JIT flush: re-instrumented code must see the open gate
-    // (instrumentation-time check reads ARMED || STICKY).
-    ARMED.store(true, Ordering::Release);
     STICKY.store(true, Ordering::Relaxed);
     unsafe {
         for (range_lo, range_hi) in &flush_ranges {
-            pb_pin_remove_instrumentation_in_range(*range_lo, *range_hi);
+            let status = pb_pin_remove_instrumentation_in_range(*range_lo, *range_hi);
+            if status != PB_OK {
+                FAILED.store(true, Ordering::Release);
+                stop();
+                return Err(format!(
+                    "trace instrumentation flush 0x{range_lo:x}-0x{range_hi:x} failed -> {status}"
+                ));
+            }
         }
     }
     crate::log::line(&format!(
@@ -811,7 +905,14 @@ pub fn extend_ranges(ranges: Vec<(u64, u64)>) -> Result<(), String> {
         for (lo, hi) in &ranges {
             // Re-JIT code already present in the new region. Future code is
             // covered by the sticky instrumentation gate and exact filter.
-            pb_pin_remove_instrumentation_in_range(*lo, *hi);
+            let status = pb_pin_remove_instrumentation_in_range(*lo, *hi);
+            if status != PB_OK {
+                FAILED.store(true, Ordering::Release);
+                stop();
+                return Err(format!(
+                    "trace extension flush 0x{lo:x}-0x{hi:x} failed -> {status}"
+                ));
+            }
         }
     }
     for (lo, hi) in ranges {
@@ -835,7 +936,8 @@ pub fn extend_ranges(ranges: Vec<(u64, u64)>) -> Result<(), String> {
 /// trace_stop: disarm and wait (bounded, ~5s) for the drainer to catch up.
 /// Idempotent: not recording just reports the last session's counters.
 pub fn stop() -> (u64, u64) {
-    if ARMED.swap(false, Ordering::AcqRel) {
+    let was_armed = ARMED.swap(false, Ordering::AcqRel);
+    if was_armed || !DRAIN_DONE.load(Ordering::Acquire) {
         for _ in 0..1000 {
             if DRAIN_DONE.load(Ordering::Acquire) {
                 break;
@@ -843,6 +945,11 @@ pub fn stop() -> (u64, u64) {
             unsafe {
                 pb_pin_sleep(5);
             }
+        }
+        if !DRAIN_DONE.load(Ordering::Acquire) {
+            crate::log::line(
+                "trace stop timed out: drainer still owns the session; restart is blocked",
+            );
         }
         crate::log::line(&format!(
             "trace stop recorded={} dropped={}",
@@ -857,11 +964,6 @@ pub fn stop() -> (u64, u64) {
 }
 
 // ---- drain thread (Pin internal; std io + allocation are fine here) ----
-
-/// Hole patience before skipping an abandoned slot: ~64ms of 1ms naps.
-/// A preempted producer resolves in microseconds; only the post-stop
-/// abandon race produces a real hole.
-const HOLE_NAPS: u32 = 64;
 
 fn main_module_name() -> String {
     unsafe {
@@ -1055,22 +1157,42 @@ fn flush_run<W: Write>(
     Ok(())
 }
 
+struct DrainCompletion;
+
+impl Drop for DrainCompletion {
+    fn drop(&mut self) {
+        // Published only after writer/args locals have been dropped and the
+        // output handle is closed (locals declared after this guard drop first).
+        DRAIN_DONE.store(true, Ordering::Release);
+    }
+}
+
+fn fail_drain(reason: &str) {
+    FAILED.store(true, Ordering::Release);
+    ARMED.store(false, Ordering::Release);
+    while IN_FLIGHT.load(Ordering::Acquire) != 0 {
+        unsafe {
+            pb_pin_sleep(1);
+        }
+    }
+    let claim = CLAIM.load(Ordering::Acquire);
+    let drained = DRAINED.load(Ordering::Acquire);
+    if claim > drained {
+        DROPPED.fetch_add(claim - drained, Ordering::Relaxed);
+        DRAINED.store(claim, Ordering::Release);
+    }
+    crate::log::line(reason);
+}
+
 unsafe extern "C" fn drain_main(argument: *mut c_void) {
-    let args = Box::from_raw(argument as *mut DrainArgs);
+    let _completion = DrainCompletion;
+    let mut args = Box::from_raw(argument as *mut DrainArgs);
     let slab = &*SLAB.load(Ordering::Acquire);
     let cap = SLAB_CAP.load(Ordering::Relaxed);
-
-    let file = match std::fs::File::create(&args.path) {
-        Ok(file) => file,
-        Err(error) => {
-            crate::log::line(&format!("trace record: create {} failed: {error}", args.path));
-            // Leave nothing claimable: the session is dead on arrival.
-            ARMED.store(false, Ordering::Release);
-            DRAIN_DONE.store(true, Ordering::Release);
-            return;
-        }
+    let Some(mut writer) = args.writer.take() else {
+        fail_drain("trace record: drain thread started without a writer");
+        return;
     };
-    let mut writer = std::io::BufWriter::with_capacity(1 << 20, file);
 
     let kinds: Vec<u32> = (0..32)
         .filter(|k| args.kinds_mask & (1 << k) != 0)
@@ -1116,17 +1238,23 @@ unsafe extern "C" fn drain_main(argument: *mut c_void) {
     scratch.extend_from_slice(&(meta.len() as u32).to_le_bytes());
     scratch.extend_from_slice(&0u32.to_le_bytes()); // reserved
     scratch.extend_from_slice(meta.as_bytes());
-    let _ = writer.write_all(&scratch);
+    if writer.write_all(&scratch).is_err() {
+        fail_drain("trace record: header write failed");
+        return;
+    }
     scratch.clear();
     scratch.reserve(pinbridge_proto::EVENT_WIRE_LEN);
 
     write_record(&mut scratch, &marker(0, MARKER_START, args.kinds_mask as u64));
-    let _ = writer.write_all(&scratch);
+    if writer.write_all(&scratch).is_err() {
+        fail_drain("trace record: start marker write failed");
+        return;
+    }
 
     let mut next: u64 = 0;
-    let mut hole_naps: u32 = 0;
     let mut pending: Option<Event> = None;
     let mut pending_repeats: u64 = 0;
+    let mut io_failed = false;
     loop {
         let claim = CLAIM.load(Ordering::Acquire);
         if next < claim {
@@ -1148,6 +1276,8 @@ unsafe extern "C" fn drain_main(argument: *mut c_void) {
                         } else {
                             if flush_run(&mut writer, &mut scratch, &previous, pending_repeats).is_err() {
                                 crate::log::line("trace record: file write failed, stopping drain");
+                                io_failed = true;
+                                ARMED.store(false, Ordering::Release);
                                 break;
                             }
                             pending = Some(event);
@@ -1163,40 +1293,115 @@ unsafe extern "C" fn drain_main(argument: *mut c_void) {
                 WRITTEN.fetch_add(1, Ordering::Relaxed);
                 next += 1;
                 DRAINED.store(next, Ordering::Release);
-                hole_naps = 0;
-            } else if hole_naps >= HOLE_NAPS {
-                // abandoned claim (stop race): count and skip the hole
-                DROPPED.fetch_add(1, Ordering::Relaxed);
-                next += 1;
-                DRAINED.store(next, Ordering::Release);
-                hole_naps = 0;
             } else {
-                hole_naps += 1;
-                pb_pin_sleep(1);
+                // Every reserved claim has a live producer. Once all producers
+                // have left, a missing tag is an invariant failure rather than
+                // a normal overflow condition.
+                if !ARMED.load(Ordering::Acquire)
+                    && IN_FLIGHT.load(Ordering::Acquire) == 0
+                {
+                    crate::log::line("trace record: unpublished reserved slot; marking incomplete");
+                    FAILED.store(true, Ordering::Release);
+                    DROPPED.fetch_add(1, Ordering::Relaxed);
+                    next += 1;
+                    DRAINED.store(next, Ordering::Release);
+                } else {
+                    pb_pin_sleep(1);
+                }
             }
-        } else if !ARMED.load(Ordering::Acquire) {
+        } else if !ARMED.load(Ordering::Acquire)
+            && IN_FLIGHT.load(Ordering::Acquire) == 0
+        {
             break; // stopped and caught up
         } else {
             pb_pin_sleep(1);
         }
     }
 
-    if let Some(previous) = pending.as_ref() {
-        if flush_run(&mut writer, &mut scratch, previous, pending_repeats).is_ok() {
-            // The logical events were counted as they were drained above;
-            // this final flush only emits their compact physical form.
-        } else {
-            crate::log::line("trace record: final run write failed");
+    if !io_failed {
+        if let Some(previous) = pending.as_ref() {
+            if flush_run(&mut writer, &mut scratch, previous, pending_repeats).is_err() {
+                crate::log::line("trace record: final run write failed");
+                io_failed = true;
+            }
+        }
+    }
+    if io_failed {
+        FAILED.store(true, Ordering::Release);
+        while IN_FLIGHT.load(Ordering::Acquire) != 0 {
+            pb_pin_sleep(1);
+        }
+        let claim = CLAIM.load(Ordering::Acquire);
+        if claim > next {
+            DROPPED.fetch_add(claim - next, Ordering::Relaxed);
+            DRAINED.store(claim, Ordering::Release);
         }
     }
     let recorded = WRITTEN.load(Ordering::Relaxed);
     write_record(&mut scratch, &marker(next + 1, MARKER_STOP, recorded));
-    let _ = writer.write_all(&scratch);
-    let _ = writer.flush();
-    DRAIN_DONE.store(true, Ordering::Release);
+    if writer.write_all(&scratch).is_err() || writer.flush().is_err() {
+        FAILED.store(true, Ordering::Release);
+        crate::log::line("trace record: stop marker/flush failed");
+    }
     crate::log::line(&format!(
         "trace record: {} closed (recorded={recorded} dropped={})",
         args.path,
         DROPPED.load(Ordering::Relaxed)
     ));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::try_reserve;
+    use core::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+
+    #[test]
+    fn full_reservation_does_not_create_a_sequence_hole() {
+        let claim = AtomicU64::new(0);
+        let drained = AtomicU64::new(0);
+
+        assert_eq!(try_reserve(&claim, &drained, 2), Some(0));
+        assert_eq!(try_reserve(&claim, &drained, 2), Some(1));
+        assert_eq!(try_reserve(&claim, &drained, 2), None);
+        assert_eq!(claim.load(Ordering::Relaxed), 2);
+
+        drained.store(1, Ordering::Release);
+        assert_eq!(try_reserve(&claim, &drained, 2), Some(2));
+        assert_eq!(claim.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn concurrent_reservations_are_unique_and_contiguous() {
+        const WORKERS: usize = 8;
+        const PER_WORKER: usize = 256;
+        let claim = Arc::new(AtomicU64::new(0));
+        let drained = Arc::new(AtomicU64::new(0));
+        let mut workers = Vec::new();
+
+        for _ in 0..WORKERS {
+            let claim = Arc::clone(&claim);
+            let drained = Arc::clone(&drained);
+            workers.push(std::thread::spawn(move || {
+                let mut reservations = Vec::with_capacity(PER_WORKER);
+                for _ in 0..PER_WORKER {
+                    reservations.push(
+                        try_reserve(&claim, &drained, (WORKERS * PER_WORKER) as u64)
+                            .expect("capacity covers every reservation"),
+                    );
+                }
+                reservations
+            }));
+        }
+
+        let mut reservations = workers
+            .into_iter()
+            .flat_map(|worker| worker.join().expect("worker panicked"))
+            .collect::<Vec<_>>();
+        reservations.sort_unstable();
+        assert_eq!(
+            reservations,
+            (0..(WORKERS * PER_WORKER) as u64).collect::<Vec<_>>()
+        );
+    }
 }

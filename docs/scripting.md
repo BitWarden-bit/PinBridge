@@ -259,10 +259,14 @@ Pin 的 XED 回调发生在解码前，不是“已解码指令通知”。平�
   查询 VirtualQuery 区域，脚本可据此识别私有可执行堆代码。
 - `pb.trace_stop() -> (recorded, dropped)`（等 drain 追平，~5s 上限）
 - `pb.trace_status() -> (active, recorded, dropped)`
+- `pb.trace_status_detail() -> (state, active, recorded, dropped)`；`state` 为
+  `idle`、`recording`、`draining`、`complete` 或 `failed`。`trace_stop` 超时后旧会话仍由
+  drain 线程持有，新会话会被拒绝，不能复用旧缓冲区或覆盖旧文件状态。
 
 `examples/python/trace_scope.py` 提供模块名/RVA/线程/断点触发的采集模板。
 设置 `TRACE_MAX_EVENTS` 时，脚本会在主事件窗口达到阈值后停止 recorder 并暂停目标；
-生产分析仍应检查 PBTR 的 `dropped` 和序列缺口。
+生产分析必须要求 `state == "complete"` 且 `dropped == 0`。容量不足只增加 `dropped`，
+不消耗录制序号，因此不会制造假序号洞；但任何丢失仍表示该窗口不能用于确定性重放。
 
 输出：
 - `pb.print(msg)`(= `pb.log`)→ 输出环，见下文"输出到 UI 的路径"。

@@ -36,6 +36,27 @@ def pb_init():
         )
     if pb.get_reg(tid, "rip") is not None:
         raise RuntimeError("x64 RIP unexpectedly resolved in an x86 session")
+
+    # 0x40 is INC EAX in legacy 32-bit mode but a REX prefix in long mode.
+    # Temporarily decode this mode-sensitive pair at the stopped entry point,
+    # then restore the target before it executes.
+    original = pb.read_mem(stopped_eip, 2)
+    if original is None or len(original) != 2:
+        raise RuntimeError("could not read x86 entry bytes")
+    original = bytes(original)
+    try:
+        if not pb.write_mem(stopped_eip, b"\x40\xc3"):
+            raise RuntimeError("could not install x86 decode probe")
+        mode_rows = pb.disasm(stopped_eip, 2) or []
+        if not mode_rows or mode_rows[0][1] != 1:
+            raise RuntimeError("x86 decoder used long mode: %r" % (mode_rows,))
+        text = mode_rows[0][4].lower().replace(" ", "")
+        if "inc" not in text or "eax" not in text:
+            raise RuntimeError("x86 mode-sensitive decode mismatch: %r" % (mode_rows[0],))
+    finally:
+        if not pb.write_mem(stopped_eip, original):
+            raise RuntimeError("could not restore x86 entry bytes")
+
     rows = pb.disasm(stopped_eip, 4) or []
     if len(rows) < 2:
         raise RuntimeError("could not decode x86 entry instructions")

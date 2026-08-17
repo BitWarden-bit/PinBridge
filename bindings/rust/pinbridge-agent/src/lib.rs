@@ -133,10 +133,6 @@ fn agent_main(argc: c_int, argv: *mut *mut c_char) -> c_int {
         if sync_intercept_status != PB_OK {
             return 14;
         }
-        if engines::meta_init() != PB_OK {
-            log::line("meta init failed");
-            return 6;
-        }
         if stepper::init() != PB_OK {
             log::line("stepper init failed");
             return 7;

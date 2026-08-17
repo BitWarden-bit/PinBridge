@@ -697,13 +697,48 @@ impl Client {
 
     /// (active, recorded, dropped) snapshot of the recording channel.
     pub fn trace_status(&mut self) -> Result<(bool, u64, u64)> {
+        let status = self.trace_status_detail()?;
+        Ok((status.active, status.recorded, status.dropped))
+    }
+
+    /// Extended recorder state. Servers before the additive state byte are
+    /// interpreted as recording/complete from their legacy active flag.
+    pub fn trace_status_detail(&mut self) -> Result<TraceStatus> {
         let body = self.request(proto::op::TRACE_STATUS, &[])?;
         if body.is_empty() {
             return Err(Error::new(ErrorKind::InvalidData, "short trace status"));
         }
         let active = body[0] != 0;
         let mut r = proto::Reader::new(&body[1..]);
-        Ok((active, r.u64_or_err()?, r.u64_or_err()?))
+        let recorded = r.u64_or_err()?;
+        let dropped = r.u64_or_err()?;
+        let state = r.u8().unwrap_or(if active { 1 } else { 3 });
+        Ok(TraceStatus {
+            state,
+            active,
+            recorded,
+            dropped,
+        })
+    }
+}
+
+pub struct TraceStatus {
+    pub state: u8,
+    pub active: bool,
+    pub recorded: u64,
+    pub dropped: u64,
+}
+
+impl TraceStatus {
+    pub fn state_name(&self) -> &'static str {
+        match self.state {
+            0 => "idle",
+            1 => "recording",
+            2 => "draining",
+            3 => "complete",
+            4 => "failed",
+            _ => "unknown",
+        }
     }
 }
 

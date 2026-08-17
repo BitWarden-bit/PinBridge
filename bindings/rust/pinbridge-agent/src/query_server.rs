@@ -360,13 +360,15 @@ fn handle_trace_stop() -> Vec<u8> {
     out
 }
 
-/// TRACE_STATUS: empty -> [u8 active][u64 recorded][u64 dropped].
+/// TRACE_STATUS: empty -> [u8 active][u64 recorded][u64 dropped][u8 state].
+/// The additive state tail is backward-compatible with older clients.
 fn handle_trace_status() -> Vec<u8> {
     let (active, recorded, dropped) = crate::record::status();
-    let mut out = Vec::with_capacity(17);
+    let mut out = Vec::with_capacity(18);
     out.push(active as u8);
     proto::put_u64(&mut out, recorded);
     proto::put_u64(&mut out, dropped);
+    out.push(crate::record::session_state());
     out
 }
 
@@ -517,6 +519,14 @@ pub fn handle_step(payload: &[u8]) -> Result<Vec<u8>, u8> {
         }
     };
     let rip = read_reg(crate::arch::instr_ptr_reg() as i32).ok_or(proto::STATUS_BAD_REQUEST)?;
+    let next_ip = |size: u32| {
+        let next = rip.wrapping_add(size as u64);
+        if crate::arch::pointer_width() == 4 {
+            next & u32::MAX as u64
+        } else {
+            next
+        }
+    };
 
     let mut flow: PbFlowInsn = unsafe { core::mem::zeroed() };
     let decoded = unsafe {
@@ -528,14 +538,15 @@ pub fn handle_step(payload: &[u8]) -> Result<Vec<u8>, u8> {
             && flow.size > 0
     };
 
-    // step over a call: a single one-shot on the fallthrough
+    // Step over a call: one private successor on the fallthrough. It never
+    // shares ownership with an ordinary user/Python breakpoint.
     if decoded && over && flow.kind == 2 {
-        let fallthrough = rip + flow.size as u64;
-        let id = bp::set_oneshot(fallthrough).map_err(|_| proto::STATUS_INTERNAL)?;
-        bp::note_step_bp(id, fallthrough);
-        bp::arm_resume_skip(); // swallow the replay if we sit on a breakpoint
+        let fallthrough = next_ip(flow.size);
+        stepper::arm_candidates(tid, rip, &[fallthrough])
+            .map_err(|_| proto::STATUS_INTERNAL)?;
         bp::arm_step_watchdog(100); // ~5s: auto-pause if the call never returns
         if !bp::control_command(bp::CMD_RESUME) {
+            stepper::cancel();
             return Err(proto::STATUS_INTERNAL);
         }
         crate::log::line(&format!("step over tid={tid} from 0x{rip:x} bp=0x{fallthrough:x}"));
@@ -544,7 +555,7 @@ pub fn handle_step(payload: &[u8]) -> Result<Vec<u8>, u8> {
 
     if decoded {
         // enumerate every possible successor of the current instruction
-        let fallthrough = rip + flow.size as u64;
+        let fallthrough = next_ip(flow.size);
         let mut candidates: Vec<u64> = Vec::with_capacity(3);
         if flow.kind == 0 || flow.conditional != 0 {
             candidates.push(fallthrough);
@@ -564,9 +575,12 @@ pub fn handle_step(payload: &[u8]) -> Result<Vec<u8>, u8> {
                 read_reg(flow.base_reg)
             };
             if let Some(base) = base {
-                let ea = base
+                let mut ea = base
                     .wrapping_add(read_reg(flow.index_reg).unwrap_or(0).wrapping_mul(flow.scale))
                     .wrapping_add(flow.disp as u64);
+                if crate::arch::pointer_width() == 4 {
+                    ea &= u32::MAX as u64;
+                }
                 if let Some(value) = read_mem_ptr(ea) {
                     candidates.push(value);
                 }
@@ -580,17 +594,13 @@ pub fn handle_step(payload: &[u8]) -> Result<Vec<u8>, u8> {
         }
         candidates.sort_unstable();
         candidates.dedup();
-        let mut planted = 0u32;
-        for address in &candidates {
-            if let Ok(id) = bp::set_oneshot(*address) {
-                bp::note_step_bp(id, *address);
-                planted += 1;
-            }
-        }
+        let planted = stepper::arm_candidates(tid, rip, &candidates)
+            .map(|count| count as u32)
+            .unwrap_or(0);
         if planted > 0 {
-            bp::arm_resume_skip(); // swallow the replay if we sit on a breakpoint
             bp::arm_step_watchdog(100); // ~5s: auto-pause if no successor fires
             if !bp::control_command(bp::CMD_RESUME) {
+                stepper::cancel();
                 return Err(proto::STATUS_INTERNAL);
             }
             crate::log::line(&format!(

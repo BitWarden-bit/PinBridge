@@ -442,8 +442,8 @@ fn record_kind(name: &str) -> Option<u32> {
 
 /// Starts recording the given kinds (default exec+memory, at value tier)
 /// for instructions in range (default: everywhere — narrow it, the tape is
-/// lossless but the flood is real) into a .pbtr file. False when a session
-/// is already recording or the arguments are rejected.
+/// bounded and a wide range can overflow) into a .pbtr file. False when a
+/// session is already recording/draining or the arguments are rejected.
 #[pyfunction(name = "trace_start", signature = (path, kinds=None, range=None))]
 fn pb_trace_start(path: &str, kinds: Option<Vec<String>>, range: Option<(u64, u64)>) -> bool {
     let names = kinds.unwrap_or_else(|| vec!["exec".to_string(), "memory".to_string()]);
@@ -518,6 +518,20 @@ fn pb_trace_stop() -> Option<(u64, u64)> {
 #[pyfunction(name = "trace_status")]
 fn pb_trace_status() -> Option<(bool, u64, u64)> {
     rpc(|c| c.trace_status())
+}
+
+/// `(state, active, recorded, dropped)` where state is one of idle,
+/// recording, draining, complete, or failed.
+#[pyfunction(name = "trace_status_detail")]
+fn pb_trace_status_detail() -> Option<(String, bool, u64, u64)> {
+    rpc(|c| c.trace_status_detail()).map(|status| {
+        (
+            status.state_name().to_string(),
+            status.active,
+            status.recorded,
+            status.dropped,
+        )
+    })
 }
 
 // ---- registrations (mutate the current plugin's filters) ----
@@ -1466,6 +1480,7 @@ fn pb(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(pb_memory_region, m)?)?;
     m.add_function(wrap_pyfunction!(pb_trace_stop, m)?)?;
     m.add_function(wrap_pyfunction!(pb_trace_status, m)?)?;
+    m.add_function(wrap_pyfunction!(pb_trace_status_detail, m)?)?;
     m.add_function(wrap_pyfunction!(pb_on_event, m)?)?;
     m.add_function(wrap_pyfunction!(pb_off_event, m)?)?;
     m.add_function(wrap_pyfunction!(pb_event_names, m)?)?;

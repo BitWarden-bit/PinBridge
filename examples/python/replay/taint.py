@@ -14,9 +14,9 @@ Instruction bytes:
     档2 (kind-9/10) recording for packed targets.
 
 Taint model (v1):
-  * register taint at BYTE granularity (each of the 8 bytes of a GP register
-    carries its own label set) — a 32-bit subregister write zero-extends and
-    therefore KILLS the upper 4 bytes' taint;
+  * register taint at BYTE granularity (8-byte x64 or 4-byte x86 GP banks);
+    in x64, a 32-bit subregister write zero-extends and therefore KILLS the
+    upper 4 bytes' taint;
   * shadow memory at byte granularity keyed by concrete EA;
   * labels = source ids (s0, s1, ...); each tainted byte also tracks a
     "chain depth" = longest propagation path from a source (reported as the
@@ -26,8 +26,8 @@ Taint model (v1):
   * single-thread windows (records are split by thread_id).
 
 Usage:
-  python taint.py trace.pbtr forward --source mem:0x..:0x40 [--source reg:RAX]
-                                     [--sink reg:RIP] [--sink mem:0xLO-0xHI]
+  python taint.py trace.pbtr forward --source mem:0x..:0x40 [--source reg:RAX/EAX]
+                                     [--sink reg:RIP/EIP] [--sink mem:0xLO-0xHI]
                                      [--thread N] [--max-events N] [--pe f --base B]
   python taint.py trace.pbtr slice --at 12345 --operand reg:rdx [--thread N]
 """
@@ -49,7 +49,7 @@ except ImportError:
 
 
 # ---------------------------------------------------------------------------
-# register model (byte-granular over the 64-bit GP file + rip)
+# architecture/register model (byte-granular GP file + instruction pointer)
 # ---------------------------------------------------------------------------
 
 # classic naming order: rax rcx rdx rbx rsp rbp rsi rdi
@@ -59,21 +59,69 @@ _N8L = ["al", "cl", "dl", "bl", "spl", "bpl", "sil", "dil"]
 _GP64 = ["rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi"] + \
         ["r%d" % i for i in range(8, 16)]
 
-REG_INFO = {}   # name -> (base64, byte_offset, size)
-for _i, _b in enumerate(_GP64):
-    REG_INFO[_b] = (_b, 0, 8)
-for _i in range(8):
-    REG_INFO[_N32[_i]] = (_GP64[_i], 0, 4)
-    REG_INFO[_N16[_i]] = (_GP64[_i], 0, 2)
-    REG_INFO[_N8L[_i]] = (_GP64[_i], 0, 1)
-for _i in range(8, 16):
-    REG_INFO["r%dd" % _i] = ("r%d" % _i, 0, 4)
-    REG_INFO["r%dw" % _i] = ("r%d" % _i, 0, 2)
-    REG_INFO["r%db" % _i] = ("r%d" % _i, 0, 1)
-for _n, _b in (("ah", "rax"), ("ch", "rcx"), ("dh", "rdx"), ("bh", "rbx")):
-    REG_INFO[_n] = (_b, 1, 1)
-REG_INFO["rip"] = ("rip", 0, 8)
-REG_INFO["eip"] = ("rip", 0, 4)
+
+class Architecture:
+    """Instruction/register semantics selected from PBTR metadata."""
+
+    def __init__(self, name="x64"):
+        normalized = str(name or "x64").strip().lower()
+        if normalized in ("x86", "ia32", "i386", "i686", "32"):
+            self.name = "x86"
+            self.pointer_size = 4
+        elif normalized in ("x64", "amd64", "x86_64", "ia32e", "64"):
+            self.name = "x64"
+            self.pointer_size = 8
+        else:
+            raise SystemExit("unsupported trace architecture: %s" % name)
+        self.zero_extends_32 = self.name == "x64"
+        self.reg_info = self._build_registers()
+        self.ip = "rip" if self.name == "x64" else "eip"
+        self.sp = "rsp" if self.name == "x64" else "esp"
+        self.bp = "rbp" if self.name == "x64" else "ebp"
+
+    def _build_registers(self):
+        info = {}
+        if self.name == "x64":
+            for base in _GP64:
+                info[base] = (base, 0, 8)
+            for index in range(8):
+                info[_N32[index]] = (_GP64[index], 0, 4)
+                info[_N16[index]] = (_GP64[index], 0, 2)
+                info[_N8L[index]] = (_GP64[index], 0, 1)
+            for index in range(8, 16):
+                info["r%dd" % index] = ("r%d" % index, 0, 4)
+                info["r%dw" % index] = ("r%d" % index, 0, 2)
+                info["r%db" % index] = ("r%d" % index, 0, 1)
+            high_bases = ("rax", "rcx", "rdx", "rbx")
+            info["rip"] = ("rip", 0, 8)
+            info["eip"] = ("rip", 0, 4)
+        else:
+            for index, base in enumerate(_N32):
+                info[base] = (base, 0, 4)
+                info[_N16[index]] = (base, 0, 2)
+                if index < 4:
+                    info[_N8L[index]] = (base, 0, 1)
+            high_bases = ("eax", "ecx", "edx", "ebx")
+            info["eip"] = ("eip", 0, 4)
+        for name, base in zip(("ah", "ch", "dh", "bh"), high_bases):
+            info[name] = (base, 1, 1)
+        return info
+
+    def bank_size(self, base):
+        return max(size + offset for item_base, offset, size in self.reg_info.values()
+                   if item_base == base)
+
+
+DEFAULT_ARCH = Architecture("x64")
+# Compatibility alias for callers that inspect the original x64 table.
+REG_INFO = DEFAULT_ARCH.reg_info
+
+
+def architecture_from_meta(meta):
+    name = meta.get("arch") if meta else None
+    if not name and meta and meta.get("pointer_width") == 4:
+        name = "x86"
+    return Architecture(name or "x64")
 
 # taint entry: (frozenset_of_labels, chain_depth); clean = (frozenset(), 0)
 CLEAN = (frozenset(), 0)
@@ -92,29 +140,30 @@ def taint_union(entries):
 
 
 class RegState:
-    """Per-thread register taint: base -> 8 byte entries."""
+    """Per-thread register taint: canonical base -> byte entries."""
 
-    def __init__(self):
+    def __init__(self, arch=None):
+        self.arch = arch or DEFAULT_ARCH
         self.regs = {}
 
     def _bank(self, base):
         bank = self.regs.get(base)
         if bank is None:
-            bank = [CLEAN] * 8
+            bank = [CLEAN] * self.arch.bank_size(base)
             self.regs[base] = bank
         return bank
 
     def read(self, name):
-        base, off, size = REG_INFO[name]
+        base, off, size = self.arch.reg_info[name]
         bank = self.regs.get(base)
         if bank is None:
             return CLEAN
         return taint_union(bank[off:off + size])
 
     def write(self, name, entry):
-        base, off, size = REG_INFO[name]
+        base, off, size = self.arch.reg_info[name]
         bank = self._bank(base)
-        if size == 4 and off == 0:
+        if self.arch.zero_extends_32 and size == 4 and off == 0:
             # 32-bit writes zero-extend: upper 4 bytes become a clean constant
             for i in range(4):
                 bank[i] = entry
@@ -126,15 +175,15 @@ class RegState:
 
     def reg_bytes(self, name):
         """byte keys covered by a read of this register name"""
-        base, off, size = REG_INFO[name]
+        base, off, size = self.arch.reg_info[name]
         return {("r", base, off + i) for i in range(size)}
 
     def reg_def_bytes(self, name):
         """(full, val) byte keys for a write: full includes the zero-extended
         upper half of 32-bit writes; val is where source taint lands."""
-        base, off, size = REG_INFO[name]
+        base, off, size = self.arch.reg_info[name]
         val = {("r", base, off + i) for i in range(size)}
-        if size == 4 and off == 0:
+        if self.arch.zero_extends_32 and size == 4 and off == 0:
             full = val | {("r", base, i) for i in range(4, 8)}
         else:
             full = val
@@ -146,9 +195,9 @@ class RegState:
 # ---------------------------------------------------------------------------
 
 class PEImage:
-    """Minimal PE32+ mapper for the kind-3 fallback path (no SMC!)."""
+    """Minimal PE32/PE32+ mapper for the kind-3 fallback path (no SMC!)."""
 
-    def __init__(self, path, base=None):
+    def __init__(self, path, base=None, arch=None):
         with open(path, "rb") as fh:
             self.data = fh.read()
         if self.data[:2] != b"MZ":
@@ -158,10 +207,18 @@ class PEImage:
             raise SystemExit("--pe: bad PE signature")
         opt = e_lfanew + 24
         magic = struct.unpack_from("<H", self.data, opt)[0]
-        if magic != 0x20B:
-            raise SystemExit("--pe: only PE32+ (x64) supported")
-        self.base = base if base is not None else \
-            struct.unpack_from("<Q", self.data, opt + 24)[0]
+        if magic == 0x20B:
+            self.arch = Architecture("x64")
+            image_base = struct.unpack_from("<Q", self.data, opt + 24)[0]
+        elif magic == 0x10B:
+            self.arch = Architecture("x86")
+            image_base = struct.unpack_from("<I", self.data, opt + 28)[0]
+        else:
+            raise SystemExit("--pe: unsupported optional-header magic 0x%x" % magic)
+        if arch is not None and self.arch.name != arch.name:
+            raise SystemExit("--pe architecture %s does not match trace %s" %
+                             (self.arch.name, arch.name))
+        self.base = base if base is not None else image_base
         size_opt = struct.unpack_from("<H", self.data, e_lfanew + 20)[0]
         nsec = struct.unpack_from("<H", self.data, e_lfanew + 6)[0]
         self.sections = []
@@ -217,26 +274,31 @@ CS_AC_WRITE = 2
 
 
 class Decoder:
-    def __init__(self, pe_path=None, pe_base=None):
+    def __init__(self, pe_path=None, pe_base=None, arch=None):
         if capstone is None:
             raise SystemExit(
                 "capstone is required: pip install capstone "
                 "(or -i https://mirrors.aliyun.com/pypi/simple/)")
-        self.cs = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_64)
+        self.arch = arch if isinstance(arch, Architecture) else Architecture(arch or "x64")
+        mode = capstone.CS_MODE_32 if self.arch.name == "x86" else capstone.CS_MODE_64
+        self.cs = capstone.Cs(capstone.CS_ARCH_X86, mode)
         self.cs.detail = True
-        self.pe = PEImage(pe_path, pe_base) if pe_path else None
+        self.pe = PEImage(pe_path, pe_base, self.arch) if pe_path else None
         self.cache = {}
         self.undecoded = 0
 
     def decode(self, ip, rec):
-        hit = self.cache.get(ip)
-        if hit is not None:
-            return hit
         data = None
         if rec is not None and rec.kind == pbtrace.KIND_EXEC_BYTES:
             data = rec.exec_bytes()
         elif self.pe is not None:
             data = self.pe.read(ip, 16)
+        # SMC-safe: the same IP may carry different kind-9 bytes at different
+        # times. A cache keyed only by IP silently reused stale semantics.
+        cache_key = (ip, data)
+        hit = self.cache.get(cache_key)
+        if hit is not None:
+            return hit
         if not data:
             self.undecoded += 1
             insn = DecodedInsn(ip, rec.arg0 if rec else 0, "??", "", [], ok=False)
@@ -263,7 +325,7 @@ class Decoder:
                 self.undecoded += 1
                 out = DecodedInsn(ip, len(data), "??", data.hex(), [], ok=False)
             insn = out
-        self.cache[ip] = insn
+        self.cache[cache_key] = insn
         return insn
 
 
@@ -375,20 +437,22 @@ def _infer_access(mn, nops, idx):
     return (CS_AC_READ | CS_AC_WRITE) if idx == 0 else CS_AC_READ
 
 
-def compute_transfer(insn, events):
+def compute_transfer(insn, events, arch=None):
     """Build taint transfer steps for one decoded instruction.
 
     events: resolved memory events already split into reads/writes with
     concrete EAs (see resolve_events). Unknown mnemonics take the
     conservative path: every written operand = union of every read operand.
     """
+    arch = arch or DEFAULT_ARCH
+    reg_info = arch.reg_info
     mn = insn.mnemonic
     ops = insn.operands
     t = Transfer()
 
     def op_read_keys(op):
         if op.kind == "reg":
-            base, off, size = REG_INFO.get(op.reg, (None, 0, 0))
+            base, off, size = reg_info.get(op.reg, (None, 0, 0))
             if base is None:
                 return set()
             return {("r", base, off + i) for i in range(size)}
@@ -398,11 +462,11 @@ def compute_transfer(insn, events):
 
     def op_def_keys(op):
         if op.kind == "reg":
-            base, off, size = REG_INFO.get(op.reg, (None, 0, 0))
+            base, off, size = reg_info.get(op.reg, (None, 0, 0))
             if base is None:
                 return set(), set()
             val = {("r", base, off + i) for i in range(size)}
-            if size == 4 and off == 0:
+            if arch.zero_extends_32 and size == 4 and off == 0:
                 full = val | {("r", base, i) for i in range(4, 8)}
             else:
                 full = val
@@ -449,8 +513,8 @@ def compute_transfer(insn, events):
             base, index, _scale, _disp = ops[1].mem
             extra = set()
             for rn in (base, index):
-                if rn and rn in REG_INFO:
-                    b, o, s = REG_INFO[rn]
+                if rn and rn in reg_info:
+                    b, o, s = reg_info[rn]
                     extra |= {("r", b, o + i) for i in range(s)}
             emit(ops[0], (), extra_uses=extra)
         return t
@@ -515,11 +579,11 @@ def compute_transfer(insn, events):
         return t
 
     if mn == "leave":
-        # rsp <- rbp; rbp <- [rsp]: approximate through rbp
-        rbp_keys = {("r", "rbp", i) for i in range(8)}
-        t.steps.append(Step({("r", "rsp", i) for i in range(8)},
-                            {("r", "rsp", i) for i in range(8)}, set(rbp_keys)))
-        t.steps.append(Step(set(rbp_keys), set(rbp_keys), set(stack_read)))
+        # sp <- bp; bp <- [sp], using the trace architecture's pointer width.
+        bp_keys = {("r", arch.bp, i) for i in range(arch.pointer_size)}
+        sp_keys = {("r", arch.sp, i) for i in range(arch.pointer_size)}
+        t.steps.append(Step(set(sp_keys), set(sp_keys), set(bp_keys)))
+        t.steps.append(Step(set(bp_keys), set(bp_keys), set(stack_read)))
         return t
 
     # conservative fallback: every written operand = union of read operands
@@ -543,7 +607,8 @@ def compute_transfer(insn, events):
 # ---------------------------------------------------------------------------
 
 class Source:
-    def __init__(self, label, spec):
+    def __init__(self, label, spec, arch=None):
+        self.arch = arch or DEFAULT_ARCH
         self.label = label
         self.kind = None
         self.reg = None
@@ -559,8 +624,9 @@ class Source:
         if spec.startswith("reg:"):
             self.kind = "reg"
             self.reg = spec[4:].lower()
-            if self.reg not in REG_INFO:
-                raise SystemExit("unknown source register: %s" % self.reg)
+            if self.reg not in self.arch.reg_info:
+                raise SystemExit("unknown %s source register: %s" %
+                                 (self.arch.name, self.reg))
         elif spec.startswith("mem:"):
             self.kind = "mem"
             parts = spec[4:].split(":")
@@ -585,11 +651,12 @@ class Source:
         return "%s: event:#%d" % (self.label, self.event_index)
 
 
-def parse_sink(spec):
+def parse_sink(spec, arch=None):
+    arch = arch or DEFAULT_ARCH
     if spec.startswith("reg:"):
         name = spec[4:].lower()
-        if name not in REG_INFO:
-            raise SystemExit("unknown sink register: %s" % name)
+        if name not in arch.reg_info:
+            raise SystemExit("unknown %s sink register: %s" % (arch.name, name))
         return ("reg", name)
     if spec.startswith("mem:"):
         rng = spec[4:]
@@ -648,7 +715,7 @@ def _bind_mem_eas(insn, events):
 
 
 def run_forward(window, decoder, sources, extra_sinks, max_sink_lines=50):
-    regstate = RegState()
+    regstate = RegState(decoder.arch)
     shadow = {}                       # ea byte -> taint entry
     sink_hits = []
     unknown_mnemonics = {}
@@ -716,7 +783,7 @@ def run_forward(window, decoder, sources, extra_sinks, max_sink_lines=50):
                     out.append(bank[k[2]] if bank else CLEAN)
             return taint_union(out)
 
-        transfer = compute_transfer(insn, events)
+        transfer = compute_transfer(insn, events, decoder.arch)
         if not transfer.known:
             unknown_mnemonics[insn.mnemonic] = \
                 unknown_mnemonics.get(insn.mnemonic, 0) + 1
@@ -783,16 +850,17 @@ def run_forward(window, decoder, sources, extra_sinks, max_sink_lines=50):
 # backward slice
 # ---------------------------------------------------------------------------
 
-def parse_operand(spec):
+def parse_operand(spec, arch=None):
+    arch = arch or DEFAULT_ARCH
     if spec.startswith("reg:"):
         name = spec[4:].lower()
-        if name not in REG_INFO:
-            raise SystemExit("unknown operand register: %s" % name)
+        if name not in arch.reg_info:
+            raise SystemExit("unknown %s operand register: %s" % (arch.name, name))
         return ("reg", name)
     if spec.startswith("mem:"):
         parts = spec[4:].split(":")
         if len(parts) == 1:
-            return ("mem", int(parts[0], 0), 8)
+            return ("mem", int(parts[0], 0), arch.pointer_size)
         return ("mem", int(parts[0], 0), int(parts[1], 0))
     raise SystemExit("operand syntax: reg:NAME | mem:0xEA[:0xSIZE]")
 
@@ -820,14 +888,14 @@ def run_slice(window, decoder, at_seq, operand):
             if op.kind == "mem":
                 op.ea = None
         _bind_mem_eas(insn, events)
-        inst.transfer = compute_transfer(insn, events)
+        inst.transfer = compute_transfer(insn, events, decoder.arch)
 
     kind, a1, *rest = operand
     if kind == "reg":
-        base, off, size = REG_INFO[a1]
+        base, off, size = decoder.arch.reg_info[a1]
         demand = {("r", base, off + i) for i in range(size)}
     else:
-        size = rest[0] if rest else 8
+        size = rest[0] if rest else decoder.arch.pointer_size
         demand = {("m", a1 + i) for i in range(size)}
 
     in_slice = {target.idx}
@@ -870,12 +938,13 @@ def _fmt_labels(entry):
 
 
 def cmd_forward(args, trace):
-    sources = [Source("s%d" % i, spec)
+    arch = architecture_from_meta(trace.meta)
+    sources = [Source("s%d" % i, spec, arch)
                for i, spec in enumerate(args.source or [])]
     if not sources:
         raise SystemExit("forward needs at least one --source")
-    extra_sinks = [parse_sink(s) for s in (args.sink or [])]
-    decoder = Decoder(args.pe, args.base)
+    extra_sinks = [parse_sink(s, arch) for s in (args.sink or [])]
+    decoder = Decoder(args.pe, args.base, arch)
     window = build_window(trace, args.thread, args.max_events)
     sink_hits, stats, state = run_forward(window, decoder, sources, extra_sinks)
     print("== forward taint ==")
@@ -914,9 +983,10 @@ def cmd_forward(args, trace):
 def cmd_slice(args, trace):
     if args.at is None or not args.operand:
         raise SystemExit("slice needs --at SEQ and --operand reg:NAME|mem:EA[:SZ]")
-    decoder = Decoder(args.pe, args.base)
+    arch = architecture_from_meta(trace.meta)
+    decoder = Decoder(args.pe, args.base, arch)
     window = build_window(trace, args.thread, args.max_events)
-    operand = parse_operand(args.operand)
+    operand = parse_operand(args.operand, arch)
     in_slice, reg_demand, mem_demand, target = \
         run_slice(window, decoder, args.at, operand)
     print("== backward slice ==")

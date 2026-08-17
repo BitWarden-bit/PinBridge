@@ -11,7 +11,7 @@ use crate::event::{
 };
 use crate::ring::submit;
 use core::ffi::c_void;
-use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 use pinbridge_sys::*;
 
 static ENGINE_ACTIVE: AtomicBool = AtomicBool::new(true);
@@ -242,68 +242,6 @@ pub fn set_instrumentation_policies(
     Ok(generation)
 }
 
-// Instruction metadata (kind + static size), recorded at instrumentation time
-// for the step-over machinery. Instrumentation time may allocate; guarded by
-// a Pin mutex like every shared structure in this process.
-pub const KIND_LINEAR: u8 = 0;
-pub const KIND_BRANCH: u8 = 1;
-pub const KIND_CALL: u8 = 2;
-pub const KIND_RETURN: u8 = 3;
-
-static META_MUTEX: AtomicUsize = AtomicUsize::new(0);
-static mut INS_META: Option<crate::TlsFreeMap<u64, (u8, u8)>> = None;
-const META_MAX: usize = 1_000_000;
-
-pub fn meta_init() -> PbStatus {
-    let mut handle: PbMutexHandle = core::ptr::null_mut();
-    let status = unsafe { pb_pin_mutex_init(&mut handle) };
-    if status == PB_OK {
-        META_MUTEX.store(handle as usize, Ordering::Release);
-        unsafe {
-            INS_META = Some(crate::new_map());
-        }
-    }
-    status
-}
-
-fn meta_record(address: u64, kind: u8, size: u8) {
-    let mutex = META_MUTEX.load(Ordering::Acquire) as PbMutexHandle;
-    if mutex.is_null() {
-        return;
-    }
-    unsafe {
-        if pb_pin_mutex_lock(mutex) != PB_OK {
-            return;
-        }
-        let map = &mut *core::ptr::addr_of_mut!(INS_META);
-        if let Some(map) = map.as_mut() {
-            if map.len() < META_MAX {
-                map.insert(address, (kind, size));
-            }
-        }
-        pb_pin_mutex_unlock(mutex);
-    }
-}
-
-/// (kind, size) for an instrumented instruction, if recorded.
-pub fn meta_lookup(address: u64) -> Option<(u8, u8)> {
-    let mutex = META_MUTEX.load(Ordering::Acquire) as PbMutexHandle;
-    if mutex.is_null() {
-        return None;
-    }
-    let mut found = None;
-    unsafe {
-        if pb_pin_mutex_lock(mutex) == PB_OK {
-            let map = &*core::ptr::addr_of!(INS_META);
-            if let Some(map) = map.as_ref() {
-                found = map.get(&address).copied();
-            }
-            pb_pin_mutex_unlock(mutex);
-        }
-    }
-    found
-}
-
 fn parse_range(value: &str) -> Option<(u64, u64)> {
     let (start, end) = value.split_once('-')?;
     let start = u64::from_str_radix(start.trim().trim_start_matches("0x"), 16).ok()?;
@@ -386,10 +324,17 @@ pub unsafe extern "C" fn on_ins(ins: PbInsHandle, _user_data: *mut c_void) {
     }
 
     // instrumentation breakpoints: any address, regardless of capture ranges
-    if crate::bp::any_active() {
-        if let Some(slot) = crate::bp::find(address) {
-            crate::bp::instrument(ins, slot);
-        }
+    let breakpoint_slot = if crate::bp::any_active() {
+        crate::bp::find(address)
+    } else {
+        None
+    };
+    if let Some(slot) = breakpoint_slot {
+        crate::bp::instrument(ins, slot);
+    } else if let Some(candidate) = crate::stepper::candidate_index(address) {
+        // Private step successors never enter the ordinary breakpoint table;
+        // an overlapping user breakpoint above retains priority and ownership.
+        crate::bp::instrument_step(ins, candidate);
     }
 
     let runtime_hook = crate::hooks::any() && crate::hooks::contains(address);
@@ -436,16 +381,6 @@ pub unsafe extern "C" fn on_ins(ins: PbInsHandle, _user_data: *mut c_void) {
     let is_call = query_bool(ins, pb_ins_is_call);
     let is_ret = !is_call && query_bool(ins, pb_ins_is_ret);
     let is_branch = !is_call && !is_ret && query_bool(ins, pb_ins_is_branch);
-    let kind = if is_call {
-        KIND_CALL
-    } else if is_ret {
-        KIND_RETURN
-    } else if is_branch {
-        KIND_BRANCH
-    } else {
-        KIND_LINEAR
-    };
-    meta_record(address, kind, size.min(255) as u8);
 
     // Unlike the runtime `instruction` event, this is emitted once when Pin
     // has fully decoded the instruction for instrumentation. All values are

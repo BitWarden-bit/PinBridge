@@ -10,11 +10,15 @@ agent 内嵌 CPython 多插件脚本宿主（见 `docs/scripting.md`)：事件�
 
 ## 2. 录制通道（已交付，ABI v1.5)
 
-把"跑过的那段执行"无损落到盘上：
+把"跑过的那段执行"写入有界录制通道；只有最终状态为 `complete` 且 `dropped == 0` 的
+窗口才称为无损、才允许进入确定性重放：
 
 - `trace start/stop` 控制操作（op 0x35/0x36/0x37;CLI `trace start <kinds> <lo> <hi> <path>` /
   `trace stop` / `tracest`;pb API `pb.trace_start/trace_stop/trace_status`)；独立大容量
   slab(`PINBRIDGE_AGENT_RECORD_CAP`，默认 1M 槽 × 96B);Pin 内部线程 drain 落盘。
+- `pb.trace_status_detail()` 明确区分 `idle/recording/draining/complete/failed`。停止时先关闭
+  生产者入口，再等待所有已进入回调发布完成；容量满只增加 `dropped`，不占用序号。旧
+  drain 未完成时禁止开始新会话，避免复用 slab 或让两个后台线程同时写同一会话状态。
 - **采集域规格**（op 0x38；CLI `trace start-spec <kinds> <lo-hi[,lo-hi]> <threads|all> <path>`；
   Python `pb.trace_start_spec`）：在 native recorder 的 ring claim 之前同时按多个地址范围和
   线程白名单过滤。空线程列表表示全部线程，最多 16 个范围和 64 个线程；PBTR 元数据保留
@@ -46,6 +50,9 @@ agent 内嵌 CPython 多插件脚本宿主（见 `docs/scripting.md`)：事件�
 
 - **具体 EA 消灭别名问题**——每条 memory 事件记录的是确定地址与确定值，不做指针分析，
   不靠猜测；
+- **架构随轨迹选择**——重放器按 PBTR 的 `arch/pointer_width` 使用 x86 或 x64 Capstone 模式、
+  4/8 字节寄存器库与 PE32/PE32+ 映射；kind-9 解码缓存同时以地址和实际机器码为键，允许
+  同一地址在 SMC 后出现不同指令；
 - **录制值 + 入口上下文 = 确定性重放**——单线程窗口内，内存读的答案都在带上，从入口
   快照出发逐条 exec 重执行，结果与当时一致。
 

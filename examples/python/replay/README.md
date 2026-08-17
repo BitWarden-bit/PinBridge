@@ -150,8 +150,12 @@ python taint.py win.pbtr slice --at 2711833 --operand mem:0x7ff6e6e53128:4 \
 
 - Instruction bytes come from kind-9 records when present; otherwise `--pe`
   maps bytes from the on-disk PE (default base: meta `main_module.low`, else
-  the PE's ImageBase). **SMC caveat: the PE fallback breaks on self-modifying
-  / self-decrypting code — for packed targets record 档2 (kind-9/10).**
+  the PE32/PE32+ ImageBase). Decode mode and register aliases come from PBTR
+  `arch`/`pointer_width` metadata. **SMC caveat: the PE fallback breaks on
+  self-modifying / self-decrypting code — for packed targets record 档2
+  (kind-9/10).**
+  Kind-9 cache entries include both IP and captured bytes, so rewritten code
+  at the same address is decoded independently.
 - Sources: `reg:NAME` (seed at window entry), `mem:0xA:0xSZ[@first-touch|@start]`
   (first-touch labels virgin bytes when first read in the window),
   `event:#N` (labels the Nth memory event of the window).
@@ -168,7 +172,8 @@ python taint.py win.pbtr slice --at 2711833 --operand mem:0x7ff6e6e53128:4 \
 python test_taint.py     # pure offline tests, no Pin
 ```
 
-Cover: reader round-trip/gaps/truncated tail/unknown kinds; mem→reg
+Cover: reader round-trip/gaps/truncated tail/unknown kinds; x86/x64 decode and
+register models; same-IP SMC byte changes; mem→reg
 propagation; xor-reg,reg kill; ALU label union; push/pop round-trip through
 concrete stack EAs; 32-bit subregister zero-extend kill; control-flow & data
 sink firing; conservative unknown-mnemonic handling; slice contributor
@@ -179,7 +184,7 @@ exactness, entry-boundary demand, stack propagation, xor-kill cut.
 - **档1 recordings are value-blind**: no data values in the events, so taint
   follows instruction semantics only (`and eax, 0` still propagates). kind-10
   values are carried but not yet used for constant folding.
-- Register taint is byte-granular (8 slots per GP register); flags and
+- Register taint is byte-granular (x64 GP banks 8 bytes, x86 GP banks 4 bytes); flags and
   SIMD/x87 registers are not tracked.
 - Single-thread windows only (records are split by thread_id; inter-thread
   flows e.g. via shared memory are not followed).
@@ -189,6 +194,3 @@ exactness, entry-boundary demand, stack propagation, xor-kill cut.
 - Multi-memory-operand instructions bind events to operands by access+size
   heuristics; exotic forms can mis-bind (counted, not silent).
 - No concolic exploration: replay follows only the recorded path.
-- The decode cache keys instruction bytes by ip — an SMC site that rewrites
-  itself mid-window would be mis-decoded (kind-9/10 recordings don't have
-  this problem once 档2 ships).

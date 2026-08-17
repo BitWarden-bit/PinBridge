@@ -38,6 +38,8 @@ B_JMP_RAX = b"\xFF\xE0"                       # jmp rax
 B_MOV_RCX_IMM = b"\x48\xB9" + struct.pack("<Q", 0x1234)   # mov rcx, 0x1234
 B_CPUID = b"\x0F\xA2"                         # cpuid
 B_RET = b"\xC3"                               # ret
+B_X86_INC_EAX_RET = b"\x40\xC3"               # x86: inc eax; ret
+B_X86_MOV_EAX_MEM_EBX = b"\x8B\x03"            # x86: mov eax, [ebx]
 
 EA_SRC = 0x0000000000200000
 EA_SRC2 = 0x0000000000201000
@@ -271,6 +273,50 @@ class TraceReaderTests(unittest.TestCase):
 
 
 class ForwardTaintTests(unittest.TestCase):
+    def test_x86_mode_and_register_model_follow_trace_metadata(self):
+        with tempfile.TemporaryDirectory() as d:
+            trace = build_trace(
+                os.path.join(d, "x86.pbtr"),
+                [(B_X86_MOV_EAX_MEM_EBX,
+                  [(EA_SRC, 4, pbtrace.ACCESS_READ, 0)])],
+                meta_extra={"arch": "x86", "pointer_width": 4},
+            )
+            arch = taint.architecture_from_meta(trace.meta)
+            decoder = taint.Decoder(arch=arch)
+            sources = [taint.Source("s0", "mem:0x%x:4" % EA_SRC, arch)]
+            _hits, _stats, state = taint.run_forward(
+                taint.build_window(trace, None), decoder, sources, [])
+            self.assertEqual(decoder.arch.name, "x86")
+            self.assertEqual(state["regs"].read("eax")[0], frozenset({"s0"}))
+            self.assertEqual(len(state["regs"].regs["eax"]), 4)
+            with self.assertRaises(SystemExit):
+                taint.Source("bad", "reg:rax", arch)
+
+    def test_x86_0x40_is_inc_eax_not_a_rex_prefix(self):
+        padded = B_X86_INC_EAX_RET + b"\x00" * (16 - len(B_X86_INC_EAX_RET))
+        a1, a2 = struct.unpack("<QQ", padded)
+        rec = pbtrace.Record(
+            1, pbtrace.KIND_EXEC_BYTES, TID, 0x401000,
+            (len(B_X86_INC_EAX_RET), a1, a2, 0, 0, 0, 0, 0),
+        )
+        insn = taint.Decoder(arch="x86").decode(0x401000, rec)
+        self.assertEqual(insn.text, "inc eax")
+        self.assertEqual(insn.size, 1)
+
+    def test_decode_cache_distinguishes_smc_bytes_at_the_same_ip(self):
+        decoder = taint.Decoder()
+
+        def record(code, sequence):
+            padded = code + b"\x00" * (16 - len(code))
+            a1, a2 = struct.unpack("<QQ", padded)
+            return pbtrace.Record(
+                sequence, pbtrace.KIND_EXEC_BYTES, TID, BASE_IP,
+                (len(code), a1, a2, 0, 0, 0, 0, 0),
+            )
+
+        self.assertEqual(decoder.decode(BASE_IP, record(b"\x90", 1)).text, "nop")
+        self.assertEqual(decoder.decode(BASE_IP, record(B_RET, 2)).text, "ret")
+
     def test_a_mov_mem_to_reg_propagates(self):
         with tempfile.TemporaryDirectory() as d:
             trace = build_trace(os.path.join(d, "t.pbtr"),

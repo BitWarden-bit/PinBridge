@@ -555,20 +555,20 @@ fn run_command(words: &[&str], default_limit: u64, client: &mut Client) -> Resul
                     Ok(serde_json::json!({ "extended": true, "ranges": ranges }))
                 }
                 Some("status") | None => {
-                    let (active, recorded, dropped) =
-                        client.trace_status().map_err(|e| e.to_string())?;
+                    let status = client.trace_status_detail().map_err(|e| e.to_string())?;
                     Ok(serde_json::json!({
-                        "recording": active, "recorded": recorded, "dropped": dropped,
+                        "state": status.state_name(), "recording": status.active,
+                        "recorded": status.recorded, "dropped": status.dropped,
                     }))
                 }
                 Some(other) => Err(format!("unknown trace subcommand: {other}")),
             }
         }
         "tracest" => {
-            let (active, recorded, dropped) =
-                client.trace_status().map_err(|e| e.to_string())?;
+            let status = client.trace_status_detail().map_err(|e| e.to_string())?;
             Ok(serde_json::json!({
-                "recording": active, "recorded": recorded, "dropped": dropped,
+                "state": status.state_name(), "recording": status.active,
+                "recorded": status.recorded, "dropped": status.dropped,
             }))
         }
         "script" => {

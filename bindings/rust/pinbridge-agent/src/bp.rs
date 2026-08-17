@@ -220,38 +220,10 @@ unsafe fn release_redirect() {
     }
 }
 
-/// One-shot breakpoints planted for an exact single step cover every
-/// possible successor of the current instruction; only one of them fires.
-/// The rest must be removed once the world stops, or they would fire as
-/// surprise stops on later passes. Max 2 live candidates (jcc).
-static PENDING_STEP: [(AtomicU32, AtomicU64); 2] =
-    [const { (AtomicU32::new(0), AtomicU64::new(0)) }; 2];
-
-/// Records a step one-shot (id, address). Call from the query-server thread.
-pub fn note_step_bp(id: u32, address: u64) {
-    for slot in &PENDING_STEP {
-        if slot.0.load(Ordering::Acquire) == 0 {
-            slot.1.store(address, Ordering::Release);
-            slot.0.store(id, Ordering::Release);
-            return;
-        }
-    }
-}
-
-/// Breaker post-stop: drops every pending step one-shot except the one at
-/// `fired_address` (that one already auto-deactivated on the hit).
-pub fn clear_step_bps(fired_address: u64) {
-    for slot in &PENDING_STEP {
-        let id = slot.0.load(Ordering::Acquire);
-        if id == 0 {
-            continue;
-        }
-        let address = slot.1.load(Ordering::Acquire);
-        slot.0.store(0, Ordering::Release);
-        if address != fired_address {
-            remove(id);
-        }
-    }
+/// Breaker post-stop: private successor callbacks are analysis-time gated, so
+/// cancellation is enough and can never delete a normal breakpoint.
+fn clear_step_bps() {
+    crate::stepper::cancel();
 }
 
 /// Resume-over-breakpoint replay suppression. The hitting thread is stopped
@@ -320,7 +292,8 @@ fn unlock_table() {
 }
 
 /// Slot index of the active breakpoint at `address`, if any.
-pub fn find(address: u64) -> Option<usize> {    if !any_active() || !lock_table() {
+pub fn find(address: u64) -> Option<usize> {
+    if !any_active() || !lock_table() {
         return None;
     }
     let mut found = None;
@@ -346,6 +319,54 @@ pub fn instrument(ins: PbInsHandle, slot_index: usize) {
     }
 }
 
+/// Called when a decoded step successor has no ordinary breakpoint at the
+/// same address. `candidate_index` refers to the stepper's private table.
+pub fn instrument_step(ins: PbInsHandle, candidate_index: usize) {
+    unsafe {
+        pb_ins_insert_call_before_ctx(
+            ins,
+            Some(on_step_hit_ctx),
+            candidate_index as *mut c_void,
+        );
+    }
+}
+
+unsafe fn exact_stop(context: PbContextHandle, tid: u32, address: u64) {
+    LAST_HIT_TID.store(tid, Ordering::Release);
+    LAST_HIT_ADDR.store(address, Ordering::Release);
+    let armed = !context.is_null() && redirect_arm(tid, address);
+    if armed {
+        request_stop();
+        let status = pb_pin_set_context_reg(
+            context,
+            crate::arch::instr_ptr_reg(),
+            STUB_BASE.load(Ordering::Acquire) as u64,
+        );
+        if status == PB_OK {
+            pb_pin_execute_at(context as PbConstContextHandle); // noreturn
+        } else {
+            release_redirect();
+        }
+    }
+    request_stop();
+}
+
+unsafe extern "C" fn on_step_hit_ctx(context: PbContextHandle, user_data: *mut c_void) {
+    let candidate_index = user_data as usize;
+    let mut tid: PbThreadId = 0;
+    if pb_pin_thread_id(&mut tid) != PB_OK {
+        return;
+    }
+    let address = crate::stepper::candidate_address(candidate_index);
+    if address != 0 && crate::stepper::consume_start_replay(tid as u32, address) {
+        return;
+    }
+    let Some(address) = crate::stepper::claim_candidate(candidate_index, tid as u32) else {
+        return;
+    };
+    exact_stop(context, tid as u32, address);
+}
+
 /// Analysis callback (with thread context): fires on every execution of a
 /// breakpoint instruction.
 unsafe extern "C" fn on_hit_ctx(context: PbContextHandle, user_data: *mut c_void) {
@@ -358,21 +379,15 @@ unsafe extern "C" fn on_hit_ctx(context: PbContextHandle, user_data: *mut c_void
     if !slot.active.load(Ordering::Relaxed) {
         return; // removed but not yet re-JITed away
     }
-    if crate::stepper::on_bp_event(slot.address) {
-        // consumed by the stepper (replay suppression, or a step-over landing
-        // after parking); the one-shot lifecycle still applies
-        if slot.one_shot.load(Ordering::Relaxed) {
-            slot.active.store(false, Ordering::Relaxed);
-            ACTIVE_COUNT.fetch_sub(1, Ordering::Relaxed);
-        }
-        return;
-    }
     // Resume-over-breakpoint replay suppression: swallow exactly the first
     // re-execution on the thread that caused the stop (see arm_resume_skip).
     // NOTE: analysis callback on an application thread — no logging, no std
     // locks, no I/O in here (see instrument()).
     let mut tid: PbThreadId = 0;
     let have_tid = pb_pin_thread_id(&mut tid) == PB_OK;
+    if have_tid && crate::stepper::consume_start_replay(tid as u32, slot.address) {
+        return;
+    }
     let skip_tid = RESUME_SKIP_TID.load(Ordering::Acquire);
     if skip_tid != NO_HIT_TID && have_tid && skip_tid == tid as u32 {
         RESUME_SKIP_TID.store(NO_HIT_TID, Ordering::Release); // window closed
@@ -388,30 +403,16 @@ unsafe extern "C" fn on_hit_ctx(context: PbContextHandle, user_data: *mut c_void
     // Record who hit it before asking the breaker to stop the world.
     // PIN_ThreadId is one of the few calls legal in analysis code.
     if have_tid {
-        LAST_HIT_TID.store(tid as u32, Ordering::Release);
+        // An overlapping normal breakpoint both completes the step and keeps
+        // its own independent lifetime/hit accounting.
+        let _ = crate::stepper::claim_breakpoint(tid as u32, slot.address);
+        exact_stop(context, tid as u32, slot.address);
+        return;
     }
+    LAST_HIT_TID.store(NO_HIT_TID, Ordering::Release);
     LAST_HIT_ADDR.store(slot.address, Ordering::Release);
-    // Exact stop: redirect the hitting thread into the park stub BEFORE the
-    // bp instruction executes. Fire-and-forget request_stop() let the thread
-    // run on past the bp until the breaker suspended it — the stop landed
-    // anywhere ("断不下来/跑飞了"). If the stub slot is taken, fall back to
-    // that inexact-but-safe behavior.
-    let armed = have_tid && !context.is_null() && redirect_arm(tid as u32, slot.address);
-    if armed {
-        request_stop();
-        let status = pb_pin_set_context_reg(
-            context,
-            crate::arch::instr_ptr_reg(),
-            STUB_BASE.load(Ordering::Acquire) as u64,
-        );
-        if status == PB_OK {
-            pb_pin_execute_at(context as PbConstContextHandle); // noreturn
-        } else {
-            // without the rip write the redirect would re-enter the bp at
-            // once — stay on the inexact-but-safe path instead
-            release_redirect();
-        }
-    }
+    // Without a Pin thread id we cannot bind this stop to a writable context;
+    // retain the safe inexact fallback and let the breaker stop the world.
     request_stop();
 }
 
@@ -498,7 +499,7 @@ unsafe extern "C" fn breaker_main(_argument: *mut c_void) {
                     // with the world frozen, roll the redirected thread's
                     // saved context back onto the breakpoint address
                     rewind_redirected();
-                    clear_step_bps(last_hit().1);
+                    clear_step_bps();
                     // Publish the stop LAST: observers (script on_stop, UI
                     // polls) must never see stopped=true while the breaker is
                     // still mutating stopped contexts — a get_context racing
@@ -521,7 +522,7 @@ unsafe extern "C" fn breaker_main(_argument: *mut c_void) {
                 if good {
                     WATCHDOG_TICKS.store(0, Ordering::Release);
                     rewind_redirected();
-                    clear_step_bps(last_hit().1);
+                    clear_step_bps();
                     // publish last (see above)
                     crate::control::STOPPED.store(true, Ordering::Release);
                     STOP_GEN.fetch_add(1, Ordering::AcqRel);
