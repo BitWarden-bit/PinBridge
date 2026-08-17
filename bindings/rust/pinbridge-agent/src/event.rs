@@ -6,11 +6,14 @@
 /// Architecture-specific integer argument registers plus ABI stack snapshots
 /// captured at a runtime instruction hook.
 pub const EVENT_HOOK_REGS: u32 = 1;
-/// One memory operand access (EA + size + access tag).
+/// One memory operand access (EA + size + access tag); arg7 is the matching
+/// instrumentation-policy generation in the live event ring.
 pub const EVENT_MEMORY: u32 = 2;
-/// One executed instruction (address + static size).
+/// One executed instruction (address + static size); arg7 is the matching
+/// instrumentation-policy generation in the live event ring.
 pub const EVENT_EXEC: u32 = 3;
-/// One executed control-flow edge (branch/call/return target + taken).
+/// One executed control-flow edge (branch/call/return target + taken); arg7 is
+/// the matching instrumentation-policy generation in the live event ring.
 pub const EVENT_BRANCH_EDGE: u32 = 4;
 /// Syscall entry (number + 6 args) / exit (number + return + errno).
 pub const EVENT_SYSCALL: u32 = 5;
@@ -79,8 +82,16 @@ pub const EVENT_PIN_INTERNAL_EXCEPTION: u32 = 24;
 /// A statically decoded instruction observed during Pin instrumentation.
 /// address=instruction address, arg0=size, arg1=XED category,
 /// arg2=XED extension, arg3=opcode/iclass, arg4=memory operand count,
-/// arg5=control-flow flags (fall-through/branch/call/return/syscall).
+/// arg5=control-flow flags, arg6=direct target when the direct flag is set,
+/// arg7=instrumentation policy generation.
 pub const EVENT_INSTRUCTION_DECODE: u32 = 25;
+pub const DECODE_FLAG_FALL_THROUGH: u64 = 1 << 0;
+pub const DECODE_FLAG_BRANCH: u64 = 1 << 1;
+pub const DECODE_FLAG_CALL: u64 = 1 << 2;
+pub const DECODE_FLAG_RETURN: u64 = 1 << 3;
+pub const DECODE_FLAG_SYSCALL: u64 = 1 << 4;
+pub const DECODE_FLAG_DIRECT_CONTROL_FLOW: u64 = 1 << 5;
+pub const DECODE_FLAG_INDIRECT_CONTROL_FLOW: u64 = 1 << 6;
 /// Pin is about to report an application breakpoint to the debugger.
 /// address=IP, arg0=Pin debugging-event id, arg1=SP, arg2=flags,
 /// arg3=integer return register.

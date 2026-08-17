@@ -23,16 +23,24 @@ unsafe fn query_bool<T: Copy>(
     (query(handle, &mut value) == PB_OK && value != 0) as u64
 }
 
-unsafe fn routine_event(routine: PbRtnHandle, generation: u64) -> bool {
+unsafe fn routine_event(routine: PbRtnHandle, required_generation: Option<u64>) -> bool {
     let mut valid = 0u8;
     if pb_rtn_valid(routine, &mut valid) != PB_OK || valid == 0 {
         return false;
     }
     let mut address = 0u64;
-    if pb_rtn_address(routine, &mut address) != PB_OK
-        || !crate::engines::wants_at_instrumentation(address, EVENT_ROUTINE_INSTRUMENT)
-    {
+    if pb_rtn_address(routine, &mut address) != PB_OK {
         return false;
+    }
+    let Some(generation) =
+        crate::engines::instrumentation_generation(address, EVENT_ROUTINE_INSTRUMENT)
+    else {
+        return false;
+    };
+    if let Some(required) = required_generation {
+        if generation != required {
+            return false;
+        }
     }
     let mut size = 0u64;
     let mut id = 0u32;
@@ -60,11 +68,11 @@ unsafe fn routine_event(routine: PbRtnHandle, generation: u64) -> bool {
 
 unsafe extern "C" fn on_routine(routine: PbRtnHandle, _user_data: *mut c_void) {
     if crate::engines::wants_instrumentation_kind(EVENT_ROUTINE_INSTRUMENT) {
-        let _ = routine_event(routine, crate::engines::policy_generation());
+        let _ = routine_event(routine, None);
     }
 }
 
-unsafe fn bbl_events(trace: PbTraceHandle, generation: u64) {
+unsafe fn bbl_events(trace: PbTraceHandle) {
     if !crate::engines::wants_instrumentation_kind(EVENT_BBL_INSTRUMENT) {
         return;
     }
@@ -82,24 +90,26 @@ unsafe fn bbl_events(trace: PbTraceHandle, generation: u64) {
             break;
         }
         let mut address = 0u64;
-        if pb_bbl_address(bbl, &mut address) == PB_OK
-            && crate::engines::wants_at_instrumentation(address, EVENT_BBL_INSTRUMENT)
-        {
-            let mut size = 0u64;
-            let mut instructions = 0u32;
-            let _ = pb_bbl_size(bbl, &mut size);
-            let _ = pb_bbl_num_ins(bbl, &mut instructions);
-            crate::ring::submit(Event {
-                kind: EVENT_BBL_INSTRUMENT,
-                thread_id: PB_INVALID_THREAD_ID,
-                address,
-                arg0: size,
-                arg1: instructions as u64,
-                arg2: query_bool(bbl, pb_bbl_has_fall_through),
-                arg3: query_bool(bbl, pb_bbl_original),
-                arg7: generation,
-                ..Event::EMPTY
-            });
+        if pb_bbl_address(bbl, &mut address) == PB_OK {
+            let generation =
+                crate::engines::instrumentation_generation(address, EVENT_BBL_INSTRUMENT);
+            if let Some(generation) = generation {
+                let mut size = 0u64;
+                let mut instructions = 0u32;
+                let _ = pb_bbl_size(bbl, &mut size);
+                let _ = pb_bbl_num_ins(bbl, &mut instructions);
+                crate::ring::submit(Event {
+                    kind: EVENT_BBL_INSTRUMENT,
+                    thread_id: PB_INVALID_THREAD_ID,
+                    address,
+                    arg0: size,
+                    arg1: instructions as u64,
+                    arg2: query_bool(bbl, pb_bbl_has_fall_through),
+                    arg3: query_bool(bbl, pb_bbl_original),
+                    arg7: generation,
+                    ..Event::EMPTY
+                });
+            }
         }
         let mut next = PbBblHandle { opaque: 0 };
         if pb_bbl_next(bbl, &mut next) != PB_OK {
@@ -110,12 +120,13 @@ unsafe fn bbl_events(trace: PbTraceHandle, generation: u64) {
 }
 
 unsafe extern "C" fn on_trace(trace: PbTraceHandle, _user_data: *mut c_void) {
-    let generation = crate::engines::policy_generation();
     let mut address = 0u64;
     if pb_trace_address(trace, &mut address) != PB_OK {
         return;
     }
-    if crate::engines::wants_at_instrumentation(address, EVENT_TRACE_INSTRUMENT) {
+    if let Some(generation) =
+        crate::engines::instrumentation_generation(address, EVENT_TRACE_INSTRUMENT)
+    {
         let mut size = 0u64;
         let mut bbl_count = 0u32;
         let mut instruction_count = 0u32;
@@ -140,7 +151,7 @@ unsafe extern "C" fn on_trace(trace: PbTraceHandle, _user_data: *mut c_void) {
             ..Event::EMPTY
         });
     }
-    bbl_events(trace, generation);
+    bbl_events(trace);
 }
 
 unsafe fn emit_routine_snapshot_locked(generation: u64) -> (usize, usize, usize, usize) {
@@ -182,7 +193,7 @@ unsafe fn emit_routine_snapshot_locked(generation: u64) -> (usize, usize, usize,
                             break;
                         }
                         routine_total += 1;
-                        if routine_event(routine, generation) {
+                        if routine_event(routine, Some(generation)) {
                             matched_total += 1;
                         }
                         let mut next = PbRtnHandle { opaque: 0 };

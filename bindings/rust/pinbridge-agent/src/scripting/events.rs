@@ -622,22 +622,61 @@ pub fn build_event_dict(
             row.set_item("memory_address", event.arg0)?;
             row.set_item("size", event.arg1)?;
             row.set_item("access", event.arg2)?;
+            row.set_item("policy_generation", event.arg7)?;
+        }
+        EventSelector::Kind(EVENT_EXEC) => {
+            row.set_item("size", event.arg0)?;
+            let next_address = event.address.wrapping_add(event.arg0);
+            row.set_item(
+                "next_address",
+                if crate::arch::is_32() {
+                    next_address & u32::MAX as u64
+                } else {
+                    next_address
+                },
+            )?;
+            row.set_item("policy_generation", event.arg7)?;
         }
         EventSelector::Kind(EVENT_INSTRUCTION_DECODE) => {
             row.set_item("size", event.arg0)?;
+            let next_address = event.address.wrapping_add(event.arg0);
+            row.set_item(
+                "next_address",
+                if crate::arch::is_32() {
+                    next_address & u32::MAX as u64
+                } else {
+                    next_address
+                },
+            )?;
             row.set_item("category", event.arg1)?;
             row.set_item("extension", event.arg2)?;
             row.set_item("opcode", event.arg3)?;
             row.set_item("memory_operand_count", event.arg4)?;
-            row.set_item("has_fall_through", event.arg5 & 1 != 0)?;
-            row.set_item("is_branch", event.arg5 & (1 << 1) != 0)?;
-            row.set_item("is_call", event.arg5 & (1 << 2) != 0)?;
-            row.set_item("is_return", event.arg5 & (1 << 3) != 0)?;
-            row.set_item("is_syscall", event.arg5 & (1 << 4) != 0)?;
+            row.set_item(
+                "has_fall_through",
+                event.arg5 & DECODE_FLAG_FALL_THROUGH != 0,
+            )?;
+            row.set_item("is_branch", event.arg5 & DECODE_FLAG_BRANCH != 0)?;
+            row.set_item("is_call", event.arg5 & DECODE_FLAG_CALL != 0)?;
+            row.set_item("is_return", event.arg5 & DECODE_FLAG_RETURN != 0)?;
+            row.set_item("is_syscall", event.arg5 & DECODE_FLAG_SYSCALL != 0)?;
+            let direct = event.arg5 & DECODE_FLAG_DIRECT_CONTROL_FLOW != 0;
+            row.set_item("is_direct_control_flow", direct)?;
+            row.set_item(
+                "is_indirect_control_flow",
+                event.arg5 & DECODE_FLAG_INDIRECT_CONTROL_FLOW != 0,
+            )?;
+            if direct {
+                row.set_item("direct_target", event.arg6)?;
+            } else {
+                row.set_item("direct_target", py.None())?;
+            }
+            row.set_item("policy_generation", event.arg7)?;
         }
         EventSelector::Kind(EVENT_BRANCH_EDGE) => {
             row.set_item("target", event.arg0)?;
             row.set_item("taken", event.arg1 != 0)?;
+            row.set_item("policy_generation", event.arg7)?;
         }
         _ => {}
     }

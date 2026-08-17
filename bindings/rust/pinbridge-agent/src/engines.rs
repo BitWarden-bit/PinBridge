@@ -5,9 +5,11 @@
 //!   2. analysis time — the same snapshot applies exact kind/range/thread rules before submission.
 
 use crate::event::{
-    Event, EVENT_BRANCH_EDGE, EVENT_EXEC, EVENT_HOOK_REGS, EVENT_HOOK_RETURN, EVENT_MEMORY,
-    EVENT_BBL_INSTRUMENT, EVENT_INSTRUCTION_DECODE, EVENT_ROUTINE_INSTRUMENT, EVENT_SYSCALL,
-    EVENT_TRACE_INSTRUMENT,
+    Event, DECODE_FLAG_BRANCH, DECODE_FLAG_CALL, DECODE_FLAG_DIRECT_CONTROL_FLOW,
+    DECODE_FLAG_FALL_THROUGH, DECODE_FLAG_INDIRECT_CONTROL_FLOW, DECODE_FLAG_RETURN,
+    DECODE_FLAG_SYSCALL, EVENT_BBL_INSTRUMENT, EVENT_BRANCH_EDGE, EVENT_EXEC, EVENT_HOOK_REGS,
+    EVENT_HOOK_RETURN, EVENT_INSTRUCTION_DECODE, EVENT_MEMORY, EVENT_ROUTINE_INSTRUMENT,
+    EVENT_SYSCALL, EVENT_TRACE_INSTRUMENT,
 };
 use crate::ring::submit;
 use core::ffi::c_void;
@@ -64,7 +66,26 @@ impl InstrumentationRule {
 }
 
 struct InstrumentationPolicy {
+    generation: u64,
     rules: Vec<InstrumentationRule>,
+}
+
+impl InstrumentationPolicy {
+    #[inline]
+    fn instrumentation_generation(&self, address: u64, kind: u32) -> Option<u64> {
+        self.rules
+            .iter()
+            .any(|rule| rule.matches_instrumentation(address, kind))
+            .then_some(self.generation)
+    }
+
+    #[inline]
+    fn analysis_generation(&self, address: u64, thread_id: u32, kind: u32) -> Option<u64> {
+        self.rules
+            .iter()
+            .any(|rule| rule.matches_analysis(address, thread_id, kind))
+            .then_some(self.generation)
+    }
 }
 
 static INSTRUMENTATION_POLICY: AtomicPtr<InstrumentationPolicy> =
@@ -90,6 +111,7 @@ fn default_kinds() -> u32 {
 fn default_policy() -> InstrumentationPolicy {
     let (start, end) = trace_range();
     InstrumentationPolicy {
+        generation: 0,
         rules: vec![InstrumentationRule {
             kinds: DEFAULT_INSTRUMENTATION_KINDS.load(Ordering::Relaxed) as u32,
             start,
@@ -99,7 +121,9 @@ fn default_policy() -> InstrumentationPolicy {
     }
 }
 
-fn publish_policy(policy: InstrumentationPolicy) -> u64 {
+fn publish_policy(mut policy: InstrumentationPolicy) -> u64 {
+    let generation = POLICY_GENERATION.fetch_add(1, Ordering::AcqRel) + 1;
+    policy.generation = generation;
     let replacement = Box::into_raw(Box::new(policy));
     let old = INSTRUMENTATION_POLICY.swap(replacement, Ordering::AcqRel);
     if !old.is_null() {
@@ -108,7 +132,7 @@ fn publish_policy(policy: InstrumentationPolicy) -> u64 {
             .unwrap_or_else(|error| error.into_inner())
             .push(old as usize);
     }
-    POLICY_GENERATION.fetch_add(1, Ordering::AcqRel) + 1
+    generation
 }
 
 fn policy() -> &'static InstrumentationPolicy {
@@ -116,7 +140,10 @@ fn policy() -> &'static InstrumentationPolicy {
     if snapshot.is_null() {
         // configure_from_env publishes before Pin starts the application.
         // This branch is only a defensive identity used by unit tests.
-        static EMPTY: InstrumentationPolicy = InstrumentationPolicy { rules: Vec::new() };
+        static EMPTY: InstrumentationPolicy = InstrumentationPolicy {
+            generation: 0,
+            rules: Vec::new(),
+        };
         &EMPTY
     } else {
         unsafe { &*snapshot }
@@ -138,16 +165,14 @@ pub(crate) fn wants_instrumentation_kind(kind: u32) -> bool {
         .any(|rule| rule.kinds & (1 << kind) != 0)
 }
 
-pub(crate) fn policy_generation() -> u64 {
-    POLICY_GENERATION.load(Ordering::Acquire)
+#[inline]
+pub(crate) fn instrumentation_generation(address: u64, kind: u32) -> Option<u64> {
+    policy().instrumentation_generation(address, kind)
 }
 
 #[inline]
-fn wants_at_analysis(address: u64, thread_id: u32, kind: u32) -> bool {
-    policy()
-        .rules
-        .iter()
-        .any(|rule| rule.matches_analysis(address, thread_id, kind))
+fn analysis_generation(address: u64, thread_id: u32, kind: u32) -> Option<u64> {
+    policy().analysis_generation(address, thread_id, kind)
 }
 
 #[cfg(test)]
@@ -167,6 +192,13 @@ mod instrumentation_tests {
         assert!(!rule.matches_instrumentation(0x1000, EVENT_MEMORY));
         assert!(rule.matches_analysis(0x1080, 7, EVENT_EXEC));
         assert!(!rule.matches_analysis(0x1080, 6, EVENT_EXEC));
+
+        let policy = InstrumentationPolicy {
+            generation: 42,
+            rules: vec![rule],
+        };
+        assert_eq!(policy.analysis_generation(0x1080, 7, EVENT_EXEC), Some(42));
+        assert_eq!(policy.analysis_generation(0x1080, 6, EVENT_EXEC), None);
     }
 }
 
@@ -231,7 +263,10 @@ pub fn set_instrumentation_policies(
     ENABLE_EXEC.store(kinds & INSTRUMENT_EXEC != 0, Ordering::Release);
     ENABLE_MEMORY.store(kinds & INSTRUMENT_MEMORY != 0, Ordering::Release);
     ENABLE_BRANCH.store(kinds & INSTRUMENT_BRANCH != 0, Ordering::Release);
-    let generation = publish_policy(InstrumentationPolicy { rules });
+    let generation = publish_policy(InstrumentationPolicy {
+        generation: 0,
+        rules,
+    });
     for (start, end) in flush_ranges {
         let status = unsafe { pb_pin_remove_instrumentation_in_range(start, end) };
         if status != PB_OK {
@@ -385,7 +420,7 @@ pub unsafe extern "C" fn on_ins(ins: PbInsHandle, _user_data: *mut c_void) {
     // Unlike the runtime `instruction` event, this is emitted once when Pin
     // has fully decoded the instruction for instrumentation. All values are
     // copied now; no borrowed INS/XED object crosses into the Python thread.
-    if wants_at_instrumentation(address, EVENT_INSTRUCTION_DECODE) {
+    if let Some(generation) = instrumentation_generation(address, EVENT_INSTRUCTION_DECODE) {
         let mut category: i32 = 0;
         let mut extension: i32 = 0;
         let mut opcode: u32 = 0;
@@ -396,19 +431,29 @@ pub unsafe extern "C" fn on_ins(ins: PbInsHandle, _user_data: *mut c_void) {
         let _ = pb_ins_memory_operand_count(ins, &mut memory_operands);
         let mut flags = 0u64;
         if query_bool(ins, pb_ins_has_fall_through) {
-            flags |= 1;
+            flags |= DECODE_FLAG_FALL_THROUGH;
         }
         if is_branch {
-            flags |= 1 << 1;
+            flags |= DECODE_FLAG_BRANCH;
         }
         if is_call {
-            flags |= 1 << 2;
+            flags |= DECODE_FLAG_CALL;
         }
         if is_ret {
-            flags |= 1 << 3;
+            flags |= DECODE_FLAG_RETURN;
         }
         if query_bool(ins, pb_ins_is_syscall) {
-            flags |= 1 << 4;
+            flags |= DECODE_FLAG_SYSCALL;
+        }
+        let direct_control_flow = query_bool(ins, pb_ins_is_direct_control_flow);
+        let indirect_control_flow = query_bool(ins, pb_ins_is_indirect_control_flow);
+        let mut direct_target = 0u64;
+        if direct_control_flow {
+            flags |= DECODE_FLAG_DIRECT_CONTROL_FLOW;
+            let _ = pb_ins_direct_control_flow_target_address(ins, &mut direct_target);
+        }
+        if indirect_control_flow {
+            flags |= DECODE_FLAG_INDIRECT_CONTROL_FLOW;
         }
         submit(Event {
             kind: EVENT_INSTRUCTION_DECODE,
@@ -420,6 +465,8 @@ pub unsafe extern "C" fn on_ins(ins: PbInsHandle, _user_data: *mut c_void) {
             arg3: opcode as u64,
             arg4: memory_operands as u64,
             arg5: flags,
+            arg6: direct_target,
+            arg7: generation,
             ..Event::EMPTY
         });
     }
@@ -572,11 +619,12 @@ unsafe extern "C" fn on_memory(
     access: u32,
     _user_data: *mut c_void,
 ) {
-    if !ENABLE_MEMORY.load(Ordering::Relaxed)
-        || !wants_at_analysis(instruction_address, thread_id, EVENT_MEMORY)
-    {
+    if !ENABLE_MEMORY.load(Ordering::Relaxed) {
         return;
     }
+    let Some(generation) = analysis_generation(instruction_address, thread_id, EVENT_MEMORY) else {
+        return;
+    };
     submit(Event {
         kind: EVENT_MEMORY,
         thread_id,
@@ -584,6 +632,7 @@ unsafe extern "C" fn on_memory(
         arg0: memory_address,
         arg1: size as u64,
         arg2: access as u64,
+        arg7: generation,
         ..Event::EMPTY
     });
 }
@@ -597,14 +646,18 @@ unsafe extern "C" fn on_exec(
     if crate::stepper::on_step_event(thread_id, address) {
         return;
     }
-    if !ENABLE_EXEC.load(Ordering::Relaxed) || !wants_at_analysis(address, thread_id, EVENT_EXEC) {
+    if !ENABLE_EXEC.load(Ordering::Relaxed) {
         return;
     }
+    let Some(generation) = analysis_generation(address, thread_id, EVENT_EXEC) else {
+        return;
+    };
     submit(Event {
         kind: EVENT_EXEC,
         thread_id,
         address,
         arg0: size as u64,
+        arg7: generation,
         ..Event::EMPTY
     });
 }
@@ -616,17 +669,19 @@ unsafe extern "C" fn on_branch_edge(
     taken: u64,
     _user_data: *mut c_void,
 ) {
-    if !ENABLE_BRANCH.load(Ordering::Relaxed)
-        || !wants_at_analysis(address, thread_id, EVENT_BRANCH_EDGE)
-    {
+    if !ENABLE_BRANCH.load(Ordering::Relaxed) {
         return;
     }
+    let Some(generation) = analysis_generation(address, thread_id, EVENT_BRANCH_EDGE) else {
+        return;
+    };
     submit(Event {
         kind: EVENT_BRANCH_EDGE,
         thread_id,
         address,
         arg0: target_address,
         arg1: taken,
+        arg7: generation,
         ..Event::EMPTY
     });
 }

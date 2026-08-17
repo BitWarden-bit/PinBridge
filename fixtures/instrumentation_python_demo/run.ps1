@@ -98,6 +98,7 @@ try {
     foreach ($marker in @(
         "INSTRUMENTATION_POLICY_READY",
         "INSTRUMENTATION_NATIVE_HIT",
+        "INSTRUMENTATION_BATCH_HIT",
         "INSTRUMENTATION_LIFECYCLE_HIT type=trace.instrument",
         "INSTRUMENTATION_LIFECYCLE_HIT type=routine.instrument",
         "INSTRUMENTATION_LIFECYCLE_HIT type=basic_block.instrument"

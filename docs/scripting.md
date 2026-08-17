@@ -234,8 +234,12 @@ Pin 的 XED 回调发生在解码前，不是“已解码指令通知”。平�
 `pb.instrumentation_set(kinds=["instruction.decode"], ranges=[...])` 做原生地址过滤。
 事件在线程无关的插桩阶段产生，因此 `tid == -1`，`threads` 过滤不适用于该种类。专用字段
 为 `size`、`category`、`extension`、`opcode`、`memory_operand_count`、
-`has_fall_through`、`is_branch`、`is_call`、`is_return`、`is_syscall`。这些值已经从 INS/XED
-对象复制到固定记录；回调需要文本时可在脚本线程按地址调用 `pb.disasm`。
+`next_address`、`has_fall_through`、`is_branch`、`is_call`、`is_return`、`is_syscall`、
+`is_direct_control_flow`、`is_indirect_control_flow`、`direct_target`（非直接控制流为 `None`）
+和 `policy_generation`。这些值已经从 INS/XED 对象复制到固定记录；回调需要文本时可在
+脚本线程按地址调用 `pb.disasm`。高吞吐 `on_event_batch` 保持原始布局：`a0=size`、
+`a1=category`、`a2=extension`、`a3=opcode`、`a4=memory_operand_count`、`a5=flags`、
+`a6=direct_target`、`a7=policy_generation`。
 
 函数、Trace 和基本块同样使用“Python 声明、原生产生、脚本线程批量消费”的模型。先用
 `pb.on` 或 `pb.watch` 订阅对应名字，再把相同种类加入 `pb.instrumentation_set`。函数策略
@@ -399,6 +403,9 @@ pb.off(subscription_id)
 | `pin.detach` | `phase="detached"` | 已接入 JIT/Probe 原生完成回调；分离后不承诺 Python 仍被调度 |
 | `pin.attach` | `phase="attached"` | 支持的平台在全部会话回调重建并再次 application-start 后投递；Pin 3.31 Windows JIT 不支持重附加 |
 | `debugger.breakpoint` / `debugger.single_step` / `debugger.async_break` | `ip`, `debugging_event`, `stack_pointer`, `flags`, `return_value` | Pin 准备把停止事件报告给应用调试器时产生；这里只观察，不改变处理结果 |
+| `instruction` | `size`, `next_address`, `policy_generation` | 指令实际执行时产生；版本号来自完成原生范围/线程匹配的同一份不可变策略快照 |
+| `memory` | `memory_address`, `size`, `access`, `policy_generation` | 指令的每个内存操作数实际访问时产生 |
+| `branch.edge` | `target`, `taken`, `policy_generation` | 分支、调用或返回的实际控制流边沿 |
 | `trace.instrument` | `size`, `basic_block_count`, `instruction_count`, `has_fall_through`, `routine_address`, `policy_generation` | Pin 为执行路径创建动态 Trace 时产生 |
 | `routine.instrument` | `size`, `instruction_count`, `routine_id`, `is_dynamic`, `is_artificial`, `policy_generation` | 策略启用时补当前函数快照，随后接收 Pin 新发现函数 |
 | `basic_block.instrument` | `size`, `instruction_count`, `has_fall_through`, `is_original`, `policy_generation` | Trace 内的基本块静态元数据 |

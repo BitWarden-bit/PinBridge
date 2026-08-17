@@ -449,6 +449,10 @@ Pin 热路径不获取 GIL、不调用 Python、不分配规则对象。
 关闭时执行并缓存一个函数，再由 Python 只启用该函数范围，验证动态重新插桩成功且相邻
 排除函数没有泄漏事件。
 
+运行时 `instruction`、`memory`、`branch.edge` 事件的 `policy_generation` 取自完成地址/线程
+匹配的同一份不可变原生策略快照，不是随后另读的全局计数器。`instruction` 同时提供 `size`
+和按目标位数回绕的 `next_address`，脚本无需再从原始 `a0` 猜字段含义。
+
 函数、Trace 和基本块生命周期沿用同一个规则快照，而不是另建一套容易交叉放宽的过滤器：
 
 - `routine.instrument`：策略发布后遍历当前已加载镜像的 section/routine，补发范围内函数
@@ -554,9 +558,9 @@ pb.instrumentation_set(
 
 第二条链路在普通 INS 插桩回调中运行，此时 Pin 已经完成解码且有稳定地址。原生层先应用
 `instrumentation_set` 的种类和地址范围，再复制长度、XED 类别、扩展、操作码、内存操作数
-数量和控制流标志到固定事件记录。`pb.on("instruction.decode")` 可逐条处理，
-`pb.watch(["instruction.decode"])` + `on_event_batch` 可批量处理；借用的 INS/XED 句柄从不
-离开 Pin 回调。该事件是静态插桩事件，`thread_id == -1`，线程过滤只适用于运行时事件。
+数量、控制流标志、直接目标和策略版本复制到固定事件记录。`pb.on("instruction.decode")`
+可逐条处理，`pb.watch(["instruction.decode"])` + `on_event_batch` 可批量处理；借用的 INS/XED
+句柄从不离开 Pin 回调。该事件是静态插桩事件，`thread_id == -1`，线程过滤只适用于运行时事件。
 
 真实 Pin 回归使用 Pin 官方测试相同的 `0F 1C 00` CLDEMOTE 编码，验证 Python 策略让 XED
 识别为 CLDEMOTE、原生地址范围没有泄漏，并同时通过命名回调和批处理回调收到复制结果。
