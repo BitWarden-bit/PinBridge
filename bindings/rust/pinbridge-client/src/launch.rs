@@ -15,19 +15,131 @@ use std::time::{Duration, Instant};
 
 #[cfg(windows)]
 mod target_process {
+    use super::target_needs_console_window;
+    use crate::arch::detect_pe_subsystem;
     use core::ffi::c_void;
     use std::collections::HashMap;
+    use std::io::{Error, Result as IoResult};
+    use std::os::windows::io::AsRawHandle;
+    use std::os::windows::process::CommandExt;
+    use std::path::Path;
+    use std::process::{Child, Command};
     use std::sync::{Mutex, OnceLock};
 
+    const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
     const PROCESS_TERMINATE: u32 = 0x0001;
     const SYNCHRONIZE: u32 = 0x0010_0000;
-    static HANDLES: OnceLock<Mutex<HashMap<u32, usize>>> = OnceLock::new();
+    const JOB_OBJECT_EXTENDED_LIMIT_INFORMATION: i32 = 9;
+    const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: u32 = 0x0000_2000;
+    static TARGET_HANDLES: OnceLock<Mutex<HashMap<u32, usize>>> = OnceLock::new();
+    static JOB_HANDLES: OnceLock<Mutex<HashMap<u32, usize>>> = OnceLock::new();
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct IoCounters {
+        read_operation_count: u64,
+        write_operation_count: u64,
+        other_operation_count: u64,
+        read_transfer_count: u64,
+        write_transfer_count: u64,
+        other_transfer_count: u64,
+    }
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct BasicLimitInformation {
+        per_process_user_time_limit: i64,
+        per_job_user_time_limit: i64,
+        limit_flags: u32,
+        minimum_working_set_size: usize,
+        maximum_working_set_size: usize,
+        active_process_limit: u32,
+        affinity: usize,
+        priority_class: u32,
+        scheduling_class: u32,
+    }
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct ExtendedLimitInformation {
+        basic_limit_information: BasicLimitInformation,
+        io_info: IoCounters,
+        process_memory_limit: usize,
+        job_memory_limit: usize,
+        peak_process_memory_used: usize,
+        peak_job_memory_used: usize,
+    }
 
     extern "system" {
         fn OpenProcess(access: u32, inherit: i32, process_id: u32) -> *mut c_void;
         fn TerminateProcess(process: *mut c_void, exit_code: u32) -> i32;
         fn WaitForSingleObject(handle: *mut c_void, milliseconds: u32) -> u32;
         fn CloseHandle(handle: *mut c_void) -> i32;
+        fn CreateJobObjectW(attributes: *mut c_void, name: *const u16) -> *mut c_void;
+        fn SetInformationJobObject(
+            job: *mut c_void,
+            information_class: i32,
+            information: *const c_void,
+            information_length: u32,
+        ) -> i32;
+        fn AssignProcessToJobObject(job: *mut c_void, process: *mut c_void) -> i32;
+        fn TerminateJobObject(job: *mut c_void, exit_code: u32) -> i32;
+    }
+
+    /// Put the outer Pin launcher in a kill-on-close Job immediately after
+    /// CreateProcess returns. Pin replaces that process with an architecture
+    /// specific launcher; the Job is the only stable owner of the resulting
+    /// Pin server and target descendants.
+    pub fn track_backend(child: &Child) -> IoResult<()> {
+        unsafe {
+            let job = CreateJobObjectW(core::ptr::null_mut(), core::ptr::null());
+            if job.is_null() {
+                return Err(Error::last_os_error());
+            }
+            let mut limits = ExtendedLimitInformation::default();
+            limits.basic_limit_information.limit_flags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            if SetInformationJobObject(
+                job,
+                JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
+                &limits as *const _ as *const c_void,
+                core::mem::size_of::<ExtendedLimitInformation>() as u32,
+            ) == 0
+            {
+                let error = Error::last_os_error();
+                CloseHandle(job);
+                return Err(error);
+            }
+            if AssignProcessToJobObject(job, child.as_raw_handle() as *mut c_void) == 0 {
+                let error = Error::last_os_error();
+                CloseHandle(job);
+                return Err(error);
+            }
+            let mut jobs = JOB_HANDLES
+                .get_or_init(|| Mutex::new(HashMap::new()))
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(previous) = jobs.insert(child.id(), job as usize) {
+                TerminateJobObject(previous as *mut c_void, 1);
+                CloseHandle(previous as *mut c_void);
+            }
+            Ok(())
+        }
+    }
+
+    pub fn configure_visibility(
+        command: &mut Command,
+        target: &[String],
+        show_target_console: bool,
+    ) {
+        let Some(executable) = target.first() else {
+            return;
+        };
+        let Ok(subsystem) = detect_pe_subsystem(Path::new(executable)) else {
+            return;
+        };
+        if target_needs_console_window(show_target_console, subsystem) {
+            command.creation_flags(CREATE_NEW_CONSOLE);
+        }
     }
 
     pub fn remember(backend_pid: u32, target_pid: u32) {
@@ -35,7 +147,7 @@ mod target_process {
         if handle.is_null() {
             return;
         }
-        let mut handles = HANDLES
+        let mut handles = TARGET_HANDLES
             .get_or_init(|| Mutex::new(HashMap::new()))
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -47,29 +159,55 @@ mod target_process {
     }
 
     pub fn terminate(backend_pid: u32) {
-        let Some(handles) = HANDLES.get() else {
-            return;
-        };
-        let handle = handles
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(&backend_pid);
-        let Some(handle) = handle else {
-            return;
-        };
         unsafe {
-            let handle = handle as *mut c_void;
-            let _ = TerminateProcess(handle, 1);
-            let _ = WaitForSingleObject(handle, 5_000);
-            let _ = CloseHandle(handle);
+            if let Some(jobs) = JOB_HANDLES.get() {
+                if let Some(job) = jobs
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .remove(&backend_pid)
+                {
+                    let job = job as *mut c_void;
+                    let _ = TerminateJobObject(job, 1);
+                    let _ = CloseHandle(job);
+                }
+            }
+            if let Some(handles) = TARGET_HANDLES.get() {
+                if let Some(handle) = handles
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .remove(&backend_pid)
+                {
+                    let handle = handle as *mut c_void;
+                    let _ = TerminateProcess(handle, 1);
+                    let _ = WaitForSingleObject(handle, 5_000);
+                    let _ = CloseHandle(handle);
+                }
+            }
         }
     }
 }
 
 #[cfg(not(windows))]
 mod target_process {
+    use std::io::Result as IoResult;
+    use std::process::Child;
+    use std::process::Command;
+
+    pub fn configure_visibility(
+        _command: &mut Command,
+        _target: &[String],
+        _show_target_console: bool,
+    ) {
+    }
+    pub fn track_backend(_child: &Child) -> IoResult<()> {
+        Ok(())
+    }
     pub fn remember(_backend_pid: u32, _target_pid: u32) {}
     pub fn terminate(_backend_pid: u32) {}
+}
+
+fn target_needs_console_window(show_target_console: bool, subsystem: u16) -> bool {
+    show_target_console && subsystem == crate::arch::IMAGE_SUBSYSTEM_WINDOWS_CUI
 }
 
 pub struct BackendConfig {
@@ -84,6 +222,9 @@ pub struct BackendConfig {
     /// This is the compatibility mode for protectors which depend on native
     /// exception/single-step semantics.
     pub probe_mode: bool,
+    /// Give a CUI target its own visible console. GUI frontends set this;
+    /// console frontends keep sharing their existing terminal.
+    pub show_target_console: bool,
 }
 
 /// The resolved backend for one launch: which architecture, which Pin
@@ -146,7 +287,11 @@ fn discover_pin(arch: Arch) -> Option<PathBuf> {
     let mut dir = exe.parent()?.to_path_buf();
     for _ in 0..8 {
         let candidates = [
-            dir.join("runtime").join("pin").join(runtime).join("bin").join("pin.exe"),
+            dir.join("runtime")
+                .join("pin")
+                .join(runtime)
+                .join("bin")
+                .join("pin.exe"),
             dir.join("pin").join(runtime).join("bin").join("pin.exe"),
         ];
         for candidate in candidates {
@@ -271,6 +416,7 @@ pub fn spawn_backend(config: &BackendConfig, target: &[String]) -> IoResult<Chil
 
     let mut command = Command::new(&config.pin_exe);
     configure_execution_mode(&mut command, config.probe_mode);
+    target_process::configure_visibility(&mut command, target, config.show_target_console);
     command
         .arg("-t")
         .arg(&config.agent_dll)
@@ -285,12 +431,21 @@ pub fn spawn_backend(config: &BackendConfig, target: &[String]) -> IoResult<Chil
         // from the parent process.
         command.env_remove("PINBRIDGE_ENTRY_BP");
     }
-    command.spawn().map_err(|error| {
+    let mut child = command.spawn().map_err(|error| {
         Error::new(
             error.kind(),
             format!("failed to spawn {}: {error}", config.pin_exe.display()),
         )
-    })
+    })?;
+    if let Err(error) = target_process::track_backend(&child) {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(Error::new(
+            error.kind(),
+            format!("failed to assign Pin process tree to a Windows Job: {error}"),
+        ));
+    }
+    Ok(child)
 }
 
 fn configure_execution_mode(command: &mut Command, probe_mode: bool) {
@@ -299,19 +454,31 @@ fn configure_execution_mode(command: &mut Command, probe_mode: bool) {
     }
 }
 
-/// Polls until the agent's query port accepts connections (the agent binds it
-/// from a Pin internal thread shortly after the tool starts).
+/// Polls until the agent answers a protocol PING. The listener is deliberately
+/// bound before its Pin internal accept thread can run, so a successful TCP
+/// handshake alone is not a readiness signal.
 pub fn wait_for_port(port: u16, timeout: Duration) -> IoResult<()> {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
-        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
-            return Ok(());
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let attempt = remaining.min(Duration::from_millis(250));
+        if let Ok(mut client) = crate::client::Client::connect_with_timeout(port, attempt) {
+            if client.ping_full().is_ok() {
+                return Ok(());
+            }
         }
-        std::thread::sleep(Duration::from_millis(100));
+        std::thread::sleep(
+            deadline
+                .saturating_duration_since(Instant::now())
+                .min(Duration::from_millis(25)),
+        );
     }
     Err(Error::new(
         ErrorKind::TimedOut,
-        format!("agent did not open port {port} within {}s", timeout.as_secs()),
+        format!(
+            "agent did not open port {port} within {}s",
+            timeout.as_secs()
+        ),
     ))
 }
 
@@ -320,7 +487,9 @@ pub fn wait_for_port(port: u16, timeout: Duration) -> IoResult<()> {
 pub fn wait_for_entry_stop(port: u16, timeout: Duration) -> IoResult<(u32, u64)> {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
-        if let Ok(mut client) = crate::client::Client::connect(port) {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let attempt = remaining.min(Duration::from_millis(250));
+        if let Ok(mut client) = crate::client::Client::connect_with_timeout(port, attempt) {
             if let Ok((stopped, tid, address, expected)) = client.entry_stop_status() {
                 let at_entry = expected
                     .map(|entry| entry != 0 && address == entry)
@@ -334,7 +503,10 @@ pub fn wait_for_entry_stop(port: u16, timeout: Duration) -> IoResult<(u32, u64)>
     }
     Err(Error::new(
         ErrorKind::TimedOut,
-        format!("target did not stop at its PE entry within {}s", timeout.as_secs()),
+        format!(
+            "target did not stop at its PE entry within {}s",
+            timeout.as_secs()
+        ),
     ))
 }
 
@@ -359,6 +531,8 @@ pub struct LaunchOptions {
     /// Prefer target compatibility over instruction-level JIT features.
     /// Probe mode implicitly disables the entry breakpoint.
     pub probe_mode: bool,
+    /// Create a separate visible console when the target PE is WINDOWS_CUI.
+    pub show_target_console: bool,
 }
 
 /// Full launch chain for a target: resolve pin, spawn backend, wait for the
@@ -380,6 +554,7 @@ pub fn launch_for_target_full(
     target: &[String],
     timeout: Duration,
 ) -> IoResult<(Child, u16, LaunchMetadata)> {
+    let deadline = Instant::now() + timeout;
     let resolved = resolve_backend(options, target).map_err(Error::other)?;
     let port = if options.port == 0 {
         pick_free_port()?
@@ -393,11 +568,11 @@ pub fn launch_for_target_full(
         port,
         entry_bp: options.entry_bp,
         probe_mode: options.probe_mode,
+        show_target_console: options.show_target_console,
     };
     let mut child = spawn_backend(&backend, target)?;
-    if let Err(error) = wait_for_port(port, timeout) {
-        let _ = child.kill();
-        let _ = child.wait();
+    if let Err(error) = wait_for_port(port, deadline.saturating_duration_since(Instant::now())) {
+        kill_backend(&mut child);
         return Err(error);
     }
     // Best-effort ABI read before the caller takes over the control plane.
@@ -411,9 +586,10 @@ pub fn launch_for_target_full(
         }
     }
     if options.entry_bp && !options.probe_mode {
-        if let Err(error) = wait_for_entry_stop(port, timeout) {
-            let _ = child.kill();
-            let _ = child.wait();
+        if let Err(error) =
+            wait_for_entry_stop(port, deadline.saturating_duration_since(Instant::now()))
+        {
+            kill_backend(&mut child);
             return Err(error);
         }
     }
@@ -436,6 +612,8 @@ fn pick_free_port() -> IoResult<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::TcpListener;
+    use std::thread;
 
     fn options() -> LaunchOptions {
         LaunchOptions {
@@ -445,7 +623,36 @@ mod tests {
             port: 9001,
             entry_bp: true,
             probe_mode: false,
+            show_target_console: false,
         }
+    }
+
+    #[test]
+    fn readiness_requires_a_ping_response_not_only_a_tcp_handshake() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            thread::sleep(Duration::from_millis(120));
+            let (op, _, _) = pinbridge_proto::read_frame(&mut stream).unwrap();
+            assert_eq!(op, pinbridge_proto::op::PING);
+            let mut response = Vec::new();
+            pinbridge_proto::put_u32(&mut response, 1);
+            pinbridge_proto::put_u32(&mut response, 0);
+            pinbridge_proto::put_u32(&mut response, 1234);
+            pinbridge_proto::put_u64(&mut response, 0);
+            pinbridge_proto::write_frame(
+                &mut stream,
+                pinbridge_proto::op::PING,
+                pinbridge_proto::STATUS_OK,
+                &response,
+            )
+            .unwrap();
+        });
+        let started = Instant::now();
+        wait_for_port(port, Duration::from_secs(1)).unwrap();
+        assert!(started.elapsed() >= Duration::from_millis(100));
+        server.join().unwrap();
     }
 
     #[test]
@@ -463,6 +670,22 @@ mod tests {
             .map(|value| value.to_string_lossy().into_owned())
             .collect::<Vec<_>>();
         assert_eq!(arguments, ["-probe", "1"]);
+    }
+
+    #[test]
+    fn console_window_is_explicit_and_cui_only() {
+        assert!(target_needs_console_window(
+            true,
+            crate::arch::IMAGE_SUBSYSTEM_WINDOWS_CUI
+        ));
+        assert!(!target_needs_console_window(
+            false,
+            crate::arch::IMAGE_SUBSYSTEM_WINDOWS_CUI
+        ));
+        assert!(!target_needs_console_window(
+            false,
+            crate::arch::IMAGE_SUBSYSTEM_WINDOWS_GUI
+        ));
     }
 
     #[test]
@@ -487,7 +710,10 @@ mod tests {
     #[test]
     fn resolve_target_arch_errors_on_non_pe() {
         let err = resolve_target_arch(None, &["Cargo.toml".into()]).unwrap_err();
-        assert!(err.contains("MZ") || err.contains("read"), "unexpected error: {err}");
+        assert!(
+            err.contains("MZ") || err.contains("read"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -505,9 +731,15 @@ mod tests {
         // The current exe dir varies per test binary; assert only the tail.
         let path = default_agent_dll(Arch::X86).unwrap();
         let text = path.to_string_lossy().replace('\\', "/");
-        assert!(text.ends_with("ia32/pinbridge_agent.dll"), "unexpected: {text}");
+        assert!(
+            text.ends_with("ia32/pinbridge_agent.dll"),
+            "unexpected: {text}"
+        );
         let path64 = default_agent_dll(Arch::X64).unwrap();
         let text64 = path64.to_string_lossy().replace('\\', "/");
-        assert!(text64.ends_with("pinbridge_agent.dll"), "unexpected: {text64}");
+        assert!(
+            text64.ends_with("pinbridge_agent.dll"),
+            "unexpected: {text64}"
+        );
     }
 }

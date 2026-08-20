@@ -14,6 +14,8 @@ const IMAGE_FILE_MACHINE_AMD64: u16 = 0x8664;
 /// PE optional-header magic: PE32 (32-bit) vs PE32+ (64-bit).
 pub const OPTIONAL_MAGIC_PE32: u16 = 0x010b;
 pub const OPTIONAL_MAGIC_PE32PLUS: u16 = 0x020b;
+pub const IMAGE_SUBSYSTEM_WINDOWS_GUI: u16 = 2;
+pub const IMAGE_SUBSYSTEM_WINDOWS_CUI: u16 = 3;
 
 const DOS_MAGIC: &[u8; 2] = b"MZ";
 const NT_SIGNATURE: &[u8; 4] = b"PE\0\0";
@@ -97,6 +99,7 @@ impl fmt::Display for Arch {
 pub struct PeInfo {
     pub machine: u16,
     pub optional_magic: u16,
+    pub subsystem: u16,
     pub arch: Arch,
 }
 
@@ -106,6 +109,13 @@ pub struct PeInfo {
 pub fn detect_pe_arch(path: &Path) -> Result<Arch, String> {
     let data = std::fs::read(path).map_err(|error| format!("read {}: {error}", path.display()))?;
     parse_pe(&data).map(|info| info.arch)
+}
+
+/// Reads the target's PE subsystem. Launchers use this to give console
+/// targets a visible console when their parent is a GUI application.
+pub fn detect_pe_subsystem(path: &Path) -> Result<u16, String> {
+    let data = std::fs::read(path).map_err(|error| format!("read {}: {error}", path.display()))?;
+    parse_pe(&data).map(|info| info.subsystem)
 }
 
 /// Pure PE-header parser over an in-memory image (unit-testable without a
@@ -130,14 +140,15 @@ pub fn parse_pe(data: &[u8]) -> Result<PeInfo, String> {
     let file_header = pe_offset + 4;
     let machine = read_u16(data, file_header)?;
     let size_of_optional = read_u16(data, file_header + 16)? as usize;
-    if size_of_optional < 2 {
-        return Err("PE optional header missing".to_string());
+    if size_of_optional < 70 {
+        return Err("PE optional header is too short for the subsystem field".to_string());
     }
     let optional_header = file_header + 20;
-    if optional_header + 2 > data.len() {
+    if optional_header + size_of_optional > data.len() {
         return Err("PE optional header out of range".to_string());
     }
     let optional_magic = read_u16(data, optional_header)?;
+    let subsystem = read_u16(data, optional_header + 68)?;
 
     let arch = match (machine, optional_magic) {
         (IMAGE_FILE_MACHINE_I386, OPTIONAL_MAGIC_PE32) => Arch::X86,
@@ -152,6 +163,7 @@ pub fn parse_pe(data: &[u8]) -> Result<PeInfo, String> {
     Ok(PeInfo {
         machine,
         optional_magic,
+        subsystem,
         arch,
     })
 }
@@ -189,6 +201,8 @@ mod tests {
         buf[file_header + 16..file_header + 18].copy_from_slice(&0xE0u16.to_le_bytes()); // size of optional
         let optional_header = file_header + 20;
         buf[optional_header..optional_header + 2].copy_from_slice(&optional_magic.to_le_bytes());
+        buf[optional_header + 68..optional_header + 70]
+            .copy_from_slice(&IMAGE_SUBSYSTEM_WINDOWS_CUI.to_le_bytes());
         buf
     }
 
@@ -198,18 +212,21 @@ mod tests {
         assert_eq!(info.arch, Arch::X86);
         assert_eq!(info.machine, IMAGE_FILE_MACHINE_I386);
         assert_eq!(info.optional_magic, OPTIONAL_MAGIC_PE32);
+        assert_eq!(info.subsystem, IMAGE_SUBSYSTEM_WINDOWS_CUI);
     }
 
     #[test]
     fn detects_pe32plus_as_x64() {
         let info = parse_pe(&pe_image(IMAGE_FILE_MACHINE_AMD64, OPTIONAL_MAGIC_PE32PLUS)).unwrap();
         assert_eq!(info.arch, Arch::X64);
+        assert_eq!(info.subsystem, IMAGE_SUBSYSTEM_WINDOWS_CUI);
     }
 
     #[test]
     fn rejects_inconsistent_machine_magic() {
         // I386 machine but PE32+ magic is not a valid PE — must error, not guess.
-        let err = parse_pe(&pe_image(IMAGE_FILE_MACHINE_I386, OPTIONAL_MAGIC_PE32PLUS)).unwrap_err();
+        let err =
+            parse_pe(&pe_image(IMAGE_FILE_MACHINE_I386, OPTIONAL_MAGIC_PE32PLUS)).unwrap_err();
         assert!(err.contains("inconsistent"), "unexpected error: {err}");
         let err = parse_pe(&pe_image(IMAGE_FILE_MACHINE_AMD64, OPTIONAL_MAGIC_PE32)).unwrap_err();
         assert!(err.contains("inconsistent"), "unexpected error: {err}");

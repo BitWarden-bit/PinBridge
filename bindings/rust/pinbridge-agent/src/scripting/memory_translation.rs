@@ -66,7 +66,8 @@ impl NativeRule {
         if info.address < self.source_start || access_end > self.source_end {
             return None;
         }
-        self.target_start.checked_add(info.address - self.source_start)
+        self.target_start
+            .checked_add(info.address - self.source_start)
     }
 }
 
@@ -241,7 +242,10 @@ pub fn publish() -> Result<u64, PbStatus> {
     });
     specs.sort_by(|left, right| left.0.cmp(&right.0));
 
-    let total = specs.iter().map(|(_, spec)| spec.mappings.len()).sum::<usize>();
+    let total = specs
+        .iter()
+        .map(|(_, spec)| spec.mappings.len())
+        .sum::<usize>();
     if total > MAX_MAPPINGS {
         return Err(PB_ERR_INVALID_ARGUMENT);
     }
@@ -261,9 +265,9 @@ pub fn publish() -> Result<u64, PbStatus> {
                     .target_start
                     .checked_add(mapping.source_end - mapping.source_start)
                     .is_none()
-                || occupied.iter().any(|&(start, end)| {
-                    mapping.source_start < end && start < mapping.source_end
-                })
+                || occupied
+                    .iter()
+                    .any(|&(start, end)| mapping.source_start < end && start < mapping.source_end)
             {
                 return Err(PB_ERR_INVALID_ARGUMENT);
             }

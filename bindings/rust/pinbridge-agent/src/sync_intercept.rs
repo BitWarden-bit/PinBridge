@@ -40,9 +40,14 @@ const CANCELLED: u32 = 5;
 struct HookInterest {
     address: u64,
     kind: u32,
+    /// Exact thread id, or u64::MAX for an all-thread subscription.
+    thread_filter: u64,
 }
 
 static HOOK_INTERESTS: AtomicPtr<Vec<HookInterest>> = AtomicPtr::new(core::ptr::null_mut());
+static HOOK_INTEREST_COUNT: AtomicUsize = AtomicUsize::new(0);
+static HOOK_INTEREST_READERS: AtomicUsize = AtomicUsize::new(0);
+static RETIRED_HOOK_INTERESTS: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
 static RETIRED_INTERESTS: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
 static SYSCALL_ENTRY_ALL: AtomicU32 = AtomicU32::new(0);
 static SYSCALL_EXIT_ALL: AtomicU32 = AtomicU32::new(0);
@@ -199,41 +204,126 @@ pub fn init() -> PbStatus {
     PB_OK
 }
 
-/// Replaces the lock-free Hook interest table. Called only on the scripting
-/// thread after its registry changes. Retired snapshots stay allocated: an
-/// analysis callback may have loaded the old pointer before being suspended.
-pub fn publish_hook_interests(interests: &[(u64, bool)]) {
+/// Replaces the sorted lock-free Hook interest table. Native hits perform at
+/// most two O(log n) lookups -- exact TID and all-thread wildcard -- before
+/// reserving a Python rendezvous. A thread-scoped callback therefore never
+/// parks unrelated application threads merely to reject them in Python.
+pub fn publish_hook_interests(interests: &[(u64, bool, Option<u32>)]) {
     let mut snapshot: Vec<HookInterest> = interests
         .iter()
-        .filter(|(address, _)| *address != 0)
-        .map(|(address, is_return)| HookInterest {
+        .filter(|(address, _, _)| *address != 0)
+        .map(|(address, is_return, thread_id)| HookInterest {
             address: *address,
             kind: if *is_return { HOOK_RETURN } else { HOOK_ENTRY },
+            thread_filter: thread_id.map(u64::from).unwrap_or(u64::MAX),
         })
         .collect();
-    snapshot.sort_unstable_by_key(|interest| (interest.address, interest.kind));
-    snapshot.dedup_by_key(|interest| (interest.address, interest.kind));
+    snapshot
+        .sort_unstable_by_key(|interest| (interest.address, interest.kind, interest.thread_filter));
+    snapshot.dedup_by_key(|interest| (interest.address, interest.kind, interest.thread_filter));
+    let mut next_kinds = snapshot
+        .iter()
+        .map(|interest| (interest.address, interest.kind))
+        .collect::<Vec<_>>();
+    next_kinds.sort_unstable();
+    next_kinds.dedup();
+
+    let previous = HOOK_INTERESTS.load(Ordering::Acquire);
+    let mut previous_kinds = if previous.is_null() {
+        Vec::new()
+    } else {
+        unsafe { &*previous }
+            .iter()
+            .map(|interest| (interest.address, interest.kind))
+            .collect::<Vec<_>>()
+    };
+    previous_kinds.sort_unstable();
+    previous_kinds.dedup();
+    // Upgrades must be immediate so a callback never hits a passive monitor.
+    // Downgrades are deliberately lazy: publish_interests can run inside the
+    // synchronous callback (for `once=True`), where Pin range invalidation
+    // would race the callback's ExecuteAt replay and process-exit probes. The
+    // native route is disabled now; removing/rearming the Hook naturally
+    // restores the lightweight monitor primitive.
+    let changed = next_kinds
+        .iter()
+        .filter(|kind| previous_kinds.binary_search(kind).is_err())
+        .map(|(address, kind)| (*address, *kind == HOOK_RETURN))
+        .collect::<Vec<_>>();
+
+    let count = snapshot.len();
     let replacement = Box::into_raw(Box::new(snapshot));
     let old = HOOK_INTERESTS.swap(replacement, Ordering::AcqRel);
+    HOOK_INTEREST_COUNT.store(count, Ordering::Release);
     if !old.is_null() {
-        RETIRED_INTERESTS
+        let mut retired = RETIRED_HOOK_INTERESTS
             .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .push(old as usize);
+            .unwrap_or_else(|error| error.into_inner());
+        retired.push(old as usize);
+        if HOOK_INTEREST_READERS.load(Ordering::SeqCst) == 0 {
+            for address in retired.drain(..) {
+                unsafe { drop(Box::from_raw(address as *mut Vec<HookInterest>)) };
+            }
+        }
+    }
+    crate::hooks::refresh_callback_instrumentation(&changed);
+}
+
+struct HookInterestReadGuard;
+
+impl HookInterestReadGuard {
+    #[inline]
+    fn new() -> Self {
+        HOOK_INTEREST_READERS.fetch_add(1, Ordering::SeqCst);
+        Self
+    }
+}
+
+impl Drop for HookInterestReadGuard {
+    #[inline]
+    fn drop(&mut self) {
+        HOOK_INTEREST_READERS.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
 #[inline]
-fn hook_interested(address: u64, kind: u32) -> bool {
+fn hook_interested(address: u64, kind: u32, thread_id: u32) -> bool {
+    if HOOK_INTEREST_COUNT.load(Ordering::Acquire) == 0 {
+        return false;
+    }
+    let _read_guard = HookInterestReadGuard::new();
     let snapshot = HOOK_INTERESTS.load(Ordering::Acquire);
     if snapshot.is_null() {
         return false;
     }
-    unsafe { &*snapshot }
-        .binary_search_by_key(&(address, kind), |interest| {
-            (interest.address, interest.kind)
-        })
-        .is_ok()
+    let snapshot = unsafe { &*snapshot };
+    let matches = |thread_filter| {
+        snapshot
+            .binary_search_by_key(&(address, kind, thread_filter), |interest| {
+                (interest.address, interest.kind, interest.thread_filter)
+            })
+            .is_ok()
+    };
+    matches(u64::from(thread_id)) || matches(u64::MAX)
+}
+
+/// Instrumentation-time classification. Thread filters do not affect which
+/// capture primitive is emitted; they are applied later on an actual hit.
+#[inline]
+pub fn hook_callback_interested(address: u64, is_return: bool) -> bool {
+    if HOOK_INTEREST_COUNT.load(Ordering::Acquire) == 0 {
+        return false;
+    }
+    let kind = if is_return { HOOK_RETURN } else { HOOK_ENTRY };
+    let _read_guard = HookInterestReadGuard::new();
+    let snapshot = HOOK_INTERESTS.load(Ordering::Acquire);
+    if snapshot.is_null() {
+        return false;
+    }
+    let snapshot = unsafe { &*snapshot };
+    let index =
+        snapshot.partition_point(|interest| (interest.address, interest.kind) < (address, kind));
+    index < snapshot.len() && snapshot[index].address == address && snapshot[index].kind == kind
 }
 
 fn publish_numbers(target: &AtomicPtr<Vec<u32>>, numbers: &[u32]) {
@@ -344,10 +434,8 @@ unsafe fn capture_hook(
         exception_reason: 0,
         exception_code: 0,
     };
-    request.register_mask = capture_registers(
-        context as PbConstContextHandle,
-        &mut request.registers,
-    );
+    request.register_mask =
+        capture_registers(context as PbConstContextHandle, &mut request.registers);
     request
 }
 
@@ -419,7 +507,11 @@ pub unsafe fn decide_hook(
     stack_arguments: [u64; MAX_STACK_ARGUMENTS],
 ) -> Option<InterceptResponse> {
     let kind = if is_return { HOOK_RETURN } else { HOOK_ENTRY };
-    if context.is_null() || !crate::scripting::python_ready() || !hook_interested(address, kind) {
+    if HOOK_INTEREST_COUNT.load(Ordering::Acquire) == 0
+        || context.is_null()
+        || !crate::scripting::python_ready()
+        || !hook_interested(address, kind, thread_id)
+    {
         return None;
     }
     rendezvous(capture_hook(
@@ -441,10 +533,7 @@ pub unsafe fn decide_syscall(
     return_value: u64,
     errno: u64,
 ) -> Option<InterceptResponse> {
-    if context.is_null()
-        || !crate::scripting::python_ready()
-        || !syscall_interested(kind, number)
-    {
+    if context.is_null() || !crate::scripting::python_ready() || !syscall_interested(kind, number) {
         return None;
     }
     let mut request = NativeRequest {
@@ -530,8 +619,7 @@ pub unsafe fn decide_exception(
         exception_code: code,
     };
     request.source_register_mask = capture_registers(from, &mut request.source_registers);
-    request.register_mask =
-        capture_registers(to as PbConstContextHandle, &mut request.registers);
+    request.register_mask = capture_registers(to as PbConstContextHandle, &mut request.registers);
     if let Some(index) = crate::arch::gp_registers()
         .iter()
         .position(|(_, register)| *register == crate::arch::instr_ptr_reg())
@@ -543,10 +631,7 @@ pub unsafe fn decide_exception(
     rendezvous(request)
 }
 
-pub unsafe fn apply_exception_response(
-    to: PbContextHandle,
-    response: &InterceptResponse,
-) {
+pub unsafe fn apply_exception_response(to: PbContextHandle, response: &InterceptResponse) {
     for (index, (_, register)) in crate::arch::gp_registers().iter().enumerate() {
         if response.register_mask & (1u32 << index) != 0 {
             let _ = pb_pin_set_context_reg(to, *register, response.registers[index]);
@@ -586,10 +671,8 @@ pub unsafe fn decide_debugger(
         exception_reason: 0,
         exception_code: 0,
     };
-    request.register_mask = capture_registers(
-        context as PbConstContextHandle,
-        &mut request.registers,
-    );
+    request.register_mask =
+        capture_registers(context as PbConstContextHandle, &mut request.registers);
     if let Some(index) = crate::arch::gp_registers()
         .iter()
         .position(|(_, register)| *register == crate::arch::instr_ptr_reg())
@@ -610,8 +693,7 @@ pub unsafe fn apply_debugger_response(
     event: PbDebuggingEvent,
     response: &InterceptResponse,
 ) -> bool {
-    let mut pass_to_debugger = !response.debugger_pass_set
-        || response.debugger_pass_to_debugger;
+    let mut pass_to_debugger = !response.debugger_pass_set || response.debugger_pass_to_debugger;
     if event == PB_DEBUGGING_EVENT_ASYNC_BREAK {
         pass_to_debugger = true;
     }
@@ -788,4 +870,31 @@ pub fn stats() -> (u64, u64, u64) {
         TIMEOUTS.load(Ordering::Relaxed),
         BUSY.load(Ordering::Relaxed),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hook_interest_rejects_wrong_address_kind_and_thread() {
+        publish_hook_interests(&[
+            (0x1000, false, None),
+            (0x2000, true, Some(7)),
+            (0x3000, false, Some(9)),
+        ]);
+
+        assert!(hook_interested(0x1000, HOOK_ENTRY, 1));
+        assert!(hook_interested(0x1000, HOOK_ENTRY, 999));
+        assert!(!hook_interested(0x1000, HOOK_RETURN, 1));
+        assert!(hook_interested(0x2000, HOOK_RETURN, 7));
+        assert!(!hook_interested(0x2000, HOOK_RETURN, 8));
+        assert!(!hook_interested(0x3001, HOOK_ENTRY, 9));
+        assert!(hook_callback_interested(0x1000, false));
+        assert!(hook_callback_interested(0x2000, true));
+        assert!(!hook_callback_interested(0x2000, false));
+        assert!(!hook_callback_interested(0x3001, false));
+
+        publish_hook_interests(&[]);
+    }
 }

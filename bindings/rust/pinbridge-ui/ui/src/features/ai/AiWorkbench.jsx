@@ -4,7 +4,7 @@ import { useT } from "../../i18n";
 
 const ACTIVITY_TYPES = [
   "operation", "breakpoint_set", "breakpoint_hit", "hook_set", "hook_hit",
-  "script_inject", "script_replace", "script_error", "context_read", "context_write",
+  "script_inject", "script_replace", "script_start", "script_stop", "script_remove", "script_error", "context_read", "context_write",
   "memory_read", "memory_write", "target_pause", "target_resume",
 ];
 

@@ -79,22 +79,41 @@ fn event_line(event: &proto::EventRecord) -> String {
     match event.kind {
         1 => format!(
             "#{:<9} {:<11} tid={:<3} ip=0x{:x} rcx=0x{:x} rdx=0x{:x} r8=0x{:x} r9=0x{:x}",
-            event.sequence, kind_name(event.kind), event.thread_id, event.address,
-            event.arg0, event.arg1, event.arg2, event.arg3
+            event.sequence,
+            kind_name(event.kind),
+            event.thread_id,
+            event.address,
+            event.arg0,
+            event.arg1,
+            event.arg2,
+            event.arg3
         ),
         2 => format!(
             "#{:<9} {:<11} tid={:<3} ip=0x{:x} ea=0x{:x} size={} access={}",
-            event.sequence, kind_name(event.kind), event.thread_id, event.address,
-            event.arg0, event.arg1, event.arg2
+            event.sequence,
+            kind_name(event.kind),
+            event.thread_id,
+            event.address,
+            event.arg0,
+            event.arg1,
+            event.arg2
         ),
         4 => format!(
             "#{:<9} {:<11} tid={:<3} ip=0x{:x} target=0x{:x} taken={}",
-            event.sequence, kind_name(event.kind), event.thread_id, event.address,
-            event.arg0, event.arg1
+            event.sequence,
+            kind_name(event.kind),
+            event.thread_id,
+            event.address,
+            event.arg0,
+            event.arg1
         ),
         _ => format!(
             "#{:<9} {:<11} tid={:<3} ip=0x{:x} size={}",
-            event.sequence, kind_name(event.kind), event.thread_id, event.address, event.arg0
+            event.sequence,
+            kind_name(event.kind),
+            event.thread_id,
+            event.address,
+            event.arg0
         ),
     }
 }
@@ -130,11 +149,20 @@ pub fn draw(frame: &mut Frame, state: &UiState) {
     } else {
         Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
     };
-    frame.render_widget(Paragraph::new(title).style(style).block(Block::default().borders(Borders::ALL)), chunks[0]);
+    frame.render_widget(
+        Paragraph::new(title)
+            .style(style)
+            .block(Block::default().borders(Borders::ALL)),
+        chunks[0],
+    );
 
     let rate: u64 = state.rate_history.last().copied().unwrap_or(0);
     let spark = Sparkline::default()
-        .block(Block::default().borders(Borders::ALL).title(format!("events/s (now {rate})")))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(format!("events/s (now {rate})")),
+        )
         .data(&state.rate_history)
         .style(Style::default().fg(Color::Cyan));
     frame.render_widget(spark, chunks[1]);
@@ -161,8 +189,11 @@ pub fn draw(frame: &mut Frame, state: &UiState) {
     let rows: Vec<Row> = std::iter::once(Row::new(vec![counter_line]))
         .chain(snap.newest.iter().map(|e| Row::new(vec![event_line(e)])))
         .collect();
-    let table = Table::new(rows, [Constraint::Min(60)])
-        .block(Block::default().borders(Borders::ALL).title("newest events"));
+    let table = Table::new(rows, [Constraint::Min(60)]).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title("newest events"),
+    );
     frame.render_stateful_widget(table, bottom[0], &mut TableState::default());
 
     let plugins_title = match &state.plugins_summary {
@@ -178,8 +209,8 @@ pub fn draw(frame: &mut Frame, state: &UiState) {
         .skip(skip)
         .map(|line| Line::from(line.clone()))
         .collect();
-    let plugins = Paragraph::new(lines)
-        .block(Block::default().borders(Borders::ALL).title(plugins_title));
+    let plugins =
+        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(plugins_title));
     frame.render_widget(plugins, bottom[1]);
 }
 
@@ -230,7 +261,10 @@ mod tests {
         assert!(text.contains("branch_edge"), "missing event row");
         assert!(text.contains("0x7ffbd135dd3c"), "missing address");
         assert!(text.contains("Plugins"), "missing plugins panel");
-        assert!(text.contains("oep.py(running,deliv 123)"), "missing summary");
+        assert!(
+            text.contains("oep.py(running,deliv 123)"),
+            "missing summary"
+        );
         assert!(text.contains("plugin-marker-7f3a"), "missing log line");
     }
 
@@ -264,7 +298,9 @@ mod tests {
             plugins_summary: None,
         };
         state.push_plugin_lines(
-            (0..PLUGIN_LINE_CAP + 10).map(|i| format!("line {i}")).collect(),
+            (0..PLUGIN_LINE_CAP + 10)
+                .map(|i| format!("line {i}"))
+                .collect(),
         );
         assert_eq!(state.plugin_lines.len(), PLUGIN_LINE_CAP);
         assert_eq!(state.plugin_lines.front().unwrap(), "line 10");
@@ -275,8 +311,18 @@ mod tests {
     #[test]
     fn summary_formats_entries() {
         let entries = vec![
-            ScriptListEntry { name: "a.py".to_string(), state: 1, delivered: 123, dropped: 0 },
-            ScriptListEntry { name: "b.py".to_string(), state: 2, delivered: 0, dropped: 5 },
+            ScriptListEntry {
+                name: "a.py".to_string(),
+                state: 1,
+                delivered: 123,
+                dropped: 0,
+            },
+            ScriptListEntry {
+                name: "b.py".to_string(),
+                state: 2,
+                delivered: 0,
+                dropped: 5,
+            },
         ];
         assert_eq!(
             plugin_summary(&entries),

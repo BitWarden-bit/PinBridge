@@ -33,6 +33,8 @@ PbStatus PB_CALL name(PbInsHandle ins, callback_type callback, void* user_data) 
 
 PB_INS_CAPTURE_WRAPPER(pb_ins_insert_capture_regs, PbInsCaptureRegsCallback,
                        PbBackendInsInsertCaptureRegs)
+PB_INS_CAPTURE_WRAPPER(pb_ins_insert_hook_monitor, PbInsHookMonitorCallback,
+                       PbBackendInsInsertHookMonitor)
 PB_INS_CAPTURE_WRAPPER(pb_ins_insert_capture_regs_ctx,
                        PbInsContextCaptureRegsCallback,
                        PbBackendInsInsertCaptureRegsCtx)

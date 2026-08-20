@@ -40,8 +40,8 @@ fn main() {
     let state = ui::UiState {
         snapshot,
         rate_history: vec![
-            2_100_000, 3_400_000, 4_800_000, 5_400_000, 5_100_000, 5_500_000, 5_400_000,
-            5_600_000, 5_450_000, 5_500_000,
+            2_100_000, 3_400_000, 4_800_000, 5_400_000, 5_100_000, 5_500_000, 5_400_000, 5_600_000,
+            5_450_000, 5_500_000,
         ],
         plugin_lines: std::collections::VecDeque::from(vec![
             "oep.py: iat scan complete, 312 thunks fixed".to_string(),

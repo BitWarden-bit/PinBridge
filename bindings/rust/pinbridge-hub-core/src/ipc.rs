@@ -10,8 +10,11 @@ use std::sync::{
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-pub const MAX_FRAME_BYTES: usize = 2 * 1024 * 1024;
-pub const MAX_REQUEST_BYTES: usize = MAX_FRAME_BYTES;
+/// Detailed 32k Hook inventories can exceed 2 MiB after symbol and callback
+/// metadata are serialized. Responses may use the larger authenticated IPC
+/// frame, while client requests remain bounded at the original 2 MiB.
+pub const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_REQUEST_BYTES: usize = 2 * 1024 * 1024;
 pub const MIN_SECRET_BYTES: usize = 16;
 pub const MAX_SECRET_BYTES: usize = 4096;
 pub const MAX_CONNECTIONS: usize = 32;
@@ -98,26 +101,36 @@ fn constant_eq(a: &str, b: &str) -> bool {
             .fold(0u8, |d, (x, y)| d | (x ^ y))
             == 0
 }
-pub fn read_frame<R: Read>(r: &mut R) -> Result<Value, IpcError> {
+fn read_frame_with_limit<R: Read>(r: &mut R, limit: usize) -> Result<Value, IpcError> {
     let mut len = [0u8; 4];
     r.read_exact(&mut len)?;
     let n = u32::from_le_bytes(len) as usize;
-    if n == 0 || n > MAX_FRAME_BYTES {
+    if n == 0 || n > limit {
         return Err(IpcError::FrameTooLarge);
     }
     let mut b = vec![0; n];
     r.read_exact(&mut b)?;
     serde_json::from_slice(&b).map_err(|e| IpcError::InvalidFrame(e.to_string()))
 }
-pub fn write_frame<W: Write>(w: &mut W, value: &Value) -> Result<(), IpcError> {
+pub fn read_frame<R: Read>(r: &mut R) -> Result<Value, IpcError> {
+    read_frame_with_limit(r, MAX_FRAME_BYTES)
+}
+fn write_frame_with_limit<W: Write>(
+    w: &mut W,
+    value: &Value,
+    limit: usize,
+) -> Result<(), IpcError> {
     let b = serde_json::to_vec(value).map_err(|e| IpcError::InvalidFrame(e.to_string()))?;
-    if b.len() > MAX_FRAME_BYTES {
+    if b.len() > limit {
         return Err(IpcError::FrameTooLarge);
     }
     w.write_all(&(b.len() as u32).to_le_bytes())?;
     w.write_all(&b)?;
     w.flush()?;
     Ok(())
+}
+pub fn write_frame<W: Write>(w: &mut W, value: &Value) -> Result<(), IpcError> {
+    write_frame_with_limit(w, value, MAX_FRAME_BYTES)
 }
 pub struct IpcClient {
     stream: TcpStream,
@@ -127,12 +140,20 @@ impl IpcClient {
         let mut stream = TcpStream::connect(addr)?;
         stream.set_read_timeout(Some(Duration::from_secs(30)))?;
         stream.set_write_timeout(Some(Duration::from_secs(30)))?;
-        write_frame(&mut stream, &serde_json::to_value(hello).unwrap())?;
+        write_frame_with_limit(
+            &mut stream,
+            &serde_json::to_value(hello).unwrap(),
+            MAX_REQUEST_BYTES,
+        )?;
         Ok(Self { stream })
     }
     pub fn call(&mut self, request: IpcRequest) -> Result<IpcResponse, IpcError> {
         let request_id = request.id.clone();
-        write_frame(&mut self.stream, &serde_json::to_value(request).unwrap())?;
+        write_frame_with_limit(
+            &mut self.stream,
+            &serde_json::to_value(request).unwrap(),
+            MAX_REQUEST_BYTES,
+        )?;
         let v = read_frame(&mut self.stream)?;
         let response: IpcResponse =
             serde_json::from_value(v).map_err(|e| IpcError::InvalidFrame(e.to_string()))?;
@@ -227,7 +248,7 @@ fn serve_connection<F>(mut stream: TcpStream, human: &str, ai: &str, handler: Ar
 where
     F: Fn(Caller, IpcRequest) -> IpcResponse + Send + Sync + 'static,
 {
-    let hello = match read_frame(&mut stream).and_then(|v| {
+    let hello = match read_frame_with_limit(&mut stream, MAX_REQUEST_BYTES).and_then(|v| {
         serde_json::from_value::<IpcHello>(v).map_err(|e| IpcError::InvalidFrame(e.to_string()))
     }) {
         Ok(v) => v,
@@ -238,7 +259,7 @@ where
         Err(_) => return,
     };
     loop {
-        let request = match read_frame(&mut stream).and_then(|v| {
+        let request = match read_frame_with_limit(&mut stream, MAX_REQUEST_BYTES).and_then(|v| {
             serde_json::from_value::<IpcRequest>(v)
                 .map_err(|e| IpcError::InvalidFrame(e.to_string()))
         }) {
@@ -281,6 +302,15 @@ mod tests {
             read_frame(&mut std::io::Cursor::new(v)),
             Err(IpcError::FrameTooLarge)
         ));
+        let oversized_request = serde_json::json!("x".repeat(MAX_REQUEST_BYTES + 1));
+        let mut request_buffer = Vec::new();
+        assert!(matches!(
+            write_frame_with_limit(&mut request_buffer, &oversized_request, MAX_REQUEST_BYTES),
+            Err(IpcError::FrameTooLarge)
+        ));
+        let large_response = serde_json::json!("x".repeat(MAX_REQUEST_BYTES + 1));
+        let mut response_buffer = Vec::new();
+        assert!(write_frame(&mut response_buffer, &large_response).is_ok());
     }
     #[test]
     fn weak_or_equal_secrets_are_rejected() {

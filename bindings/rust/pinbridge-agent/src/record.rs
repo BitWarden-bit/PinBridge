@@ -44,12 +44,11 @@
 //!   no separate entry_context blob is required.
 
 use crate::event::{
-    Event, EVENT_BRANCH_EDGE, EVENT_CONTEXT_CHANGE, EVENT_EXEC, EVENT_EXEC_BYTES,
-    EVENT_MARKER, EVENT_MEMORY, EVENT_MEM_VALUE, EVENT_REG_SNAPSHOT, EVENT_REPEAT,
-    EVENT_SYSCALL,
+    Event, EVENT_BRANCH_EDGE, EVENT_CONTEXT_CHANGE, EVENT_EXEC, EVENT_EXEC_BYTES, EVENT_MARKER,
+    EVENT_MEMORY, EVENT_MEM_VALUE, EVENT_REG_SNAPSHOT, EVENT_REPEAT, EVENT_SYSCALL,
 };
 use core::ffi::c_void;
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicPtr, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use pinbridge_sys::*;
 use std::io::Write;
 
@@ -94,8 +93,7 @@ impl ContextSlot {
     }
 }
 
-static CONTEXT_STATE: [ContextSlot; CONTEXT_SLOTS] =
-    [const { ContextSlot::new() }; CONTEXT_SLOTS];
+static CONTEXT_STATE: [ContextSlot; CONTEXT_SLOTS] = [const { ContextSlot::new() }; CONTEXT_SLOTS];
 
 /// Register id for a wire slot. The front GP slots follow
 /// `crate::arch::gp_registers()` so an ia32 build emits eax/.../eip/eflags
@@ -412,10 +410,7 @@ pub unsafe extern "C" fn on_rec_exec(
 /// Components share arg7 so readers can assemble them into one logical frame.
 /// This is deliberately opt-in: a full GP + vector-register snapshot is
 /// information rich but much more expensive than instruction/memory alone.
-pub unsafe extern "C" fn on_rec_registers(
-    context: PbContextHandle,
-    _user_data: *mut c_void,
-) {
+pub unsafe extern "C" fn on_rec_registers(context: PbContextHandle, _user_data: *mut c_void) {
     if context.is_null() {
         return;
     }
@@ -430,7 +425,9 @@ pub unsafe extern "C" fn on_rec_registers(
     {
         return;
     }
-    let frame = CONTEXT_FRAME.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+    let frame = CONTEXT_FRAME
+        .fetch_add(1, Ordering::Relaxed)
+        .wrapping_add(1);
     let mut values = [[0u64; CONTEXT_CHUNKS]; CONTEXT_REG_COUNT];
     let mut available = [false; CONTEXT_REG_COUNT];
     for index in 0..CONTEXT_REG_COUNT {
@@ -458,9 +455,8 @@ pub unsafe extern "C" fn on_rec_registers(
             {
                 for chunk in 0..(width / 8) {
                     let start = chunk * 8;
-                    values[index][chunk] = u64::from_le_bytes(
-                        bytes[start..start + 8].try_into().unwrap(),
-                    );
+                    values[index][chunk] =
+                        u64::from_le_bytes(bytes[start..start + 8].try_into().unwrap());
                 }
                 available[index] = true;
             }
@@ -468,7 +464,9 @@ pub unsafe extern "C" fn on_rec_registers(
     }
 
     let slot = context_slot(tid as u32);
-    let baseline = slot.map(|state| !state.valid.load(Ordering::Acquire)).unwrap_or(true);
+    let baseline = slot
+        .map(|state| !state.valid.load(Ordering::Acquire))
+        .unwrap_or(true);
     let mut mask_lo = 0u64;
     let mut mask_hi = 0u64;
     for index in 0..CONTEXT_REG_COUNT {
@@ -478,8 +476,7 @@ pub unsafe extern "C" fn on_rec_registers(
         let changed = baseline
             || slot.is_none()
             || (0..(context_width(index) / 8)).any(|chunk| {
-                slot.unwrap().values[index * CONTEXT_CHUNKS + chunk]
-                    .load(Ordering::Relaxed)
+                slot.unwrap().values[index * CONTEXT_CHUNKS + chunk].load(Ordering::Relaxed)
                     != values[index][chunk]
             });
         if changed {
@@ -780,7 +777,11 @@ pub fn start_spec(
     reset_context_state();
     unsafe {
         let slab = &*SLAB.load(Ordering::Acquire);
-        core::ptr::write_bytes(slab.tags.as_ptr() as *mut u8, 0, SLAB_CAP.load(Ordering::Relaxed) * 8);
+        core::ptr::write_bytes(
+            slab.tags.as_ptr() as *mut u8,
+            0,
+            SLAB_CAP.load(Ordering::Relaxed) * 8,
+        );
     }
     let (lo, hi) = ranges.iter().fold((u64::MAX, 0), |(lo0, hi0), (lo1, hi1)| {
         (lo0.min(*lo1), hi0.max(*hi1))
@@ -927,8 +928,7 @@ pub fn extend_ranges(ranges: Vec<(u64, u64)>) -> Result<(), String> {
     }
     crate::log::line(&format!(
         "trace extend ranges={} live_ranges={}",
-        new_count,
-        new_count
+        new_count, new_count
     ));
     Ok(())
 }
@@ -983,11 +983,7 @@ fn main_module_name() -> String {
                     let full = std::ffi::CStr::from_ptr(buf.as_ptr())
                         .to_string_lossy()
                         .into_owned();
-                    return full
-                        .rsplit(['\\', '/'])
-                        .next()
-                        .unwrap_or(&full)
-                        .to_string();
+                    return full.rsplit(['\\', '/']).next().unwrap_or(&full).to_string();
                 }
                 return String::new();
             }
@@ -1245,7 +1241,10 @@ unsafe extern "C" fn drain_main(argument: *mut c_void) {
     scratch.clear();
     scratch.reserve(pinbridge_proto::EVENT_WIRE_LEN);
 
-    write_record(&mut scratch, &marker(0, MARKER_START, args.kinds_mask as u64));
+    write_record(
+        &mut scratch,
+        &marker(0, MARKER_START, args.kinds_mask as u64),
+    );
     if writer.write_all(&scratch).is_err() {
         fail_drain("trace record: start marker write failed");
         return;
@@ -1261,9 +1260,8 @@ unsafe extern "C" fn drain_main(argument: *mut c_void) {
             let slot = (next % cap as u64) as usize;
             let tag = &*(slab.tags.as_ptr().add(slot) as *const AtomicU64);
             if tag.load(Ordering::Acquire) == next + 1 {
-                let event = core::ptr::read(
-                    slab.payloads.as_ptr().add(slot * SLOT_WORDS) as *const Event
-                );
+                let event =
+                    core::ptr::read(slab.payloads.as_ptr().add(slot * SLOT_WORDS) as *const Event);
                 match pending.take() {
                     Some(previous) => {
                         let expected = previous
@@ -1274,7 +1272,9 @@ unsafe extern "C" fn drain_main(argument: *mut c_void) {
                             pending = Some(previous);
                             pending_repeats = pending_repeats.saturating_add(1);
                         } else {
-                            if flush_run(&mut writer, &mut scratch, &previous, pending_repeats).is_err() {
+                            if flush_run(&mut writer, &mut scratch, &previous, pending_repeats)
+                                .is_err()
+                            {
                                 crate::log::line("trace record: file write failed, stopping drain");
                                 io_failed = true;
                                 ARMED.store(false, Ordering::Release);
@@ -1297,9 +1297,7 @@ unsafe extern "C" fn drain_main(argument: *mut c_void) {
                 // Every reserved claim has a live producer. Once all producers
                 // have left, a missing tag is an invariant failure rather than
                 // a normal overflow condition.
-                if !ARMED.load(Ordering::Acquire)
-                    && IN_FLIGHT.load(Ordering::Acquire) == 0
-                {
+                if !ARMED.load(Ordering::Acquire) && IN_FLIGHT.load(Ordering::Acquire) == 0 {
                     crate::log::line("trace record: unpublished reserved slot; marking incomplete");
                     FAILED.store(true, Ordering::Release);
                     DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -1309,9 +1307,7 @@ unsafe extern "C" fn drain_main(argument: *mut c_void) {
                     pb_pin_sleep(1);
                 }
             }
-        } else if !ARMED.load(Ordering::Acquire)
-            && IN_FLIGHT.load(Ordering::Acquire) == 0
-        {
+        } else if !ARMED.load(Ordering::Acquire) && IN_FLIGHT.load(Ordering::Acquire) == 0 {
             break; // stopped and caught up
         } else {
             pb_pin_sleep(1);

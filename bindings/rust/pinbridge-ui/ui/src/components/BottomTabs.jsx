@@ -4,26 +4,29 @@ import { getSnapshot, subscribe } from "../store";
 import { useT } from "../i18n";
 import { resolveInto } from "../resolve";
 import { addAddress, normalizeAddress } from "../address";
+import { ModulesTab } from "./MemoryLayoutTabs";
 
-export default function BottomTabs({ tid, stopTick, onGoto }) {
+export default function BottomTabs({ tid, stopTick, onGoto, tabs }) {
   const t = useT();
-  const [tab, setTab] = useState("events");
-  const tabs = [["mem", t("memory")], ["stack", t("stack")], ["bps", t("breakpoints")], ["mods", t("modules")], ["events", t("events")]];
+  const all = [["mem", t("memory")], ["stack", t("stack")], ["mods", t("modules")], ["bps", t("breakpoints")], ["events", t("events")]];
+  const visible = tabs ? all.filter(([key]) => tabs.includes(key)) : all;
+  const [tab, setTab] = useState(visible[0][0]);
+  const current = visible.some(([key]) => key === tab) ? tab : visible[0][0];
   return (
     <div id="bottom">
       <div id="tabs">
-        {tabs.map(([key, label]) => (
-          <div key={key} className={"tab" + (tab === key ? " active" : "")} onClick={() => setTab(key)}>
+        {visible.map(([key, label]) => (
+          <div key={key} className={"tab" + (current === key ? " active" : "")} onClick={() => setTab(key)}>
             {label}
           </div>
         ))}
       </div>
       <div id="tabbody">
-        {tab === "mem" && <MemoryTab />}
-        {tab === "stack" && <StackTab tid={tid} stopTick={stopTick} onGoto={onGoto} />}
-        {tab === "bps" && <BpsTab />}
-        {tab === "mods" && <ModsTab onGoto={onGoto} />}
-        {tab === "events" && <EventsTab />}
+        {current === "mem" && <MemoryTab />}
+        {current === "stack" && <StackTab tid={tid} stopTick={stopTick} onGoto={onGoto} />}
+        {current === "bps" && <BpsTab />}
+        {current === "mods" && <ModulesTab stopTick={stopTick} onGoto={onGoto} />}
+        {current === "events" && <EventsTab />}
       </div>
     </div>
   );
@@ -144,11 +147,9 @@ function StackTab({ tid, stopTick, onGoto }) {
   };
   useEffect(() => { load(); }, [tid, stopTick]);
   if (tid == null) return <div style={{ color: "var(--dim)" }}>{t("pauseFirst")}</div>;
+  // No manual refresh button: the stack reloads automatically on every stop.
   return (
     <div>
-      <div style={{ marginBottom: 6 }}>
-        <button onClick={load}>{t("read")}</button>
-      </div>
       <table><tbody>
         {rows.map((r) => (
           <tr key={r.addr}>
@@ -183,24 +184,6 @@ function BpsTab() {
       </tbody></table>
       {stopped && <div style={{ marginTop: 6, color: "var(--dim)" }}>{t("stopped")} @ {hitAddr}</div>}
     </div>
-  );
-}
-
-function ModsTab({ onGoto }) {
-  const t = useT();
-  const [mods, setMods] = useState([]);
-  useEffect(() => { api.modules().then((m) => m && setMods(m)); }, []);
-  return (
-    <table><tbody>
-      <tr style={{ color: "var(--dim)" }}><td></td><td>{t("base")}</td><td>{t("end")}</td><td>{t("name")}</td></tr>
-      {mods.map((m) => (
-        <tr key={m.low}>
-          <td>{m.main ? "★" : ""}</td>
-          <td style={{ color: "var(--addr)", cursor: "pointer" }} onClick={() => onGoto(m.low)}>{m.low}</td>
-          <td>{m.high}</td><td>{m.name.split("\\").pop()}</td>
-        </tr>
-      ))}
-    </tbody></table>
   );
 }
 

@@ -10,6 +10,7 @@ pub static STOPPED: AtomicBool = AtomicBool::new(false);
 
 extern "system" {
     fn GetCurrentProcess() -> *mut c_void;
+    fn GetProcessHeaps(count: u32, heaps: *mut *mut c_void) -> u32;
     fn VirtualQuery(
         address: *const c_void,
         buffer: *mut MemoryBasicInformation,
@@ -43,9 +44,32 @@ pub struct MemoryRegion {
     pub base: u64,
     pub size: u64,
     pub allocation_base: u64,
+    pub allocation_protect: u32,
     pub protect: u32,
     pub state: u32,
     pub kind: u32,
+}
+
+pub struct ModuleSection {
+    pub address: u64,
+    pub size: u64,
+    pub kind: u32,
+    pub readable: bool,
+    pub writable: bool,
+    pub executable: bool,
+    pub mapped: bool,
+    pub name: String,
+}
+
+pub struct ModuleLayout {
+    pub low: u64,
+    pub high: u64,
+    pub entry: u64,
+    pub mapped_size: u64,
+    pub image_type: u32,
+    pub is_main: bool,
+    pub name: String,
+    pub sections: Vec<ModuleSection>,
 }
 
 /// Same-process VirtualQuery primitive. Unlike the loopback control request,
@@ -74,10 +98,53 @@ pub fn memory_region(address: u64) -> Option<MemoryRegion> {
         base: info.base_address as u64,
         size: info.region_size as u64,
         allocation_base: info.allocation_base as u64,
+        allocation_protect: info.allocation_protect,
         protect: info.protect,
         state: info.state,
         kind: info.kind,
     })
+}
+
+/// Enumerates the target's real VirtualQuery layout and process heap roots.
+/// Free address-space gaps are walked but omitted from the reply so the UI
+/// receives only committed/reserved allocations. The hard cap prevents a
+/// corrupted or racing VirtualQuery result from producing an unbounded reply.
+pub fn memory_map() -> (Vec<MemoryRegion>, Vec<u64>) {
+    const MEM_FREE: u32 = 0x1_0000;
+    const MAX_REGIONS: usize = 65_536;
+
+    let mut regions = Vec::new();
+    let mut address = 0u64;
+    for _ in 0..MAX_REGIONS {
+        let Some(region) = memory_region(address) else {
+            break;
+        };
+        let Some(next) = region.base.checked_add(region.size) else {
+            break;
+        };
+        if next <= address {
+            break;
+        }
+        if region.state != MEM_FREE {
+            regions.push(region);
+        }
+        address = next;
+    }
+
+    let heap_count = unsafe { GetProcessHeaps(0, core::ptr::null_mut()) };
+    let mut raw_heaps = vec![core::ptr::null_mut(); heap_count as usize];
+    let written = if raw_heaps.is_empty() {
+        0
+    } else {
+        unsafe { GetProcessHeaps(heap_count, raw_heaps.as_mut_ptr()) }.min(heap_count)
+    };
+    let heaps = raw_heaps
+        .into_iter()
+        .take(written as usize)
+        .filter(|heap| !heap.is_null())
+        .map(|heap| heap as u64)
+        .collect();
+    (regions, heaps)
 }
 
 pub fn is_stopped() -> bool {
@@ -140,17 +207,18 @@ pub fn handle_read_mem(payload: &[u8]) -> Result<Vec<u8>, u8> {
 }
 
 /// MEMORY_REGION: [u64 address] -> [u8 found][u64 base][u64 size]
-/// [u64 allocation_base][u32 protect][u32 state][u32 type].
+/// [u64 allocation_base][u32 allocation_protect][u32 protect][u32 state][u32 type].
 pub fn handle_memory_region(payload: &[u8]) -> Result<Vec<u8>, u8> {
     let mut reader = proto::Reader::new(payload);
     let address = reader.u64().ok_or(proto::STATUS_BAD_REQUEST)?;
     let info = memory_region(address);
-    let mut out = Vec::with_capacity(1 + 8 * 3 + 4 * 3);
+    let mut out = Vec::with_capacity(1 + 8 * 3 + 4 * 4);
     out.push(info.is_some() as u8);
     if let Some(info) = info {
         proto::put_u64(&mut out, info.base);
         proto::put_u64(&mut out, info.size);
         proto::put_u64(&mut out, info.allocation_base);
+        proto::put_u32(&mut out, info.allocation_protect);
         proto::put_u32(&mut out, info.protect);
         proto::put_u32(&mut out, info.state);
         proto::put_u32(&mut out, info.kind);
@@ -194,8 +262,9 @@ pub fn handle_write_mem(payload: &[u8]) -> Result<Vec<u8>, u8> {
 }
 
 const MAX_MODULES: usize = 512;
+const MAX_SECTIONS_PER_MODULE: usize = 256;
 
-pub fn modules() -> Vec<(u64, u64, bool, String)> {
+pub fn module_layout() -> Vec<ModuleLayout> {
     let mut entries = Vec::new();
     unsafe {
         let mut img = PbImgHandle { opaque: 0 };
@@ -207,9 +276,15 @@ pub fn modules() -> Vec<(u64, u64, bool, String)> {
         while valid != 0 && entries.len() < MAX_MODULES {
             let mut low: u64 = 0;
             let mut high: u64 = 0;
+            let mut entry: u64 = 0;
+            let mut mapped_size: u64 = 0;
+            let mut image_type: PbImgType = 0;
             let mut is_main: u8 = 0;
             pb_img_low_address(img, &mut low);
             pb_img_high_address(img, &mut high);
+            pb_img_entry_address(img, &mut entry);
+            pb_img_size_mapped(img, &mut mapped_size);
+            pb_img_type(img, &mut image_type);
             pb_img_is_main_executable(img, &mut is_main);
             let mut name_buf = [0 as std::os::raw::c_char; 512];
             let mut needed: u64 = 0;
@@ -220,7 +295,72 @@ pub fn modules() -> Vec<(u64, u64, bool, String)> {
             } else {
                 String::new()
             };
-            entries.push((low, high, is_main != 0, name));
+
+            let mut sections = Vec::new();
+            let mut section = PbSecHandle { opaque: 0 };
+            if pb_img_sec_head(img, &mut section) == PB_OK {
+                let mut section_valid = 0u8;
+                pb_sec_valid(section, &mut section_valid);
+                while section_valid != 0 && sections.len() < MAX_SECTIONS_PER_MODULE {
+                    let mut address = 0u64;
+                    let mut size = 0u64;
+                    let mut kind: PbSecType = 0;
+                    let mut readable = 0u8;
+                    let mut writable = 0u8;
+                    let mut executable = 0u8;
+                    let mut mapped = 0u8;
+                    pb_sec_address(section, &mut address);
+                    pb_sec_size(section, &mut size);
+                    pb_sec_type(section, &mut kind);
+                    pb_sec_is_readable(section, &mut readable);
+                    pb_sec_is_writeable(section, &mut writable);
+                    pb_sec_is_executable(section, &mut executable);
+                    pb_sec_mapped(section, &mut mapped);
+                    let mut section_name_buf = [0 as std::os::raw::c_char; 128];
+                    let mut section_name_needed = 0u64;
+                    let section_name = if pb_sec_name(
+                        section,
+                        section_name_buf.as_mut_ptr(),
+                        section_name_buf.len() as u64,
+                        &mut section_name_needed,
+                    ) == PB_OK
+                    {
+                        std::ffi::CStr::from_ptr(section_name_buf.as_ptr())
+                            .to_string_lossy()
+                            .into_owned()
+                    } else {
+                        String::new()
+                    };
+                    sections.push(ModuleSection {
+                        address,
+                        size,
+                        kind,
+                        readable: readable != 0,
+                        writable: writable != 0,
+                        executable: executable != 0,
+                        mapped: mapped != 0,
+                        name: section_name,
+                    });
+                    let mut next = PbSecHandle { opaque: 0 };
+                    if pb_sec_next(section, &mut next) != PB_OK {
+                        break;
+                    }
+                    section = next;
+                    section_valid = 0;
+                    pb_sec_valid(section, &mut section_valid);
+                }
+            }
+
+            entries.push(ModuleLayout {
+                low,
+                high,
+                entry,
+                mapped_size,
+                image_type,
+                is_main: is_main != 0,
+                name,
+                sections,
+            });
             let mut next = PbImgHandle { opaque: 0 };
             if pb_img_next(img, &mut next) != PB_OK {
                 break;
@@ -231,6 +371,13 @@ pub fn modules() -> Vec<(u64, u64, bool, String)> {
         }
     }
     entries
+}
+
+pub fn modules() -> Vec<(u64, u64, bool, String)> {
+    module_layout()
+        .into_iter()
+        .map(|module| (module.low, module.high, module.is_main, module.name))
+        .collect()
 }
 
 pub fn handle_modules() -> Vec<u8> {
@@ -244,6 +391,56 @@ pub fn handle_modules() -> Vec<u8> {
         let bytes = name.as_bytes();
         proto::put_u32(&mut out, bytes.len() as u32);
         out.extend_from_slice(bytes);
+    }
+    out
+}
+
+pub fn handle_memory_map() -> Vec<u8> {
+    let (regions, heaps) = memory_map();
+    let modules = module_layout();
+    let mut out = Vec::with_capacity(regions.len() * 40 + modules.len() * 128 + 64);
+
+    proto::put_u32(&mut out, regions.len() as u32);
+    for region in regions {
+        proto::put_u64(&mut out, region.base);
+        proto::put_u64(&mut out, region.size);
+        proto::put_u64(&mut out, region.allocation_base);
+        proto::put_u32(&mut out, region.allocation_protect);
+        proto::put_u32(&mut out, region.protect);
+        proto::put_u32(&mut out, region.state);
+        proto::put_u32(&mut out, region.kind);
+    }
+
+    proto::put_u32(&mut out, heaps.len() as u32);
+    for heap in heaps {
+        proto::put_u64(&mut out, heap);
+    }
+
+    proto::put_u32(&mut out, modules.len() as u32);
+    for module in modules {
+        proto::put_u64(&mut out, module.low);
+        proto::put_u64(&mut out, module.high);
+        proto::put_u64(&mut out, module.entry);
+        proto::put_u64(&mut out, module.mapped_size);
+        proto::put_u32(&mut out, module.image_type);
+        out.push(module.is_main as u8);
+        let name = module.name.as_bytes();
+        proto::put_u32(&mut out, name.len() as u32);
+        out.extend_from_slice(name);
+        proto::put_u32(&mut out, module.sections.len() as u32);
+        for section in module.sections {
+            proto::put_u64(&mut out, section.address);
+            proto::put_u64(&mut out, section.size);
+            proto::put_u32(&mut out, section.kind);
+            let flags = (section.readable as u8)
+                | ((section.writable as u8) << 1)
+                | ((section.executable as u8) << 2)
+                | ((section.mapped as u8) << 3);
+            out.push(flags);
+            let name = section.name.as_bytes();
+            proto::put_u32(&mut out, name.len() as u32);
+            out.extend_from_slice(name);
+        }
     }
     out
 }

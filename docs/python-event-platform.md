@@ -38,6 +38,13 @@ Python 是分析平台的控制面：脚本负责注册事件、设置过滤条�
 独立计数暴露。常驻脚本必须按号码收窄；全量订阅在 Python 消费不足时仍会发生明确计数的
 观察环覆盖。
 
+这里的 16384 槽是 Python 命名订阅通道。UI/MCP 的一键函数调用日志另有独立 32768 槽通道：
+入口根据已登记函数签名保存线程及最多 16 个整数/XMM/栈参数，正常返回按声明类型保存
+RAX/EAX 或 XMM0，并统一使用函数入口地址。每条记录还携带 Agent 命中时的 UTC 纳秒时间与
+API/普通指令分类；UI 统一时间线可分页浏览完整保留窗口并配对 API 入口/返回。通用
+instruction/memory 遥测不能覆盖它。生产回调只做固定 TLS 配对和 try-lock POD 写入，不调用
+Python、不分配，也不遍历 Hook 或脚本清单。
+
 ## 断点订阅接口
 
 第一阶段提供以下接口：
@@ -46,6 +53,7 @@ Python 是分析平台的控制面：脚本负责注册事件、设置过滤条�
 breakpoint_id = pb.breakpoint(
     address,
     callback,
+    description="说明为什么设置此断点，以及命中后回调会做什么",
     once=False,
     thread_id=None,
 )
@@ -53,7 +61,9 @@ breakpoint_id = pb.breakpoint(
 pb.breakpoint_remove(breakpoint_id)
 ```
 
-每个插件拥有自己的断点处理函数。多个插件可以订阅同一原生断点地址；底层断点只在最后一个订阅者离开后移除。
+每个插件拥有自己的断点处理函数。`description` 是 1–512 字节的必填单行说明，由 Agent
+强制校验并随回调清单返回给 MCP/UI；它不是可省略的源码注释。多个插件可以订阅同一原生
+断点地址；底层断点只在最后一个订阅者离开后移除。
 
 处理函数接收一个事件字典：
 
@@ -331,8 +341,14 @@ pb.on("hook.return", observe_return, address=return_instruction, once=True)
 原指令执行前取得 Python 返回值时使用：
 
 ```python
-pb.intercept("hook.entry", on_entry, address=entry_address, once=False)
-pb.intercept("hook.return", on_return, address=return_instruction)
+pb.intercept(
+    "hook.entry", on_entry, address=entry_address, once=False,
+    description="检查目标函数入口参数并决定是否接管",
+)
+pb.intercept(
+    "hook.return", on_return, address=return_instruction,
+    description="检查并按策略修改目标函数返回值",
+)
 ```
 
 同步 Hook 使用独立的 16 槽固定 rendezvous，不占用 64 个断点槽。Hook 分析回调复制通用

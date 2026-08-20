@@ -11,8 +11,12 @@
     "windows": [
       {
         "title": "PinBridge",
-        "width": 1180,
-        "height": 760
+        "width": 1360,
+        "height": 840,
+        "minWidth": 1180,
+        "minHeight": 720,
+        "center": true,
+        "resizable": true
       }
     ]
   },

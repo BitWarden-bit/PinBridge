@@ -45,7 +45,8 @@ pub(super) fn dispatch() {
             .as_ref()
             .and_then(|listener| listener.local_addr().ok())
             .map(|address| address.port());
-        let parent_control_port = super::super::RPC_PORT.load(core::sync::atomic::Ordering::Acquire);
+        let parent_control_port =
+            super::super::RPC_PORT.load(core::sync::atomic::Ordering::Acquire);
         let mut handlers = with_registry(|registry| {
             let mut handlers = Vec::new();
             for (name, plugin) in registry {

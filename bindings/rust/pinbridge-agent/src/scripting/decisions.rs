@@ -64,23 +64,44 @@ impl DecisionSelector {
             Self::DebuggerBreakpoint | Self::DebuggerSingleStep | Self::DebuggerAsyncBreak
         )
     }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::ChildFollow => "child.follow",
+            Self::HookEntry => "hook.entry",
+            Self::HookReturn => "hook.return",
+            Self::SyscallEntry => "syscall.entry",
+            Self::SyscallExit => "syscall.exit",
+            Self::ExceptionHandle => "exception.handle",
+            Self::DebuggerBreakpoint => "debugger.breakpoint",
+            Self::DebuggerSingleStep => "debugger.single_step",
+            Self::DebuggerAsyncBreak => "debugger.async_break",
+        }
+    }
 }
 
 pub struct DecisionSubscription {
     pub selector: DecisionSelector,
     pub callback: Py<PyAny>,
+    pub callback_name: String,
+    pub description: String,
     pub once: bool,
     pub order: u64,
     pub address: Option<u64>,
     pub thread_id: Option<u32>,
     pub numbers: Option<TlsFreeSet<u32>>,
     pub codes: Option<TlsFreeSet<u32>>,
+    pub last_generation: u64,
+    pub last_return: Option<String>,
+    pub last_error: Option<String>,
 }
 
 impl DecisionSubscription {
     pub fn new(
         selector: DecisionSelector,
         callback: Py<PyAny>,
+        callback_name: String,
+        description: String,
         once: bool,
         address: Option<u64>,
         thread_id: Option<u32>,
@@ -93,12 +114,17 @@ impl DecisionSubscription {
             Self {
                 selector,
                 callback,
+                callback_name,
+                description,
                 once,
                 order: id,
                 address,
                 thread_id,
                 numbers,
                 codes,
+                last_generation: 0,
+                last_return: None,
+                last_error: None,
             },
         )
     }

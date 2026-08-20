@@ -43,6 +43,16 @@ PbStatus PB_CALL pb_pin_enable_single_step_passthrough(
     });
 }
 
+PbStatus PB_CALL pb_pin_set_single_step_passthrough(
+    PbThreadId thread_id, uint8_t enabled)
+{
+    if (enabled > 1u)
+        return PB_ERR_INVALID_ARGUMENT;
+    return GuardInternalException([&]() {
+        return PbBackendSetSingleStepPassthrough(thread_id, enabled);
+    });
+}
+
 PbStatus PB_CALL pb_pin_try_start(
     PbThreadId thread_id, PbInternalExceptionCallback callback, void* user_data,
     PbCallbackHandle* out_scope)

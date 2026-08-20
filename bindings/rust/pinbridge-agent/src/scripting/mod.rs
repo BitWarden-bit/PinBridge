@@ -1,8 +1,10 @@
 //! In-agent CPython scripting host: multi-plugin, event-driven.
 //!
-//! One Pin internal thread owns the interpreter and the whole host (Python
-//! never runs in Pin analysis callbacks). Every debugger operation a plugin
-//! performs is a loopback TCP client call to the query server — the same
+//! One Pin internal thread owns all plugin execution and the whole host
+//! (Python never runs in Pin analysis callbacks). Interpreter bootstrap runs
+//! once from application-start, after Pin tool loading and before target code;
+//! the internal host thread is the fallback owner if it is scheduled first.
+//! Every debugger operation a plugin performs is a loopback TCP client call to the query server — the same
 //! discipline the old separate script-host cdylib followed, now compiled
 //! into the agent directly. Deployment: pinbridge_agent.dll + python310.dll
 //! (+ optional python310.zip embedded stdlib) side by side; build.rs
@@ -81,8 +83,8 @@ pub fn set_python_ready(ready: bool) {
     PYTHON_READY.store(ready, Ordering::Release);
 }
 
-/// True while the scripting thread is inside the python310.dll
-/// LoadLibraryExW / interpreter-init sequence. The breaker's stop paths wait
+/// True while the one-time python310.dll LoadLibraryExW / interpreter-init
+/// sequence is active. The breaker's stop paths wait
 /// this out (bounded): a stop landing mid-load wedges the process — the
 /// loader holds the OS loader lock and pinvm's module-load integration
 /// stalls while the application is stopped, so the load never finishes; the
@@ -91,6 +93,7 @@ pub fn set_python_ready(ready: bool) {
 /// observed stress_control "卡死": scripting stuck in LoadLibraryExW, query
 /// server stuck in __tailMerge_api_ms_win_core_synch, app left stopped).
 static PY_LOAD_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+static PY_INITIALIZER_CLAIMED: AtomicBool = AtomicBool::new(false);
 
 pub fn py_load_in_flight() -> bool {
     PY_LOAD_IN_FLIGHT.load(Ordering::Acquire)
@@ -98,6 +101,33 @@ pub fn py_load_in_flight() -> bool {
 
 pub fn set_py_load_in_flight(loading: bool) {
     PY_LOAD_IN_FLIGHT.store(loading, Ordering::Release);
+}
+
+pub fn initialize_before_application() {
+    ensure_python_initialized();
+}
+
+fn ensure_python_initialized() {
+    if !py_load_in_flight() {
+        return;
+    }
+    if PY_INITIALIZER_CLAIMED
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        let ready = host::initialize_runtime();
+        set_python_ready(ready);
+        set_py_load_in_flight(false);
+        return;
+    }
+    for _ in 0..600 {
+        if !py_load_in_flight() {
+            return;
+        }
+        unsafe {
+            pb_pin_sleep(10);
+        }
+    }
 }
 
 // ---- plugin registry (scripting thread only — RefCell, never a lock) ----
@@ -291,6 +321,36 @@ pub struct PluginInfo {
     pub state: u8,
     pub delivered: u64,
     pub dropped: u64,
+    pub breakpoints: Vec<BreakpointBindingInfo>,
+    pub decisions: Vec<DecisionBindingInfo>,
+}
+
+#[derive(Clone)]
+pub struct BreakpointBindingInfo {
+    pub id: u32,
+    pub callback_name: String,
+    pub description: String,
+    pub once: bool,
+    pub thread_id: Option<u32>,
+    pub last_stop_generation: u64,
+    pub last_action: Option<String>,
+    pub last_return: Option<String>,
+    pub last_error: Option<String>,
+}
+
+#[derive(Clone)]
+pub struct DecisionBindingInfo {
+    pub id: u64,
+    pub selector: String,
+    pub callback_name: String,
+    pub description: String,
+    pub once: bool,
+    pub address: Option<u64>,
+    pub thread_id: Option<u32>,
+    pub codes: Option<Vec<u32>>,
+    pub last_generation: u64,
+    pub last_return: Option<String>,
+    pub last_error: Option<String>,
 }
 
 /// Published after every registry mutation; lets SCRIPT_LIST answer without
@@ -312,12 +372,59 @@ pub fn publish_list_snapshot() {
                 state: p.state,
                 delivered: p.delivered,
                 dropped: p.dropped,
+                breakpoints: p
+                    .breakpoints
+                    .iter()
+                    .map(|(id, binding)| BreakpointBindingInfo {
+                        id: *id,
+                        callback_name: binding.callback_name.clone(),
+                        description: binding.description.clone(),
+                        once: binding.once,
+                        thread_id: binding.thread_id,
+                        last_stop_generation: binding.last_stop_generation,
+                        last_action: binding.last_action.clone(),
+                        last_return: binding.last_return.clone(),
+                        last_error: binding.last_error.clone(),
+                    })
+                    .collect(),
+                decisions: p
+                    .decisions
+                    .iter()
+                    .map(|(id, binding)| {
+                        let mut codes = binding
+                            .codes
+                            .as_ref()
+                            .map(|values| values.iter().copied().collect::<Vec<_>>());
+                        if let Some(values) = codes.as_mut() {
+                            values.sort_unstable();
+                        }
+                        DecisionBindingInfo {
+                            id: *id,
+                            selector: binding.selector.name().to_string(),
+                            callback_name: binding.callback_name.clone(),
+                            description: binding.description.clone(),
+                            once: binding.once,
+                            address: binding.address,
+                            thread_id: binding.thread_id,
+                            codes,
+                            last_generation: binding.last_generation,
+                            last_return: binding.last_return.clone(),
+                            last_error: binding.last_error.clone(),
+                        }
+                    })
+                    .collect(),
             })
             .collect();
         entries.sort_by(|a, b| a.name.cmp(&b.name));
         entries
     });
     *LIST_SNAPSHOT.lock().unwrap_or_else(|e| e.into_inner()) = snapshot;
+}
+
+pub fn note_external_breakpoint_set(id: u32, address: u64) {
+    if !subscriptions::native_set_is_script(address) {
+        subscriptions::mark_external_owner(id);
+    }
 }
 
 static MAILBOX: std::sync::OnceLock<Sender<ScriptCmd>> = std::sync::OnceLock::new();
@@ -426,10 +533,11 @@ pub fn output_page(after: u64, limit: usize) -> (u64, Vec<output::OutputEntry>) 
 
 // ---- spawn (from lib.rs, on Pin's tool-load path) ----
 
-/// Spawns ONE Pin internal thread running the whole scripting host. The
-/// OS-loader work (python310.dll preload, Py_Initialize) happens on THAT
-/// thread — never here, because agent_main runs inside Pin's tool-load
-/// sequence where entering the OS loader deadlocks the process.
+/// Spawns ONE Pin internal thread running the whole scripting host. OS-loader
+/// work must never happen here because agent_main runs inside Pin's tool-load
+/// sequence, where entering the OS loader deadlocks the process. The normal
+/// bootstrap owner is the later application-start callback; this thread is a
+/// race-safe fallback.
 ///
 /// Threading constraints that shaped this design (all observed in the
 /// field, see third_party/pyo3/src/gil.rs for the linked one):
@@ -450,7 +558,8 @@ pub fn spawn(port: u16) -> PbStatus {
     RPC_PORT.store(port, Ordering::Release);
     // Arm the load gate BEFORE the thread exists: a stop must never land
     // while the scripting thread is inside the python310.dll load (see
-    // py_load_in_flight). Cleared at the end of host::run()'s init attempt.
+    // py_load_in_flight). Cleared at the end of the one-time init attempt.
+    PY_INITIALIZER_CLAIMED.store(false, Ordering::Release);
     set_py_load_in_flight(true);
     let mut thread_id: PbThreadId = 0;
     let mut thread_uid: PbPinThreadUid = 0;

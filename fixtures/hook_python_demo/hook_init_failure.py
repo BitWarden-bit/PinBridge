@@ -25,8 +25,15 @@ def pb_init():
         raise RuntimeError("DemoSkip export not found")
 
     observer_id = pb.on("hook.entry", never_observe, address=address)
-    interceptor_id = pb.intercept("hook.entry", never_intercept, address=address)
-    breakpoint_id = pb.breakpoint(address, never_break)
+    interceptor_id = pb.intercept(
+        "hook.entry", never_intercept, address=address,
+        description="fixture lease that must be released when initialization fails",
+    )
+    breakpoint_id = pb.breakpoint(
+        address,
+        never_break,
+        description="Verify failed plugin initialization releases its breakpoint binding",
+    )
     pb.print(
         "HOOK_INIT_FAILURE_ARMED observer=%d interceptor=%d breakpoint=%d address=0x%x"
         % (observer_id, interceptor_id, breakpoint_id, address)

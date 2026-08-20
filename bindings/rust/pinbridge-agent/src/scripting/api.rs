@@ -20,10 +20,10 @@ use super::{
 };
 use core::sync::atomic::Ordering;
 use pinbridge_client::client::Client;
-use pinbridge_proto::ARCH_X64;
+use pinbridge_proto::{ARCH_X64, HOOK_LOG_FLAG_FUNCTION, HOOK_LOG_FLAG_SIGNATURE};
 use pinbridge_sys::{pb_pin_sleep, PbRegId, PB_INVALID_THREAD_ID, PB_OK, PB_REG_INVALID_};
 use pyo3::prelude::*;
-use pyo3::types::PyBytes;
+use pyo3::types::{PyBytes, PyDict, PyList};
 
 /// Runtime architecture id from a PING reply (x64 fallback against an agent
 /// that predates the arch extension).
@@ -126,11 +126,12 @@ fn pb_bp_remove(id: u32) -> bool {
 /// Binds one exact native breakpoint to a callback owned by the current
 /// plugin.  Unlike legacy bp_set/on_bp_hit, the callback is stored with this
 /// id and may return stay/resume/step_into/step_over.
-#[pyfunction(name = "breakpoint", signature = (address, callback, *, once=false, thread_id=None))]
+#[pyfunction(name = "breakpoint", signature = (address, callback, *, description, once=false, thread_id=None))]
 fn pb_breakpoint(
     py: Python<'_>,
     address: u64,
     callback: Py<PyAny>,
+    description: String,
     once: bool,
     thread_id: Option<u32>,
 ) -> PyResult<u32> {
@@ -147,11 +148,34 @@ fn pb_breakpoint(
             "breakpoint callback must be callable",
         ));
     }
+    let description = description.trim();
+    if description.is_empty() {
+        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+            "breakpoint description must not be empty",
+        ));
+    }
+    if description.len() > 512 {
+        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+            "breakpoint description exceeds 512 bytes",
+        ));
+    }
+    if description.chars().any(char::is_control) {
+        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+            "breakpoint description must be one printable line",
+        ));
+    }
     if thread_id == Some(PB_INVALID_THREAD_ID) {
         return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
             "thread_id uses the reserved invalid-thread sentinel",
         ));
     }
+
+    let callback_name = callback
+        .bind(py)
+        .getattr("__qualname__")
+        .or_else(|_| callback.bind(py).getattr("__name__"))
+        .and_then(|value| value.extract::<String>())
+        .unwrap_or_else(|_| "<callable>".to_string());
 
     // Determine whether this script layer created the native breakpoint.
     // Existing CLI/legacy breakpoints remain externally owned and are not
@@ -165,14 +189,22 @@ fn pb_breakpoint(
         .4
         .iter()
         .any(|(_, existing_address, _)| *existing_address == address);
-    let id = rpc(|c| c.bp_set(address)).ok_or_else(|| {
-        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("failed to create native breakpoint")
-    })?;
+    let id = subscriptions::with_script_native_set(address, || rpc(|c| c.bp_set(address)))
+        .ok_or_else(|| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("failed to create native breakpoint")
+        })?;
 
     let previous = with_current_plugin_mut(|plugin| {
-        plugin
-            .breakpoints
-            .insert(id, BreakpointSubscription::new(callback, once, thread_id))
+        plugin.breakpoints.insert(
+            id,
+            BreakpointSubscription::new(
+                callback,
+                callback_name,
+                description.to_string(),
+                once,
+                thread_id,
+            ),
+        )
     })
     .ok_or_else(no_plugin)?;
     if previous.is_none() {
@@ -211,12 +243,7 @@ fn pb_breakpoint_remove(id: u32) -> PyResult<bool> {
     name = "execution_trap",
     signature = (start, end, *, once=true, thread_id=None)
 )]
-fn pb_execution_trap(
-    start: u64,
-    end: u64,
-    once: bool,
-    thread_id: Option<u32>,
-) -> PyResult<u32> {
+fn pb_execution_trap(start: u64, end: u64, once: bool, thread_id: Option<u32>) -> PyResult<u32> {
     if current_plugin_name().is_none() {
         return Err(no_plugin());
     }
@@ -357,10 +384,10 @@ fn pb_resolve_name(spec: &str) -> Option<u64> {
 #[pyfunction(name = "disasm")]
 fn pb_disasm(addr: u64, count: u64) -> Option<Vec<(u64, u32, u32, u64, String)>> {
     let count = count.clamp(1, 128);
-    let rows = rpc(|c| c.disasm(addr, count))?;
+    let rows = crate::disasm::disassemble_local(addr, count).ok()?;
     Some(
         rows.into_iter()
-            .map(|(address, size, kind, text, _bytes, target)| (address, size, kind, target, text))
+            .map(|row| (row.address, row.size, row.kind, row.target, row.text))
             .collect(),
     )
 }
@@ -468,6 +495,208 @@ fn pb_hook_remove(addr: u64) -> bool {
 #[pyfunction(name = "hook_clear")]
 fn pb_hook_clear() -> bool {
     rpc(|c| c.hook_clear()).is_some()
+}
+
+/// Reads the dedicated native Hook lane without involving the generic event
+/// ring. The returned dictionary uses Python integers and contains an events
+/// list ordered as requested. This query is intended for script mainlines and
+/// asynchronous observers; a synchronous intercept callback must use its
+/// supplied event instead of starting a nested control-plane RPC.
+#[pyfunction(
+    name = "hook_events_query",
+    signature = (*, limit=1024, before=0, after=0, order="desc", hook_types=None, phases=None, modules=None, symbols=None, thread_ids=None, addresses=None)
+)]
+fn pb_hook_events_query(
+    py: Python<'_>,
+    limit: usize,
+    before: u64,
+    after: u64,
+    order: &str,
+    hook_types: Option<Vec<String>>,
+    phases: Option<Vec<String>>,
+    modules: Option<Vec<String>>,
+    symbols: Option<Vec<String>>,
+    thread_ids: Option<Vec<u32>>,
+    addresses: Option<Vec<u64>>,
+) -> PyResult<PyObject> {
+    if limit == 0 || limit > 4096 {
+        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+            "hook_events_query limit must be 1..4096",
+        ));
+    }
+    if !matches!(order, "asc" | "desc") {
+        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+            "hook_events_query order must be 'asc' or 'desc'",
+        ));
+    }
+    validate_python_filter("hook_types", hook_types.as_deref(), &["api", "instruction"])?;
+    validate_python_filter("phases", phases.as_deref(), &["hit", "entry", "return"])?;
+
+    let (total, dropped, next, mut records, resolutions) = rpc(|client| {
+        let (total, dropped, next, records) = client.hook_events_window(4096, before)?;
+        let mut unique = records.iter().map(|record| record.address).collect::<Vec<_>>();
+        unique.sort_unstable();
+        unique.dedup();
+        let resolved = client.resolve(&unique)?;
+        let resolutions = unique
+            .into_iter()
+            .zip(resolved)
+            .map(|(address, resolved)| {
+                let display = resolved.display();
+                (
+                    address,
+                    resolved.module,
+                    resolved.symbol,
+                    display,
+                )
+            })
+            .collect::<Vec<_>>();
+        Ok((total, dropped, next, records, resolutions))
+    })
+    .ok_or_else(|| {
+        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+            "hook_events_query is unavailable during a synchronous callback or disconnected session",
+        )
+    })?;
+
+    records.sort_by_key(|record| record.sequence);
+    if order == "desc" {
+        records.reverse();
+    }
+    let output = PyList::empty_bound(py);
+    for record in records {
+        if record.sequence <= after {
+            continue;
+        }
+        let function_hook = record.flags & HOOK_LOG_FLAG_FUNCTION != 0;
+        let hook_type = if function_hook { "api" } else { "instruction" };
+        let phase = if !function_hook {
+            "hit"
+        } else if record.kind == crate::event::EVENT_HOOK_RETURN {
+            "return"
+        } else {
+            "entry"
+        };
+        if !python_filter_matches(hook_types.as_deref(), hook_type)
+            || !python_filter_matches(phases.as_deref(), phase)
+            || thread_ids
+                .as_ref()
+                .is_some_and(|values| !values.contains(&record.thread_id))
+            || addresses
+                .as_ref()
+                .is_some_and(|values| !values.contains(&record.address))
+        {
+            continue;
+        }
+        let resolution = resolutions
+            .iter()
+            .find(|(address, _, _, _)| *address == record.address);
+        let module = resolution
+            .map(|(_, module, _, _)| module.as_str())
+            .filter(|value| !value.is_empty());
+        let symbol = resolution
+            .map(|(_, _, symbol, _)| symbol.as_str())
+            .filter(|value| !value.is_empty());
+        if !python_patterns_match(modules.as_deref(), module)
+            || !python_patterns_match(symbols.as_deref(), symbol)
+        {
+            continue;
+        }
+        let event = PyDict::new_bound(py);
+        event.set_item("sequence", record.sequence)?;
+        event.set_item("timestamp_unix_ns", record.timestamp_unix_ns)?;
+        event.set_item("kind", phase)?;
+        event.set_item("hook_type", hook_type)?;
+        event.set_item("thread_id", record.thread_id)?;
+        event.set_item("address", record.address)?;
+        event.set_item("module", module)?;
+        event.set_item("symbol", symbol)?;
+        event.set_item(
+            "display",
+            resolution.and_then(|(_, _, _, display)| display.as_deref()),
+        )?;
+        event.set_item(
+            "signature_capture",
+            record.flags & HOOK_LOG_FLAG_SIGNATURE != 0,
+        )?;
+        let argument_count = record.argument_count.min(16) as usize;
+        event.set_item("arguments", record.arguments[..argument_count].to_vec())?;
+        event.set_item(
+            "return_value",
+            (function_hook && phase == "return").then_some(record.arguments[0]),
+        )?;
+        output.append(event)?;
+        if output.len() >= limit {
+            break;
+        }
+    }
+    let result = PyDict::new_bound(py);
+    result.set_item("lane_total", total)?;
+    result.set_item("lane_dropped", dropped)?;
+    result.set_item("history_overwritten", total.saturating_sub(32768))?;
+    result.set_item("next_cursor", next)?;
+    result.set_item("window_before", before)?;
+    result.set_item("returned", output.len())?;
+    result.set_item("events", output)?;
+    Ok(result.into_py(py))
+}
+
+fn validate_python_filter(name: &str, values: Option<&[String]>, allowed: &[&str]) -> PyResult<()> {
+    if let Some(values) = values {
+        for value in values {
+            if !allowed.contains(&value.as_str()) {
+                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                    "unsupported {name} value: {value}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn python_filter_matches(values: Option<&[String]>, value: &str) -> bool {
+    values
+        .map(|values| values.iter().any(|candidate| candidate == value))
+        .unwrap_or(true)
+}
+
+fn python_patterns_match(patterns: Option<&[String]>, value: Option<&str>) -> bool {
+    patterns
+        .map(|patterns| {
+            patterns.is_empty()
+                || value.is_some_and(|value| {
+                    patterns
+                        .iter()
+                        .any(|pattern| python_wildcard_match(pattern, value))
+                })
+        })
+        .unwrap_or(true)
+}
+
+fn python_wildcard_match(pattern: &str, value: &str) -> bool {
+    let pattern = pattern.to_ascii_lowercase().into_bytes();
+    let value = value.to_ascii_lowercase().into_bytes();
+    let (mut p, mut v, mut star, mut retry) = (0usize, 0usize, None, 0usize);
+    while v < value.len() {
+        if p < pattern.len() && (pattern[p] == b'?' || pattern[p] == value[v]) {
+            p += 1;
+            v += 1;
+        } else if p < pattern.len() && pattern[p] == b'*' {
+            star = Some(p);
+            p += 1;
+            retry = v;
+        } else if let Some(star_at) = star {
+            p = star_at + 1;
+            retry += 1;
+            v = retry;
+        } else {
+            return false;
+        }
+    }
+    while p < pattern.len() && pattern[p] == b'*' {
+        p += 1;
+    }
+    p == pattern.len()
 }
 
 /// Exception pause policy passthrough (EXC_POLICY_SET): enabled + code
@@ -589,9 +818,7 @@ fn pb_trace_status_detail() -> Option<(String, bool, u64, u64)> {
 
 // ---- registrations (mutate the current plugin's filters) ----
 
-fn parse_syscall_numbers(
-    numbers: Option<Vec<u64>>,
-) -> PyResult<Option<crate::TlsFreeSet<u32>>> {
+fn parse_syscall_numbers(numbers: Option<Vec<u64>>) -> PyResult<Option<crate::TlsFreeSet<u32>>> {
     numbers
         .map(|numbers| {
             let mut filter = crate::new_set();
@@ -630,7 +857,7 @@ fn pb_on_event(
     }
     if event.trim().eq_ignore_ascii_case("breakpoint") {
         return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-            "breakpoint is a synchronous stop event; use pb.breakpoint(address, callback)",
+            "breakpoint is a synchronous stop event; use pb.breakpoint(address, callback, description=...)",
         ));
     }
     let selector = EventSelector::parse(event).ok_or_else(|| {
@@ -679,13 +906,8 @@ fn pb_on_event(
         // observation interest before installing the Python subscription.
         crate::hooks::set_observation_enabled(true);
     }
-    let (id, subscription) = EventSubscription::new(
-        selector,
-        callback,
-        once,
-        address,
-        syscall_numbers,
-    );
+    let (id, subscription) =
+        EventSubscription::new(selector, callback, once, address, syscall_numbers);
     with_current_plugin_mut(|plugin| plugin.events.insert(id, subscription))
         .ok_or_else(no_plugin)?;
     if let Some((address, created_by_scripts)) = hook_lease {
@@ -729,12 +951,13 @@ fn pb_event_names() -> Vec<&'static str> {
 /// native event waits for a bounded time and consumes the callback result.
 #[pyfunction(
     name = "intercept",
-    signature = (event, callback, *, once=false, address=None, thread_id=None, numbers=None, codes=None)
+    signature = (event, callback, *, description="", once=false, address=None, thread_id=None, numbers=None, codes=None)
 )]
 fn pb_intercept(
     py: Python<'_>,
     event: &str,
     callback: Py<PyAny>,
+    description: &str,
     once: bool,
     address: Option<u64>,
     thread_id: Option<u32>,
@@ -749,35 +972,56 @@ fn pb_intercept(
             "interceptor callback must be callable",
         ));
     }
+    let description = description.trim();
+    if description.len() > 512 {
+        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+            "interceptor description exceeds 512 bytes",
+        ));
+    }
     let selector = DecisionSelector::parse(event).ok_or_else(|| {
         PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
             "unknown interceptor {event:?}; use pb.decision_names() to list supported names"
         ))
     })?;
-    let number_filter = numbers.map(|numbers| -> PyResult<_> {
-        let mut filter = crate::new_set();
-        for number in numbers {
-            let number = u32::try_from(number).map_err(|_| {
-                PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                    "syscall number must fit in 32 bits",
-                )
-            })?;
-            filter.insert(number);
-        }
-        Ok(filter)
-    }).transpose()?;
-    let code_filter = codes.map(|codes| -> PyResult<_> {
-        let mut filter = crate::new_set();
-        for code in codes {
-            let code = u32::try_from(code).map_err(|_| {
-                PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                    "exception code must fit in 32 bits",
-                )
-            })?;
-            filter.insert(code);
-        }
-        Ok(filter)
-    }).transpose()?;
+    if selector.is_hook() && description.is_empty() {
+        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+            "Hook interceptor requires a non-empty description",
+        ));
+    }
+    let callback_name = callback
+        .bind(py)
+        .getattr("__qualname__")
+        .or_else(|_| callback.bind(py).getattr("__name__"))
+        .and_then(|value| value.extract::<String>())
+        .unwrap_or_else(|_| "<callable>".to_string());
+    let number_filter = numbers
+        .map(|numbers| -> PyResult<_> {
+            let mut filter = crate::new_set();
+            for number in numbers {
+                let number = u32::try_from(number).map_err(|_| {
+                    PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                        "syscall number must fit in 32 bits",
+                    )
+                })?;
+                filter.insert(number);
+            }
+            Ok(filter)
+        })
+        .transpose()?;
+    let code_filter = codes
+        .map(|codes| -> PyResult<_> {
+            let mut filter = crate::new_set();
+            for code in codes {
+                let code = u32::try_from(code).map_err(|_| {
+                    PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                        "exception code must fit in 32 bits",
+                    )
+                })?;
+                filter.insert(code);
+            }
+            Ok(filter)
+        })
+        .transpose()?;
     let created_hook = if selector.is_hook() {
         if number_filter.is_some() || code_filter.is_some() {
             return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
@@ -806,7 +1050,10 @@ fn pb_intercept(
             ));
         }
         None
-    } else if matches!(selector, DecisionSelector::SyscallEntry | DecisionSelector::SyscallExit) {
+    } else if matches!(
+        selector,
+        DecisionSelector::SyscallEntry | DecisionSelector::SyscallExit
+    ) {
         if address.is_some() {
             return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
                 "syscall interceptors do not accept address",
@@ -836,6 +1083,8 @@ fn pb_intercept(
     let (id, subscription) = DecisionSubscription::new(
         selector,
         callback,
+        callback_name,
+        description.to_string(),
         once,
         address,
         thread_id,
@@ -860,8 +1109,8 @@ fn pb_intercept(
 
 #[pyfunction(name = "unintercept")]
 fn pb_unintercept(id: u64) -> PyResult<bool> {
-    let removed = with_current_plugin_mut(|plugin| plugin.decisions.remove(&id))
-        .ok_or_else(no_plugin)?;
+    let removed =
+        with_current_plugin_mut(|plugin| plugin.decisions.remove(&id)).ok_or_else(no_plugin)?;
     let Some(subscription) = removed else {
         return Ok(false);
     };
@@ -924,9 +1173,7 @@ fn instrumentation_kind(name: &str) -> Option<u32> {
         "instruction" | "instruction.exec" | "exec" => crate::engines::INSTRUMENT_EXEC,
         "memory" | "mem" => crate::engines::INSTRUMENT_MEMORY,
         "branch" | "branch.edge" | "branch_edge" => crate::engines::INSTRUMENT_BRANCH,
-        "instruction.decode" | "instruction_decode" | "decode" => {
-            crate::engines::INSTRUMENT_DECODE
-        }
+        "instruction.decode" | "instruction_decode" | "decode" => crate::engines::INSTRUMENT_DECODE,
         "trace.instrument" | "trace_instrument" | "trace" => crate::engines::INSTRUMENT_TRACE,
         "routine.instrument" | "routine_instrument" | "routine" | "function" => {
             crate::engines::INSTRUMENT_ROUTINE
@@ -1117,7 +1364,9 @@ fn pb_memory_translation_set(
     let mut previous_end = 0;
     for (index, (source_start, source_end, target_start)) in mappings.into_iter().enumerate() {
         if source_start >= source_end
-            || target_start.checked_add(source_end - source_start).is_none()
+            || target_start
+                .checked_add(source_end - source_start)
+                .is_none()
             || (index != 0 && source_start < previous_end)
         {
             return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
@@ -1202,8 +1451,8 @@ fn pb_memory_translation_set(
 
 #[pyfunction(name = "memory_translation_clear")]
 fn pb_memory_translation_clear() -> PyResult<bool> {
-    let previous = with_current_plugin_mut(|plugin| plugin.memory_translation.take())
-        .ok_or_else(no_plugin)?;
+    let previous =
+        with_current_plugin_mut(|plugin| plugin.memory_translation.take()).ok_or_else(no_plugin)?;
     if previous.is_none() {
         return Ok(false);
     }
@@ -1309,8 +1558,8 @@ fn pb_code_fetch_set(segments: Vec<(u64, Vec<u8>)>) -> PyResult<u64> {
     let spec = super::code_fetch::Spec {
         segments: native_segments,
     };
-    let previous = with_current_plugin_mut(|plugin| plugin.code_fetch.replace(spec))
-        .ok_or_else(no_plugin)?;
+    let previous =
+        with_current_plugin_mut(|plugin| plugin.code_fetch.replace(spec)).ok_or_else(no_plugin)?;
     match super::code_fetch::publish() {
         Ok(generation) => Ok(generation),
         Err(status) => {
@@ -1348,7 +1597,12 @@ fn pb_code_fetch_policy(py: Python<'_>) -> PyResult<Option<Vec<(u64, Py<PyBytes>
         plugin.code_fetch.as_ref().map(|spec| {
             spec.segments
                 .iter()
-                .map(|segment| (segment.start, PyBytes::new_bound(py, &segment.bytes).unbind()))
+                .map(|segment| {
+                    (
+                        segment.start,
+                        PyBytes::new_bound(py, &segment.bytes).unbind(),
+                    )
+                })
                 .collect()
         })
     })
@@ -1376,8 +1630,8 @@ fn pb_xed_decode_set(
         ));
     }
     let spec = super::xed_decode::Spec { cet, cldemote, mpx };
-    let previous = with_current_plugin_mut(|plugin| plugin.xed_decode.replace(spec))
-        .ok_or_else(no_plugin)?;
+    let previous =
+        with_current_plugin_mut(|plugin| plugin.xed_decode.replace(spec)).ok_or_else(no_plugin)?;
     match super::xed_decode::publish() {
         Ok(generation) => Ok(generation),
         Err(status) => {
@@ -1529,6 +1783,7 @@ fn pb(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(pb_hook_rules_clear, m)?)?;
     m.add_function(wrap_pyfunction!(pb_hook_remove, m)?)?;
     m.add_function(wrap_pyfunction!(pb_hook_clear, m)?)?;
+    m.add_function(wrap_pyfunction!(pb_hook_events_query, m)?)?;
     m.add_function(wrap_pyfunction!(pb_exc_policy, m)?)?;
     m.add_function(wrap_pyfunction!(pb_trace_start, m)?)?;
     m.add_function(wrap_pyfunction!(pb_trace_start_spec, m)?)?;

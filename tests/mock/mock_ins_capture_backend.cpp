@@ -3,6 +3,7 @@
 namespace
 {
 uint32_t g_capture_regs_calls;
+uint32_t g_hook_monitor_calls;
 uint32_t g_memory_operands_calls;
 uint32_t g_exec_calls;
 uint32_t g_branch_edge_calls;
@@ -18,6 +19,16 @@ PbStatus PbBackendInsInsertCaptureRegs(
         return PB_ERR_INVALID_ARGUMENT;
     ++g_capture_regs_calls;
     callback(0x1000, 1, 0x11, 0x22, 0x33, 0x44, user_data);
+    return PB_OK;
+}
+
+PbStatus PbBackendInsInsertHookMonitor(
+    PbInsHandle ins, PbInsHookMonitorCallback callback, void* user_data)
+{
+    if (ins.opaque == 0 || !callback)
+        return PB_ERR_INVALID_ARGUMENT;
+    ++g_hook_monitor_calls;
+    callback(0x1000, 1, 0x11, 0x22, 0x33, 0x44, 0x5000, 0x66, user_data);
     return PB_OK;
 }
 

@@ -51,17 +51,6 @@ pub fn register_callbacks(reattach: bool) -> Result<(), RegistrationFailure> {
             )?;
         }
 
-        // Pin 3.x does not reliably virtualize an application that enables
-        // x86 TF with POPF: the host #DB can escape in the translated code
-        // cache as a Pin-internal exception. Register the native bridge
-        // before the general instruction engine so it can reconstruct the
-        // application single-step at the correct instruction boundary.
-        let mut single_step_compat = PbCallbackHandle { opaque: 0 };
-        checked(
-            "exception.single_step_passthrough",
-            pb_pin_enable_single_step_passthrough(&mut single_step_compat),
-        )?;
-
         let mut instrument = PbCallbackHandle { opaque: 0 };
         checked(
             "instruction",
@@ -71,6 +60,32 @@ pub fn register_callbacks(reattach: bool) -> Result<(), RegistrationFailure> {
                 &mut instrument,
             ),
         )?;
+
+        // A physical TF set by application POPF applies to Pin's generated
+        // instructions, not to original application boundaries. Register the
+        // bridge after the ordinary instruction engine so a traditional
+        // breakpoint/hook on the POPF keeps priority over its non-returning
+        // emulation. Global mode is the safe default because protected code
+        // may use TF in TLS callbacks or normal execution before a user Step.
+        // `=0` remains an explicit diagnostic opt-out to debugger-only scope.
+        let mut single_step_compat = PbCallbackHandle { opaque: 0 };
+        checked(
+            "exception.single_step_passthrough",
+            pb_pin_enable_single_step_passthrough(&mut single_step_compat),
+        )?;
+        let global_tf_compat = std::env::var("PINBRIDGE_SINGLE_STEP_PASSTHROUGH")
+            .ok()
+            .as_deref()
+            != Some("0");
+        checked(
+            "exception.single_step_scope",
+            pb_pin_set_single_step_passthrough(PB_INVALID_THREAD_ID, u8::from(global_tf_compat)),
+        )?;
+        crate::log::line(if global_tf_compat {
+            "single-step TF bridge mode=global"
+        } else {
+            "single-step TF bridge mode=debugger-scoped"
+        });
 
         let mut fini = PbCallbackHandle { opaque: 0 };
         checked(

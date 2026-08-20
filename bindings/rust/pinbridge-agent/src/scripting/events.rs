@@ -158,9 +158,7 @@ impl EventSelector {
             "pin.internal_exception" | "pin_internal_exception" | "internal_exception" => {
                 Self::Kind(EVENT_PIN_INTERNAL_EXCEPTION)
             }
-            "debugger.breakpoint" | "debugger_breakpoint" => {
-                Self::Kind(EVENT_DEBUGGER_BREAKPOINT)
-            }
+            "debugger.breakpoint" | "debugger_breakpoint" => Self::Kind(EVENT_DEBUGGER_BREAKPOINT),
             "debugger.single_step" | "debugger_single_step" => {
                 Self::Kind(EVENT_DEBUGGER_SINGLE_STEP)
             }
@@ -171,7 +169,9 @@ impl EventSelector {
             "routine.instrument" | "routine_instrument" | "function.instrument" => {
                 Self::Kind(EVENT_ROUTINE_INSTRUMENT)
             }
-            "basic_block.instrument" | "basic_block_instrument" | "bbl.instrument"
+            "basic_block.instrument"
+            | "basic_block_instrument"
+            | "bbl.instrument"
             | "bbl_instrument" => Self::Kind(EVENT_BBL_INSTRUMENT),
             "execution.trap" | "execution_trap" | "exec.trap" | "exec_trap" => {
                 Self::Kind(EVENT_EXECUTION_TRAP)
@@ -223,8 +223,7 @@ impl EventSelector {
                         || (event.arg1 == PROCESS_EXIT_SOURCE_PREPARE_FINI && event.arg2 == 0))
             }
             Self::ProcessPrepareFini => {
-                event.kind == EVENT_PROCESS_EXIT
-                    && event.arg1 == PROCESS_EXIT_SOURCE_PREPARE_FINI
+                event.kind == EVENT_PROCESS_EXIT && event.arg1 == PROCESS_EXIT_SOURCE_PREPARE_FINI
             }
             Self::Kind(kind) => event.kind == kind,
             Self::Exception => {
@@ -360,9 +359,8 @@ impl EventSubscription {
                 observation_start_after: crate::observation::total(),
                 hook_address,
                 syscall_numbers,
-                syscall_generations: (selector == EventSelector::Kind(EVENT_SYSCALL)).then(|| {
-                    shared_generation_window(crate::syscall_engine::generation())
-                }),
+                syscall_generations: (selector == EventSelector::Kind(EVENT_SYSCALL))
+                    .then(|| shared_generation_window(crate::syscall_engine::generation())),
                 context_generations: matches!(
                     selector,
                     EventSelector::Exception | EventSelector::Kind(EVENT_CONTEXT_CHANGE)
@@ -388,9 +386,7 @@ pub fn synthetic_process_event(kind: u32) -> EventRecord {
 /// and priority ring can both expose the same native callback, so consumers
 /// use this generation check to invoke Python exactly once.
 pub fn unseen_oom_occurrence(last_delivered: u64, event: &EventRecord) -> Option<u64> {
-    (event.kind == EVENT_OUT_OF_MEMORY
-        && event.arg1 != 0
-        && event.arg1 > last_delivered)
+    (event.kind == EVENT_OUT_OF_MEMORY && event.arg1 != 0 && event.arg1 > last_delivered)
         .then_some(event.arg1)
 }
 

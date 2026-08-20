@@ -350,22 +350,11 @@ pub fn run() -> ! {
             unsafe { GetCurrentThreadId() }
         ));
     }
-    // py_load_in_flight was armed in spawn() (before this thread could load
-    // anything); it is cleared only after the whole load+init attempt ends.
-    let python_module = preload_python();
-    let ready = match python_module {
-        Some(module) => match super::python_data::init_cells(module) {
-            Ok(()) => init_interpreter(),
-            Err(export) => {
-                crate::log::line(&format!(
-                    "scripting disabled: python310.dll export missing: {export}"
-                ));
-                false
-            }
-        },
-        None => false,
-    };
-    super::set_py_load_in_flight(false);
+    // Application-start normally completes this before the first target
+    // instruction. This is also the fallback owner if Pin schedules the
+    // internal thread first.
+    super::ensure_python_initialized();
+    let ready = python_ready();
     let (tx, rx) = std::sync::mpsc::channel();
     set_mailbox(tx);
     set_python_ready(ready);
@@ -377,6 +366,22 @@ pub fn run() -> ! {
         autoload_plugins(&mut pending);
     }
     host_loop(&rx, &mut pending, port)
+}
+
+pub(super) fn initialize_runtime() -> bool {
+    let python_module = preload_python();
+    match python_module {
+        Some(module) => match super::python_data::init_cells(module) {
+            Ok(()) => init_interpreter(),
+            Err(export) => {
+                crate::log::line(&format!(
+                    "scripting disabled: python310.dll export missing: {export}"
+                ));
+                false
+            }
+        },
+        None => false,
+    }
 }
 
 fn host_loop(
@@ -503,26 +508,65 @@ fn status_failed(status: pyo3::ffi::PyStatus, what: &str) -> bool {
     false
 }
 
-/// Manual interpreter start (no pyo3 auto-initialize): the default Python
-/// config, switched to isolated + zip-based stdlib when the embedded distro
-/// (python310.zip next to the agent) is present.
+fn installed_python_home() -> Option<std::path::PathBuf> {
+    let mut candidates = Vec::new();
+    for name in ["PINBRIDGE_PYTHON_DIST", "PYTHONHOME"] {
+        if let Some(value) = std::env::var_os(name) {
+            candidates.push(std::path::PathBuf::from(value));
+        }
+    }
+    if let Some(executable) = std::env::var_os("PYTHON_SYS_EXECUTABLE") {
+        if let Some(parent) = std::path::Path::new(&executable).parent() {
+            candidates.push(parent.to_path_buf());
+        }
+    }
+    if let Some(path) = std::env::var_os("PATH") {
+        candidates.extend(std::env::split_paths(&path));
+    }
+    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+        let python = std::path::PathBuf::from(local)
+            .join("Programs")
+            .join("Python");
+        #[cfg(target_pointer_width = "32")]
+        let installs = ["Python310-32", "Python310"];
+        #[cfg(not(target_pointer_width = "32"))]
+        let installs = ["Python310", "Python310-64"];
+        candidates.extend(installs.into_iter().map(|name| python.join(name)));
+    }
+    candidates.into_iter().find(|path| {
+        path.join("python310.dll").is_file()
+            && path
+                .join("Lib")
+                .join("encodings")
+                .join("__init__.py")
+                .is_file()
+    })
+}
+
+/// Manual interpreter start (no pyo3 auto-initialize) using embedding-safe,
+/// isolated configuration. Prefer a zip stdlib next to the agent; otherwise
+/// point the isolated config at a matching installed Python 3.10 home.
 fn init_interpreter() -> bool {
     super::api::append_pb_to_inittab(); // must precede Py_Initialize
     unsafe {
         let mut preconfig: pyo3::ffi::PyPreConfig = core::mem::zeroed();
-        pyo3::ffi::PyPreConfig_InitPythonConfig(&mut preconfig);
+        // This interpreter is a guest inside the target process.  Isolated
+        // initialization keeps the application's locale, signal handlers and
+        // C standard streams untouched.
+        pyo3::ffi::PyPreConfig_InitIsolatedConfig(&mut preconfig);
         if status_failed(pyo3::ffi::Py_PreInitialize(&preconfig), "python preinit") {
             return false;
         }
         let mut config: pyo3::ffi::PyConfig = core::mem::zeroed();
-        pyo3::ffi::PyConfig_InitPythonConfig(&mut config);
+        pyo3::ffi::PyConfig_InitIsolatedConfig(&mut config);
         // The wide strings must outlive Py_InitializeFromConfig.
         let mut wide_paths: Vec<Vec<u16>> = Vec::new();
         let mut failed = false;
+        let mut embedded_distro = false;
         if let Some(dir) = agent_dir() {
             let zip = format!("{dir}\\python310.zip");
             if std::path::Path::new(&zip).exists() {
-                config.isolated = 1;
+                embedded_distro = true;
                 config.module_search_paths_set = 1;
                 for path in [&zip, &dir] {
                     let wide: Vec<u16> = path.encode_utf16().chain(core::iter::once(0)).collect();
@@ -539,6 +583,29 @@ fn init_interpreter() -> bool {
                 if !failed {
                     crate::log::line(&format!("python embedded distro: {zip}"));
                 }
+            }
+        }
+        if !failed && !embedded_distro {
+            if let Some(home) = installed_python_home() {
+                let home_text = home.to_string_lossy().into_owned();
+                let wide_home: Vec<u16> = home_text
+                    .encode_utf16()
+                    .chain(core::iter::once(0))
+                    .collect();
+                let config_ptr = &mut config as *mut pyo3::ffi::PyConfig;
+                failed = status_failed(
+                    pyo3::ffi::PyConfig_SetString(
+                        config_ptr,
+                        &mut (*config_ptr).home,
+                        wide_home.as_ptr(),
+                    ),
+                    "python home",
+                );
+                if !failed {
+                    crate::log::line(&format!("python installed home: {home_text}"));
+                }
+            } else {
+                crate::log::line("python installed home not found");
             }
         }
         if failed {
@@ -835,12 +902,7 @@ fn exec_one(name: &str, code: Py<PyAny>, port: u16) {
                 crate::observation::total(),
                 client.bp_list().map(|b| b.3).unwrap_or(0),
             ),
-            None => (
-                0,
-                crate::priority::total(),
-                crate::observation::total(),
-                0,
-            ),
+            None => (0, crate::priority::total(), crate::observation::total(), 0),
         };
     let initial_module_generation = crate::modules::generation();
     let initial_context_generation = crate::exception::generation();
@@ -855,7 +917,8 @@ fn exec_one(name: &str, code: Py<PyAny>, port: u16) {
             }
         };
         let globals = module.dict();
-        let previous_state = with_registry(|registry| registry.get(name).map(|plugin| plugin.state));
+        let previous_state =
+            with_registry(|registry| registry.get(name).map(|plugin| plugin.state));
         let registry_key = previous_state
             .map(|_| {
                 with_registry(|registry| {
@@ -907,12 +970,8 @@ fn exec_one(name: &str, code: Py<PyAny>, port: u16) {
             priority_cursor: initial_priority_cursor,
             observation_cursor: initial_observation_cursor,
             module_generation: initial_module_generation,
-            exception_generations: events::shared_generation_window(
-                initial_context_generation,
-            ),
-            syscall_generations: events::shared_generation_window(
-                initial_syscall_generation,
-            ),
+            exception_generations: events::shared_generation_window(initial_context_generation),
+            syscall_generations: events::shared_generation_window(initial_syscall_generation),
             last_stop_gen: initial_stop_gen,
             last_breakpoint_gen: initial_stop_gen,
             delivered: 0,
@@ -999,8 +1058,7 @@ fn exec_one(name: &str, code: Py<PyAny>, port: u16) {
                 p.module_generation = legacy_module_generation;
                 p.exception_generations =
                     events::shared_generation_window(legacy_context_generation);
-                p.syscall_generations =
-                    events::shared_generation_window(legacy_syscall_generation);
+                p.syscall_generations = events::shared_generation_window(legacy_syscall_generation);
                 p.last_stop_gen = legacy_stop_gen;
                 default_subscribe(p);
             }
@@ -1062,9 +1120,7 @@ fn exec_one(name: &str, code: Py<PyAny>, port: u16) {
                     "plugin replacement commit invariant failed: {name}"
                 ));
                 super::interceptors::publish_interests();
-                super::native_policies::refresh_best_effort(
-                    "replacement commit invariant failure",
-                );
+                super::native_policies::refresh_best_effort("replacement commit invariant failure");
                 mark_native_dirty();
                 super::publish_list_snapshot();
                 return;
@@ -1137,24 +1193,21 @@ fn consumes_priority(p: &Plugin) -> bool {
     p.on_exception.is_some()
         || p.on_module_load.is_some()
         || p.on_module_unload.is_some()
-        || p
-            .events
+        || p.events
             .values()
             .any(|subscription| subscription.selector.is_priority())
 }
 
 fn consumes_observation(p: &Plugin) -> bool {
     p.on_syscall.is_some()
-        || p.events
-            .values()
-            .any(|subscription| {
-                matches!(
-                    subscription.selector,
-                    EventSelector::Kind(EVENT_SYSCALL)
-                        | EventSelector::Kind(EVENT_HOOK_REGS)
-                        | EventSelector::Kind(crate::event::EVENT_HOOK_RETURN)
-                )
-            })
+        || p.events.values().any(|subscription| {
+            matches!(
+                subscription.selector,
+                EventSelector::Kind(EVENT_SYSCALL)
+                    | EventSelector::Kind(EVENT_HOOK_REGS)
+                    | EventSelector::Kind(crate::event::EVENT_HOOK_RETURN)
+            )
+        })
 }
 
 fn event_record(event: &crate::event::Event) -> pinbridge_proto::EventRecord {
@@ -1197,53 +1250,60 @@ fn tick(pending: &mut Vec<(String, Py<PyAny>)>, port: u16) {
     // adapt the pull size to last tick's measured Python cost (routed count)
     adapt_page_limit();
 
-    let (min_cursor, min_priority_cursor, min_observation_cursor, wants_stop, page_limit) = with_registry(|r| {
-        let mut min_cursor: Option<u64> = None;
-        let mut min_priority_cursor: Option<u64> = None;
-        let mut min_observation_cursor: Option<u64> = None;
-        let mut wants_stop = false;
-        let mut page_limit = 0u64;
-        let mut any_watch = false;
-        for p in r.values() {
-            if p.state != STATE_RUNNING {
-                continue;
-            }
-            if consumes_ring(p) {
-                min_cursor = Some(min_cursor.map(|m: u64| m.min(p.cursor)).unwrap_or(p.cursor));
-            }
-            if consumes_priority(p) {
-                min_priority_cursor = Some(
-                    min_priority_cursor
-                        .map(|m: u64| m.min(p.priority_cursor))
-                        .unwrap_or(p.priority_cursor),
-                );
-            }
-            if consumes_observation(p) {
-                min_observation_cursor = Some(
-                    min_observation_cursor
-                        .map(|m: u64| m.min(p.observation_cursor))
-                        .unwrap_or(p.observation_cursor),
-                );
-            }
-            if p.filters.want_bp || p.on_stop.is_some() || !p.breakpoints.is_empty() {
-                wants_stop = true;
-            }
-            if p.on_event_batch.is_some() {
-                if let Some(w) = &p.filters.watch {
-                    any_watch = true;
-                    page_limit = page_limit.max(w.batch);
+    let (min_cursor, min_priority_cursor, min_observation_cursor, wants_stop, page_limit) =
+        with_registry(|r| {
+            let mut min_cursor: Option<u64> = None;
+            let mut min_priority_cursor: Option<u64> = None;
+            let mut min_observation_cursor: Option<u64> = None;
+            let mut wants_stop = false;
+            let mut page_limit = 0u64;
+            let mut any_watch = false;
+            for p in r.values() {
+                if p.state != STATE_RUNNING {
+                    continue;
+                }
+                if consumes_ring(p) {
+                    min_cursor = Some(min_cursor.map(|m: u64| m.min(p.cursor)).unwrap_or(p.cursor));
+                }
+                if consumes_priority(p) {
+                    min_priority_cursor = Some(
+                        min_priority_cursor
+                            .map(|m: u64| m.min(p.priority_cursor))
+                            .unwrap_or(p.priority_cursor),
+                    );
+                }
+                if consumes_observation(p) {
+                    min_observation_cursor = Some(
+                        min_observation_cursor
+                            .map(|m: u64| m.min(p.observation_cursor))
+                            .unwrap_or(p.observation_cursor),
+                    );
+                }
+                if p.filters.want_bp || p.on_stop.is_some() || !p.breakpoints.is_empty() {
+                    wants_stop = true;
+                }
+                if p.on_event_batch.is_some() {
+                    if let Some(w) = &p.filters.watch {
+                        any_watch = true;
+                        page_limit = page_limit.max(w.batch);
+                    }
                 }
             }
-        }
-        let page_limit = if any_watch {
-            page_limit.clamp(1, RING_PAGE_CAP)
-        } else {
-            RING_PAGE_CAP
-        };
-        // adaptive good-citizen ceiling under flood (see adapt_page_limit)
-        let page_limit = page_limit.min(ADAPT_PAGE.load(Ordering::Relaxed));
-        (min_cursor, min_priority_cursor, min_observation_cursor, wants_stop, page_limit)
-    });
+            let page_limit = if any_watch {
+                page_limit.clamp(1, RING_PAGE_CAP)
+            } else {
+                RING_PAGE_CAP
+            };
+            // adaptive good-citizen ceiling under flood (see adapt_page_limit)
+            let page_limit = page_limit.min(ADAPT_PAGE.load(Ordering::Relaxed));
+            (
+                min_cursor,
+                min_priority_cursor,
+                min_observation_cursor,
+                wants_stop,
+                page_limit,
+            )
+        });
     let knobs_dirty = NATIVE_DIRTY.swap(false, Ordering::AcqRel);
     let pending_native_removals = subscriptions::has_native_removals();
     let pending_hook_removals = super::decisions::has_hook_removals();
@@ -1338,9 +1398,7 @@ fn tick(pending: &mut Vec<(String, Py<PyAny>)>, port: u16) {
             .priority_events
             .iter()
             .chain(shared.events.iter())
-            .filter(|event| {
-                event.kind == EVENT_MODULE_LOAD || event.kind == EVENT_MODULE_UNLOAD
-            })
+            .filter(|event| event.kind == EVENT_MODULE_LOAD || event.kind == EVENT_MODULE_UNLOAD)
             .map(|event| event.arg0)
             .collect();
         bases.sort_unstable();
@@ -1402,53 +1460,74 @@ fn diag(msg: &str) {
 /// are still recomputed as a union because they are script-owned policy.
 /// Runs on the scripting thread, never in an analysis callback.
 fn recompute_native_knobs(client: &mut TickClient) {
-    let (any, all, union, telemetry, hook_observation) = with_registry(|r| {
-        let mut any = false;
-        let mut all = false;
-        let mut union = crate::new_set();
-        let mut telemetry = [false; 3]; // memory, exec, branch
-        let mut hook_observation = false;
-        for p in r.values() {
-            if p.state != STATE_RUNNING {
-                continue;
-            }
-            for subscription in p.events.values() {
-                match subscription.selector {
-                    EventSelector::Kind(EVENT_MEMORY) => telemetry[0] = true,
-                    EventSelector::Kind(EVENT_EXEC) => telemetry[1] = true,
-                    EventSelector::Kind(EVENT_BRANCH_EDGE) => telemetry[2] = true,
-                    EventSelector::Kind(EVENT_HOOK_REGS)
-                    | EventSelector::Kind(crate::event::EVENT_HOOK_RETURN) => {
-                        hook_observation = true
+    let (any, all, union, telemetry, hook_entry_all, hook_return_all, hook_observation_interests) =
+        with_registry(|r| {
+            let mut any = false;
+            let mut all = false;
+            let mut union = crate::new_set();
+            let mut telemetry = [false; 3]; // memory, exec, branch
+            let mut hook_entry_all = false;
+            let mut hook_return_all = false;
+            let mut hook_observation_interests = Vec::new();
+            for p in r.values() {
+                if p.state != STATE_RUNNING {
+                    continue;
+                }
+                for subscription in p.events.values() {
+                    match subscription.selector {
+                        EventSelector::Kind(EVENT_MEMORY) => telemetry[0] = true,
+                        EventSelector::Kind(EVENT_EXEC) => telemetry[1] = true,
+                        EventSelector::Kind(EVENT_BRANCH_EDGE) => telemetry[2] = true,
+                        EventSelector::Kind(EVENT_HOOK_REGS) => match subscription.hook_address {
+                            Some(address) => hook_observation_interests.push((address, false)),
+                            None => hook_entry_all = true,
+                        },
+                        EventSelector::Kind(crate::event::EVENT_HOOK_RETURN) => {
+                            match subscription.hook_address {
+                                Some(address) => hook_observation_interests.push((address, true)),
+                                None => hook_return_all = true,
+                            }
+                        }
+                        _ => {}
                     }
-                    _ => {}
+                }
+                if let Some(watch) = &p.filters.watch {
+                    telemetry[0] |= watch.kinds_mask & (1u32 << EVENT_MEMORY) != 0;
+                    telemetry[1] |= watch.kinds_mask & (1u32 << EVENT_EXEC) != 0;
+                    telemetry[2] |= watch.kinds_mask & (1u32 << EVENT_BRANCH_EDGE) != 0;
+                }
+                if p.on_syscall.is_some() {
+                    any = true;
+                    match &p.filters.syscall_numbers {
+                        None => all = true,
+                        Some(numbers) => union.extend(numbers.iter().copied()),
+                    }
+                }
+                for subscription in p.events.values().filter(|subscription| {
+                    subscription.selector == EventSelector::Kind(EVENT_SYSCALL)
+                }) {
+                    any = true;
+                    match &subscription.syscall_numbers {
+                        None => all = true,
+                        Some(numbers) => union.extend(numbers.iter().copied()),
+                    }
                 }
             }
-            if let Some(watch) = &p.filters.watch {
-                telemetry[0] |= watch.kinds_mask & (1u32 << EVENT_MEMORY) != 0;
-                telemetry[1] |= watch.kinds_mask & (1u32 << EVENT_EXEC) != 0;
-                telemetry[2] |= watch.kinds_mask & (1u32 << EVENT_BRANCH_EDGE) != 0;
-            }
-            if p.on_syscall.is_some() {
-                any = true;
-                match &p.filters.syscall_numbers {
-                    None => all = true,
-                    Some(numbers) => union.extend(numbers.iter().copied()),
-                }
-            }
-            for subscription in p.events.values().filter(|subscription| {
-                subscription.selector == EventSelector::Kind(EVENT_SYSCALL)
-            }) {
-                any = true;
-                match &subscription.syscall_numbers {
-                    None => all = true,
-                    Some(numbers) => union.extend(numbers.iter().copied()),
-                }
-            }
-        }
-        (any, all, union, telemetry, hook_observation)
-    });
-    crate::hooks::set_observation_enabled(hook_observation);
+            (
+                any,
+                all,
+                union,
+                telemetry,
+                hook_entry_all,
+                hook_return_all,
+                hook_observation_interests,
+            )
+        });
+    crate::hooks::publish_observation_interests(
+        hook_entry_all,
+        hook_return_all,
+        &hook_observation_interests,
+    );
     for (kind, enabled) in [EVENT_MEMORY, EVENT_EXEC, EVENT_BRANCH_EDGE]
         .into_iter()
         .zip(telemetry)
@@ -1497,6 +1576,26 @@ fn parse_stop_action(value: &Bound<'_, PyAny>) -> Result<StopAction, String> {
             .ok_or_else(|| format!("unknown breakpoint action: {name}"));
     }
     Err("breakpoint callback must return None, an action string, or {'action': ...}".to_string())
+}
+
+const MAX_BREAKPOINT_RETURN_BYTES: usize = 4096;
+
+fn bounded_breakpoint_return(value: &Bound<'_, PyAny>) -> String {
+    let mut rendered = value
+        .repr()
+        .map(|value| value.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| "<return repr failed>".to_string());
+    if rendered.len() <= MAX_BREAKPOINT_RETURN_BYTES {
+        return rendered;
+    }
+    let suffix = "…<truncated>";
+    let mut end = MAX_BREAKPOINT_RETURN_BYTES.saturating_sub(suffix.len());
+    while !rendered.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    rendered.truncate(end);
+    rendered.push_str(suffix);
+    rendered
 }
 
 /// Invokes callbacks explicitly bound with pb.breakpoint().  This is kept
@@ -1557,7 +1656,9 @@ fn dispatch_bound_breakpoints(
         return None;
     }
 
-    let mut merged: Option<StopAction> = None;
+    // A callback attached to an already-existing native breakpoint augments
+    // the traditional debugger; it cannot silently resume over that stop.
+    let mut merged = subscriptions::has_external_owner(hit_id).then_some(StopAction::Stay);
     for handler in handlers {
         // Give every plugin its own dictionary.  A handler is free to annotate
         // its event, but those mutations must not leak into another plugin.
@@ -1587,11 +1688,16 @@ fn dispatch_bound_breakpoints(
                 .callback
                 .call1(py, (event,))
                 .map_err(|error| error.to_string())
-                .and_then(|value| parse_stop_action(value.bind(py)))
         });
-        let (action, error) = match result {
-            Ok(action) => (action, None),
-            Err(error) => (StopAction::Stay, Some(error)),
+        let (action, last_return, error) = match result {
+            Ok(value) => {
+                let last_return = bounded_breakpoint_return(value.bind(py));
+                match parse_stop_action(value.bind(py)) {
+                    Ok(action) => (action, Some(last_return), None),
+                    Err(error) => (StopAction::Stay, Some(last_return), Some(error)),
+                }
+            }
+            Err(error) => (StopAction::Stay, None, Some(error)),
         };
         merged = Some(merge_action(merged, action));
 
@@ -1600,6 +1706,12 @@ fn dispatch_bound_breakpoints(
             if let Some(plugin) = registry.get_mut(&handler.plugin) {
                 plugin.last_breakpoint_gen = shared.stop_gen;
                 plugin.delivered = plugin.delivered.saturating_add(1);
+                if let Some(binding) = plugin.breakpoints.get_mut(&handler.id) {
+                    binding.last_stop_generation = shared.stop_gen;
+                    binding.last_action = Some(action.name().to_string());
+                    binding.last_return = last_return.clone();
+                    binding.last_error = error.clone();
+                }
                 if error.is_some() {
                     plugin.state = STATE_ERROR;
                 }
@@ -1611,6 +1723,7 @@ fn dispatch_bound_breakpoints(
         if released && subscriptions::release_native(handler.id) {
             subscriptions::queue_native_removal(handler.id);
         }
+        super::publish_list_snapshot();
         if let Some(error) = error {
             output::push(
                 &handler.plugin,
@@ -1620,7 +1733,6 @@ fn dispatch_bound_breakpoints(
                 "plugin {} breakpoint {} callback failed: {error}",
                 handler.plugin, handler.id
             ));
-            super::publish_list_snapshot();
             super::native_policies::refresh_best_effort("breakpoint callback failed");
         }
     }
@@ -2064,9 +2176,8 @@ fn dispatch_one(py: Python<'_>, name: &str, shared: &TickShared) {
             }
             for handler in &s.event_handlers {
                 if let Some(subscription) = p.events.get_mut(&handler.id) {
-                    subscription.oom_generation = subscription
-                        .oom_generation
-                        .max(handler.oom_generation);
+                    subscription.oom_generation =
+                        subscription.oom_generation.max(handler.oom_generation);
                     subscription.mirror_generation = subscription
                         .mirror_generation
                         .max(handler.mirror_generation);
@@ -2151,7 +2262,13 @@ mod registration_boundary_tests {
     fn each_native_lane_uses_its_exact_registration_edge() {
         assert!(!after_registration_edge(10, EventLane::Main, 10, 20, 30));
         assert!(after_registration_edge(11, EventLane::Main, 10, 20, 30));
-        assert!(!after_registration_edge(20, EventLane::Priority, 10, 20, 30));
+        assert!(!after_registration_edge(
+            20,
+            EventLane::Priority,
+            10,
+            20,
+            30
+        ));
         assert!(after_registration_edge(21, EventLane::Priority, 10, 20, 30));
         assert!(!after_registration_edge(
             30,
@@ -2224,9 +2341,7 @@ fn route_named_handlers(
         {
             continue;
         }
-        if handler.selector == EventSelector::Kind(EVENT_SYSCALL)
-            && event.kind == EVENT_SYSCALL
-        {
+        if handler.selector == EventSelector::Kind(EVENT_SYSCALL) && event.kind == EVENT_SYSCALL {
             let number = event.arg0 as u32;
             if handler
                 .syscall_numbers
@@ -2330,12 +2445,7 @@ fn route_event(
 ) -> bool {
     let result: Option<Result<(), String>> = match event.kind {
         EVENT_CONTEXT_CHANGE if event.arg0 == CONTEXT_CHANGE_EXCEPTION => {
-            if event.arg3 != 0
-                && !s
-                    .exception_generations
-                    .borrow_mut()
-                    .accept(event.arg3)
-            {
+            if event.arg3 != 0 && !s.exception_generations.borrow_mut().accept(event.arg3) {
                 return false;
             }
             let code = event.arg1 as u32;
@@ -2360,11 +2470,7 @@ fn route_event(
         }
         EVENT_SYSCALL => {
             if event.address != 0 {
-                if !s
-                    .syscall_generations
-                    .borrow_mut()
-                    .accept(event.address)
-                {
+                if !s.syscall_generations.borrow_mut().accept(event.address) {
                     return false;
                 }
             }
@@ -2400,8 +2506,7 @@ fn route_event(
         }
         EVENT_MODULE_LOAD | EVENT_MODULE_UNLOAD => {
             if event.arg3 != 0 {
-                let Some(generation) =
-                    events::unseen_module_generation(s.module_generation, event)
+                let Some(generation) = events::unseen_module_generation(s.module_generation, event)
                 else {
                     return false;
                 };

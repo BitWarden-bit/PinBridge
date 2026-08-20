@@ -3,14 +3,17 @@ import { api } from "../api";
 import { getLang, setLang, useT } from "../i18n";
 import { IconChip, IconFollow, IconGo, IconPause, IconPlay, IconStepInto, IconStepOver } from "../icons";
 
-export default function Toolbar({ onStop, onFollowRip, onGoto, tid, status, target, onKillSession }) {
+export default function Toolbar({ onStop, onFollowRip, onGoto, tid, status, target, onKillSession, onReleaseSession }) {
   const t = useT();
   return (
     <div id="toolbar">
       <span id="brand"><IconChip /> PinBridge</span>
       <span className="sep" />
-      <button title={target || "current target"} onClick={onKillSession}>
-        ⏏ {t("target")}
+      <button title="释放工作区控制；保留目标进程与 Pin/Agent 后端" onClick={onReleaseSession}>
+        ⏏ 释放连接
+      </button>
+      <button title={target || "终止当前目标"} onClick={onKillSession}>
+        ■ 终止目标
       </button>
       <span className="sep" />
       <button className="primary" onClick={() => api.control("resume")}>

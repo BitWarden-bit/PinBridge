@@ -34,12 +34,14 @@ fn timestamp() -> String {
 /// Truncates the log and writes the startup header. Call once from the tool
 /// main before anything else that logs.
 pub fn init(child_control_port: Option<u16>) {
-    let configured = std::env::var("PINBRIDGE_AGENT_LOG")
-        .unwrap_or_else(|_| "pinbridge-agent.log".to_string());
+    let configured =
+        std::env::var("PINBRIDGE_AGENT_LOG").unwrap_or_else(|_| "pinbridge-agent.log".to_string());
     let selected = match child_control_port {
         Some(port) => {
             let original = std::path::Path::new(&configured);
-            let parent = original.parent().unwrap_or_else(|| std::path::Path::new(""));
+            let parent = original
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new(""));
             let stem = original
                 .file_stem()
                 .and_then(|value| value.to_str())

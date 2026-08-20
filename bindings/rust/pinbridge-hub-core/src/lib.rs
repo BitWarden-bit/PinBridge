@@ -8,10 +8,13 @@
 pub mod activities;
 pub mod agent;
 pub mod control;
+mod hook_query;
+pub mod hook_signature;
 pub mod ipc;
 pub mod script_service;
 pub mod service;
 pub mod session;
+mod trace_query;
 
 pub use agent::{AgentApi, AgentConnection, AgentOutputLine, AgentScript};
 pub use control::{Caller, ChannelActor, ControlMode, ControlState};

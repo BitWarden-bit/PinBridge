@@ -5,6 +5,8 @@
 
 PbStatus PbBackendInsInsertCaptureRegs(
     PbInsHandle ins, PbInsCaptureRegsCallback callback, void* user_data);
+PbStatus PbBackendInsInsertHookMonitor(
+    PbInsHandle ins, PbInsHookMonitorCallback callback, void* user_data);
 PbStatus PbBackendInsInsertCaptureRegsCtx(
     PbInsHandle ins, PbInsContextCaptureRegsCallback callback, void* user_data);
 PbStatus PbBackendInsInsertMemoryOperands(

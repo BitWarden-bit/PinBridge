@@ -85,6 +85,33 @@ library。`--no-default-features` 仍保留为明确选择的无 Python 原生 a
   宿主随后统一隔离该插件：撤销高频原生策略，释放它拥有的精确断点以及每一份异步/同步
   Hook 租约，并重新计算原生过滤开关；错误插件不会留下仍能命中但已无人处理的原生点。
 
+## 模块脚本与回调脚本
+
+两类脚本共用同一个内嵌 CPython 宿主，但在控制面和 UI 中是不同资源：
+
+| 类型 | 归属 | 用途 | 生命周期 |
+|---|---|---|---|
+| `callback` | 一个断点、Hook 或异常处理入口 | 检查或修改一次命中现场并返回控制动作 | 随所属绑定创建、替换和卸载 |
+| `module` | 当前分析会话 | 保存跨事件状态，依次布置 Hook、检查现场、启动 Trace，再进入下一阶段 | 独立加载、热更新、停止、重启和删除 |
+
+`script_inject` / `script_replace` 接受可选 `kind`；省略时固定为 `module`。桌面端从断点、Hook、
+异常详情创建代码时显式使用 `callback`，因此这些局部处理器不会进入独立的“模块脚本”列表。
+已有脚本不允许在更新时改变类型，避免把一个绑定拥有的回调静默提升为会话级模块。
+
+模块的“停止”和“删除”严格分开：
+
+- `script_stop(name)`：调用 `on_unload()`，释放模块拥有的断点、Hook、插桩策略等运行时资源，
+  但 Hub 保留源码和 generation；
+- `script_start(name)`：从当前 Hub 保留的源码重新加载已停止模块；
+- `script_replace(name, source, kind="module")`：运行中执行事务式热替换，停止状态下只保存新源码，
+  不会隐式启动；
+- `script_remove(name)`：卸载并删除 Hub 中保留的源码记录。
+
+复杂模块应写成跨回调推进的事件状态机，不能在一个回调里运行长期 `while` 循环。所有 Python
+插件共用一条脚本线程，长时间阻塞会同时延迟其他模块和局部回调。典型流程是：`pb_init()`
+布置第一阶段 Hook；命中回调读取现场并发布局部插桩策略；`on_event_batch()` 累积结果并切换
+下一阶段；`on_unload()` 负责显式清理，宿主再执行最终的原生租约回收。
+
 ## 脚本 API v2(`import pb`)
 
 ### 注册函数（收窄/声明订阅；改的是"当前插件"的过滤器）
@@ -157,12 +184,15 @@ service-class 高位会在进入事件和过滤器前移除。entry/exit 通过�
 - `pb.pin_attach() -> bool`：从 `pin.detach` 处理函数请求重新附加；`True` 表示 Pin 已接受，
   `False` 表示分离尚未完成，需要稍后重试。桥接/状态错误抛出 `RuntimeError`。
 
-断点（64 槽）与 hook 点（4096 槽，命中产 kind-1 hook_regs 事件）:
+断点（64 槽）与 Hook 点（32768 槽，命中产 kind-1 hook_regs 事件）:
 - `pb.bp_set(addr) -> id | None`;`pb.bp_remove(id) -> bool`
-- `pb.breakpoint(addr, callback, once=False, thread_id=None) -> id`：把精确断点绑定到
+- `pb.breakpoint(addr, callback, *, description, once=False, thread_id=None) -> id`：把精确断点绑定到
   当前插件的 Python 函数。命中时目标保持停止，回调收到 `{type,id,address,addr,tid,
   stop_generation,hits,arch,pointer_width,context_complete,registers}`；返回 `stay`、`resume`、
-  `step_into` 或 `step_over`。不返回等同于 `stay`，回调异常也保持停止。
+  `step_into` 或 `step_over`。`description` 是每个回调必填的单行说明（1–512 字节），用于
+  MCP 清单、审计和 UI 详情；缺失、空白或包含控制字符时拒绝注册。不返回等同于 `stay`，
+  回调异常也保持停止。最近一次完整 Python 返回值以最多 4 KiB 的 `repr` 保存在断点清单，
+  与解析后的控制动作、异常分开返回给 MCP，并固定显示在 UI 详情中。
 - `pb.breakpoint_remove(id) -> bool`：只删除当前插件对该断点的绑定。插件卸载时自动
   释放其全部绑定；多个插件可共享同一原生断点。
 - `pb.execution_trap(start, end, once=True, thread_id=None) -> id`：注册半开执行区间
@@ -188,8 +218,10 @@ service-class 高位会在进入事件和过滤器前移除。entry/exit 通过�
 符号、导出与反汇编：
 - `pb.resolve(addr) -> "mod!sym+0x.." | None`（含 IAT thunk 一层追踪）
 - `pb.resolve_name("module!Export") -> int | None`
-- `pb.exports(module) -> [(addr, name), ...]`（命名 PE32/PE32+ 导出，上限 8192)
-- `pb.disasm(addr, count≤128) -> [(addr, size, kind, target, text), ...]`
+- `pb.exports(module) -> [(addr, name), ...]`（命名 PE32/PE32+ 导出，上限 32768）
+- `pb.disasm(addr, count≤128) -> [(addr, size, kind, target, text), ...]`：直接使用 Agent
+  内部的 `PIN_SafeCopy + XED` 解码，不经过 loopback RPC，因此普通异步回调和
+  `pb.intercept(...)` 同步接管回调里都可使用。
 
 枚举与策略：
 - `pb.modules() -> [(base, end, is_main, name), ...]`;`pb.threads() -> [tid, ...]`
@@ -342,8 +374,10 @@ VMP 系保护壳把自己的异常导向 SEH 处理；经典解法是掐 `KiUser
 - 插件游标每 tick 从 64K 事件环翻页 ≤2048 条；默认引擎全开时 exec 洪流 ~100 万条/秒，
   翻页只是追赶。宿主按上一 tick 的实际 Python 开销自适应缩页/降频（5→40ms)。
 - `on_stop` 在断点命中的 ~10ms 内触发；`pb.wait_stop` 是脚本自动化的核心节拍。
-- "hook 全部 ntdll 导出"用 hook 点（4096 槽）不是断点（64 槽）——`exports` + 循环
-  `hook_set` 即可，命中事件自带 RCX/RDX/R8/R9 四个 Win64 参数寄存器。
+- "Hook 全部 ntdll 导出"使用函数调用日志点（32768 槽）而不是断点（64 槽）。CLI、Hub 和
+  UI 使用单次批量发布，不逐点重建快照。PE 导出不含原型：已登记签名的入口最多按真实 ABI
+  位置采集 16 个固定参数，整数返回读 RAX/EAX，浮点返回读 XMM0；未登记签名明确保留原始
+  ABI 槽，不猜测类型。普通 `hook` 命令仍是指令 Hook。
 
 ## 已知怪癖
 
@@ -379,7 +413,8 @@ pb.off(subscription_id)
   在 Python 长期处理不过来时覆盖旧记录并计入丢失；
 - `pb.off(subscription_id) -> bool`：只移除当前插件拥有的订阅；
 - `pb.event_names() -> list[str]`：返回 `pb.on` 接受的规范事件名；
-- 断点是会停止目标的同步事件，必须使用 `pb.breakpoint(address, callback)` 注册。
+- 断点是会停止目标的同步事件，必须使用
+  `pb.breakpoint(address, callback, description="为什么设置以及命中后做什么")` 注册。
 
 目前已接入的命名事件：`process.start`、`process.exit`、`process.prepare_fini`、`thread.start`、
 `thread.exit`、`module.load`、`module.unload`、`exception`、`context.change`、
@@ -464,9 +499,10 @@ Python；退出交接也只有有界确认等待。Python 处理函数统一在�
 不同应用线程可能乱序写入事件环，因此这里不是只记“最大代号”，而是每个处理函数使用
 固定 65536 位滑动窗口；乱序的真实事件不会被误删，状态大小也不会随运行时间增长。
 命名 Hook 观察也使用该 16384 槽观察环；原生点本身就是第一层地址过滤，每个处理函数再按
-自己的 `address` 精确匹配。Hook 的普通环副本仅供 CLI/UI 和 `on_event_batch` 兼容消费，
-不会再次路由到命名回调，因此同一次原生采集只调用一次对应 Python 处理函数。同步和异步
-Hook 订阅共用地址租约，任一 `once` 处理函数完成都不会提前拆除其他订阅仍使用的点。
+自己的 `address` 精确匹配。普通环副本继续供 CLI 与 `on_event_batch` 兼容消费；UI/MCP 的
+函数调用监控改读独立 32768 槽 Hook 日志，不会被通用遥测洪流覆盖，也不会再次路由到命名
+回调。因此同一次原生采集只调用一次对应 Python 处理函数。同步和异步 Hook 订阅共用地址
+租约，任一 `once` 处理函数完成都不会提前拆除其他订阅仍使用的点。
 内存不足另有不分配 Rust 堆、不加锁的紧急路径：先用预先转换好的固定文件名追加
 `pinbridge_oom.log`，再发布一个原子保底槽并尝试写高优先级环。脚本宿主先处理当次可用的
 环记录，缺失时读取保底槽，并按 `occurrence` 去重迟到的环记录，因此同一次原生回调只调用一次 Python。并发 OOM
@@ -492,7 +528,9 @@ def pb_init():
     decision_id = pb.intercept("child.follow", decide_child, once=False)
 ```
 
-- `pb.intercept(name, callback, once=False) -> decision_id`：注册当前插件拥有的同步处理函数；
+- `pb.intercept(name, callback, *, description="", once=False, address=None, thread_id=None,
+  numbers=None, codes=None) -> decision_id`：注册当前插件拥有的同步处理函数；Hook 接管必须填写
+  1–512 字节的单行 `description`，其他接管类型为兼容旧脚本暂时可省略；
 - `pb.unintercept(decision_id) -> bool`：删除当前插件的同步处理函数；
 - `pb.decision_names() -> list[str]`：返回所有同步决定名；
 - 回调返回 `bool` 或 `{"follow": bool}`；多处理函数采用“全部同意才跟随”；
@@ -502,8 +540,9 @@ def pb_init():
 - 无处理函数、Python 未就绪/忙碌、捕获失败、异常、非法返回值和超时都不跟随。
 
 Pin 回调只复制固定上限的 PID/命令行并等待 semaphore，不获取 GIL；Python 始终在专用
-脚本线程执行。决定处理期间可以使用 `pb.print`，但不能调用需要查询服务或目标停止状态的
-`pb.*` 动作，这些调用会快速返回失败以避免同步回调与查询服务互相等待。
+脚本线程执行。决定处理期间可以使用 `pb.print` 和不经过查询服务的本地 API（包括
+`pb.disasm`），但不能调用需要查询服务或目标停止状态的其他 `pb.*` 动作；这些调用会快速
+返回失败以避免同步回调与查询服务互相等待。
 
 真实回归入口是 `fixtures/child_follow_demo/run.ps1`，`-Follow $false` 和
 `-Follow $true` 都必须通过。Fini 日志给出 `child_decisions`、`child_follow`、
@@ -523,15 +562,21 @@ def entry(event):
         return {"action": "return", "return_value": 0x1234}
     return None
 
-entry_id = pb.intercept("hook.entry", entry, address=api_address, once=True)
+entry_id = pb.intercept(
+    "hook.entry", entry, address=api_address, once=True,
+    description="当首参为 5 时跳过目标函数并返回测试值",
+)
 
 def returned(event):
     return {"return_value": 0x5678}
 
-return_id = pb.intercept("hook.return", returned, address=ret_address)
+return_id = pb.intercept(
+    "hook.return", returned, address=ret_address,
+    description="在指定返回指令改写返回值",
+)
 ```
 
-`address` 是必填的非零绝对地址，`thread_id` 可选。注册会自动复用或创建 4096 点原生
+`address` 是必填的非零绝对地址，`thread_id` 可选。注册会自动复用或创建 32768 点原生
 Hook 集合中的对应点；订阅卸载时按所有权计数释放。返回字典支持：
 
 - `registers={"rax": value, ...}`：按当前 x86/x64 架构名修改通用寄存器；
@@ -545,6 +590,23 @@ Hook 集合中的对应点；订阅卸载时按所有权计数释放。返回字
 决定回调里 `pb.print` 可用，普通 `pb.*` 目标 RPC 会快速失败。真实回归入口为
 `fixtures/hook_python_demo/run.ps1`，同时验证入口跳过、返回值修改、地址绑定异步观察的
 `once`/常驻语义，以及两类订阅在相反释放顺序下都不会互相提前拆除。
+
+Hook 命中路径不扫描 32768 点或全部脚本：JIT 插桩阶段对有序地址快照二分；同步接管前在
+原生层对 `(address, entry/return, thread_id/全线程)` 有序表最多二分两次；脚本线程最后从
+同键哈希索引只取得全线程桶与当前线程桶，再调用桶内回调。DLL 批量 Hook 只发布一次快照，
+并按 64 KiB 代码窗口合并 JIT 失效区间。函数日志启用后仅 `ret` 指令做一次所属函数地址
+二分；运行时用固定容量线程本地调用栈和入口 RSP/ESP 配对返回，不分配、不阻塞、不调用
+Python。入口/返回还写入专用 32768 槽 try-lock 日志，记录真实 UTC 纳秒时间和 API/指令
+类型位；UI 的统一时间线按 `before` 序列游标翻阅历史，并按线程+函数配对入口返回。UI/MCP
+查询无需扫描通用事件环。异步
+`pb.on("hook.*")` 另有精确地址/类型原生过滤，不会因为存在任意 Hook 观察者就把所有 Hook
+命中复制进 Python 观察通道。
+
+Hub/MCP 的函数签名接口接受 C 风格原型，并强制记录来源 `pdb/header/manual/ai_inferred` 与
+置信度。签名解析器输出参数名、原始类型、规范种类、目标相关字节大小、原始值、类型化显示值
+和质量标记；支持有符号/无符号 8–64 位整数、布尔、`float/double`、指针、UTF-8/UTF-16
+字符串指针、常见 Windows 整数别名与显式聚合大小。未知 typedef 保持 `unknown_type`，聚合
+缺少字段布局时保持 `aggregate_layout_required`，不会伪造结构内容。
 
 ### 同步系统调用
 
@@ -600,7 +662,7 @@ decision_id = pb.intercept(
 - 返回 `None` 表示保持目标上下文，返回 `{"registers": {name: value}}` 修改指定寄存器；
 - 未知寄存器、返回结构错误、回调异常、超时、槽满或多插件字段冲突时，本次不应用任何
   Python 补丁，继续操作系统原有异常处理路径；
-- 回调在脚本线程执行，可以 `pb.print`，不能发起需要查询服务的目标 RPC。
+- 回调在脚本线程执行，可以 `pb.print` 和 `pb.disasm`，不能发起其他需要查询服务的目标 RPC。
 
 直接把 `rip/eip` 改到函数入口不等同于执行一次 `call`，栈布局仍由脚本负责。真实 x64
 回归 `fixtures/exception_python_demo/run.ps1` 触发访问违规，回调根据 `from_registers`

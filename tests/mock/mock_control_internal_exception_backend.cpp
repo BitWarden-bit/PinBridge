@@ -24,6 +24,11 @@ PbStatus PbBackendEnableSingleStepPassthrough(uint64_t* out_callback)
     return PB_OK;
 }
 
+PbStatus PbBackendSetSingleStepPassthrough(PbThreadId thread_id, uint8_t enabled)
+{
+    return (thread_id == 7u && enabled <= 1u) ? PB_OK : PB_ERR_INVALID_ARGUMENT;
+}
+
 PbStatus PbBackendTryStart(
     PbThreadId thread_id, PbInternalExceptionCallback callback, void* user_data,
     uint64_t* out_scope)

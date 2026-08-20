@@ -2,7 +2,7 @@
 
 use pinbridge_proto as proto;
 use std::io::{Error, ErrorKind, Result};
-use std::net::TcpStream;
+use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
 
 pub const KIND_NAMES: [&str; 8] = [
@@ -47,10 +47,16 @@ pub struct Client {
 
 impl Client {
     pub fn connect(port: u16) -> Result<Client> {
-        let stream = TcpStream::connect(("127.0.0.1", port))?;
+        Self::connect_with_timeout(port, Duration::from_secs(5))
+    }
+
+    pub fn connect_with_timeout(port: u16, timeout: Duration) -> Result<Client> {
+        let address = SocketAddr::from(([127, 0, 0, 1], port));
+        let timeout = timeout.max(Duration::from_millis(1));
+        let stream = TcpStream::connect_timeout(&address, timeout)?;
         stream.set_nodelay(true)?;
-        stream.set_read_timeout(Some(Duration::from_secs(5)))?;
-        stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+        stream.set_read_timeout(Some(timeout))?;
+        stream.set_write_timeout(Some(timeout))?;
         Ok(Client { stream })
     }
 
@@ -118,11 +124,112 @@ impl Client {
     pub fn ring_newest(&mut self, limit: u64) -> Result<(u64, Vec<proto::EventRecord>)> {
         let (total, ..) = self.counters()?;
         let after = total.saturating_sub(limit);
-        self.ring_page(after, limit).map(|(_, _, events)| (total, events))
+        self.ring_page(after, limit)
+            .map(|(_, _, events)| (total, events))
+    }
+
+    /// Newest events from the Agent's rare/high-priority lane. The returned
+    /// tuple is (lane total, producer drops, next cursor, events).
+    pub fn priority_newest(
+        &mut self,
+        limit: u64,
+    ) -> Result<(u64, u64, u64, Vec<proto::EventRecord>)> {
+        let mut request = Vec::with_capacity(8);
+        proto::put_u64(&mut request, limit);
+        let body = self.request(proto::op::PRIORITY_NEWEST, &request)?;
+        let mut reader = proto::Reader::new(&body);
+        let total = reader.u64_or_err()?;
+        let dropped = reader.u64_or_err()?;
+        let next = reader.u64_or_err()?;
+        let count = reader.u64_or_err()?;
+        let mut events = Vec::with_capacity(count as usize);
+        let mut rest = reader.remaining();
+        for _ in 0..count {
+            let event = proto::EventRecord::decode(rest)
+                .ok_or_else(|| Error::new(ErrorKind::InvalidData, "short priority event"))?;
+            rest = &rest[proto::EVENT_WIRE_LEN..];
+            events.push(event);
+        }
+        Ok((total, dropped, next, events))
+    }
+
+    /// Newest records from the dedicated Hook call-log lane. Generic
+    /// instruction/memory telemetry cannot evict these records.
+    pub fn hook_events_newest(
+        &mut self,
+        limit: u64,
+    ) -> Result<(u64, u64, u64, Vec<proto::HookLogRecord>)> {
+        self.hook_events_window(limit, 0)
+    }
+
+    /// Read one retained Hook-log window. `before == 0` selects the newest
+    /// records; otherwise records are strictly older than that sequence.
+    pub fn hook_events_window(
+        &mut self,
+        limit: u64,
+        before: u64,
+    ) -> Result<(u64, u64, u64, Vec<proto::HookLogRecord>)> {
+        let mut request = Vec::with_capacity(16);
+        proto::put_u64(&mut request, limit.clamp(1, 4096));
+        proto::put_u64(&mut request, before);
+        let body = self.request(proto::op::HOOK_EVENTS_NEWEST, &request)?;
+        let mut reader = proto::Reader::new(&body);
+        let total = reader.u64_or_err()?;
+        let dropped = reader.u64_or_err()?;
+        let next = reader.u64_or_err()?;
+        let count = reader.u64_or_err()?;
+        let mut events = Vec::with_capacity(count as usize);
+        let mut rest = reader.remaining();
+        for _ in 0..count {
+            let event = proto::HookLogRecord::decode(rest)
+                .ok_or_else(|| Error::new(ErrorKind::InvalidData, "short Hook event"))?;
+            rest = &rest[proto::HOOK_LOG_WIRE_LEN..];
+            events.push(event);
+        }
+        Ok((total, dropped, next, events))
+    }
+
+    /// Newest records from the independent timestamped Syscall lane.
+    pub fn syscall_events_newest(
+        &mut self,
+        limit: u64,
+    ) -> Result<(u64, u64, u64, Vec<proto::HookLogRecord>)> {
+        self.syscall_events_window(limit, 0)
+    }
+
+    /// Read one retained Syscall window. `before == 0` selects the newest
+    /// records; otherwise records are strictly older than that sequence.
+    pub fn syscall_events_window(
+        &mut self,
+        limit: u64,
+        before: u64,
+    ) -> Result<(u64, u64, u64, Vec<proto::HookLogRecord>)> {
+        let mut request = Vec::with_capacity(16);
+        proto::put_u64(&mut request, limit.clamp(1, 4096));
+        proto::put_u64(&mut request, before);
+        let body = self.request(proto::op::SYSCALL_EVENTS_NEWEST, &request)?;
+        let mut reader = proto::Reader::new(&body);
+        let total = reader.u64_or_err()?;
+        let dropped = reader.u64_or_err()?;
+        let next = reader.u64_or_err()?;
+        let count = reader.u64_or_err()?;
+        let mut events = Vec::with_capacity(count as usize);
+        let mut rest = reader.remaining();
+        for _ in 0..count {
+            let event = proto::HookLogRecord::decode(rest)
+                .ok_or_else(|| Error::new(ErrorKind::InvalidData, "short Syscall event"))?;
+            rest = &rest[proto::HOOK_LOG_WIRE_LEN..];
+            events.push(event);
+        }
+        Ok((total, dropped, next, events))
     }
 
     /// Cursor-paged ring read: events with sequence > `after`.
-    pub fn ring_page(&mut self, after: u64, limit: u64) -> Result<(u64, u64, Vec<proto::EventRecord>)> {
+    pub fn ring_page(
+        &mut self,
+        after: u64,
+        limit: u64,
+    ) -> Result<(u64, u64, Vec<proto::EventRecord>)> {
         let mut request = Vec::with_capacity(16);
         proto::put_u64(&mut request, after);
         proto::put_u64(&mut request, limit);
@@ -385,7 +492,12 @@ impl Client {
             let offset = r.u64_or_err()?;
             let module = read_short_str(&mut r)?;
             let symbol = read_short_str(&mut r)?;
-            out.push(Resolution { kind, offset, module, symbol });
+            out.push(Resolution {
+                kind,
+                offset,
+                module,
+                symbol,
+            });
         }
         Ok(out)
     }
@@ -454,6 +566,13 @@ impl Client {
     /// the new server lands; against the old single-script server this
     /// mis-parses by design.
     pub fn script_list(&mut self) -> Result<Vec<ScriptListEntry>> {
+        Ok(self.script_inventory()?.scripts)
+    }
+
+    /// Multi-script listing plus breakpoint callback bindings. Servers that
+    /// predate the additive binding tail still return a valid empty binding
+    /// collection.
+    pub fn script_inventory(&mut self) -> Result<ScriptInventory> {
         // op 0x42: SCRIPT_STATUS today, SCRIPT_LIST on the new server.
         let body = self.request(proto::op::SCRIPT_STATUS, &[])?;
         let mut r = proto::Reader::new(&body);
@@ -471,7 +590,105 @@ impl Client {
                 dropped,
             });
         }
-        Ok(out)
+        let mut breakpoints = Vec::new();
+        if !r.remaining().is_empty() {
+            let binding_count = r.u32_or_err()?;
+            breakpoints.reserve(binding_count as usize);
+            for _ in 0..binding_count {
+                let id = r.u32_or_err()?;
+                let plugin = read_short_str(&mut r)?;
+                let callback = read_short_str(&mut r)?;
+                let description = read_short_str(&mut r)?;
+                let once = r.u8_or_err()? != 0;
+                let thread_id = match r.u32_or_err()? {
+                    u32::MAX => None,
+                    value => Some(value),
+                };
+                let last_stop_generation = r.u64_or_err()?;
+                let last_action = read_short_str(&mut r)?;
+                let last_return = read_short_str(&mut r)?;
+                let last_error = read_short_str(&mut r)?;
+                breakpoints.push(ScriptBreakpointBinding {
+                    id,
+                    plugin,
+                    callback,
+                    description,
+                    once,
+                    thread_id,
+                    last_stop_generation,
+                    last_action: (!last_action.is_empty()).then_some(last_action),
+                    last_return: (!last_return.is_empty()).then_some(last_return),
+                    last_error: (!last_error.is_empty()).then_some(last_error),
+                });
+            }
+        }
+        let mut decisions = Vec::new();
+        if !r.remaining().is_empty() {
+            let binding_count = r.u32_or_err()?;
+            decisions.reserve(binding_count as usize);
+            for _ in 0..binding_count {
+                let id = r.u64_or_err()?;
+                let plugin = read_short_str(&mut r)?;
+                let selector = read_short_str(&mut r)?;
+                let callback = read_short_str(&mut r)?;
+                let once = r.u8_or_err()? != 0;
+                let thread_id = match r.u32_or_err()? {
+                    u32::MAX => None,
+                    value => Some(value),
+                };
+                let codes = match r.u8_or_err()? {
+                    0 => None,
+                    1 => {
+                        let count = r.u32_or_err()?;
+                        let mut values = Vec::with_capacity(count as usize);
+                        for _ in 0..count {
+                            values.push(r.u32_or_err()?);
+                        }
+                        Some(values)
+                    }
+                    _ => {
+                        return Err(Error::new(
+                            ErrorKind::InvalidData,
+                            "bad decision code filter",
+                        ))
+                    }
+                };
+                let last_generation = r.u64_or_err()?;
+                let last_return = read_short_str(&mut r)?;
+                let last_error = read_short_str(&mut r)?;
+                decisions.push(ScriptDecisionBinding {
+                    id,
+                    plugin,
+                    selector,
+                    callback,
+                    description: String::new(),
+                    once,
+                    address: None,
+                    thread_id,
+                    codes,
+                    last_generation,
+                    last_return: (!last_return.is_empty()).then_some(last_return),
+                    last_error: (!last_error.is_empty()).then_some(last_error),
+                });
+            }
+        }
+        if !r.remaining().is_empty() {
+            let metadata_count = r.u32_or_err()?;
+            for _ in 0..metadata_count {
+                let id = r.u64_or_err()?;
+                let address = r.u64_or_err()?;
+                let description = read_short_str(&mut r)?;
+                if let Some(binding) = decisions.iter_mut().find(|binding| binding.id == id) {
+                    binding.address = (address != 0).then_some(address);
+                    binding.description = description;
+                }
+            }
+        }
+        Ok(ScriptInventory {
+            scripts: out,
+            breakpoints,
+            decisions,
+        })
     }
 
     /// Paged plugin output lines (new server, op 0x43). Wire-level only
@@ -514,23 +731,105 @@ impl Client {
     /// Syscall number filter; mode 0 = all syscalls, 1 = only the listed
     /// numbers.
     pub fn syscall_filter(&mut self, mode: u8, numbers: &[u32]) -> Result<()> {
-        let mut request = Vec::with_capacity(3 + numbers.len() * 4);
+        self.syscall_filter_scoped(mode, numbers, 0, 0)
+    }
+
+    /// Syscall number plus user-mode caller-address filter. A 0/0 scope means
+    /// every caller; otherwise `[scope_start, scope_end)` is matched at syscall
+    /// entry and the decision is retained for the paired exit event.
+    pub fn syscall_filter_scoped(
+        &mut self,
+        mode: u8,
+        numbers: &[u32],
+        scope_start: u64,
+        scope_end: u64,
+    ) -> Result<()> {
+        if (scope_start == 0) != (scope_end == 0) || (scope_end != 0 && scope_end <= scope_start) {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "syscall caller scope must be 0/0 or a non-empty half-open range",
+            ));
+        }
+        let mut request = Vec::with_capacity(19 + numbers.len() * 4);
         request.push(mode);
         request.extend_from_slice(&(numbers.len() as u16).to_le_bytes());
         for number in numbers {
             proto::put_u32(&mut request, *number);
         }
+        proto::put_u64(&mut request, scope_start);
+        proto::put_u64(&mut request, scope_end);
         self.request(proto::op::SYSCALL_FILTER, &request)?;
         Ok(())
     }
 
     /// Adds `address` to the runtime hook point set. Returns false when the
-    /// 4096-entry cap is hit.
+    /// 32768-entry cap is hit.
     pub fn hook_set(&mut self, address: u64) -> Result<bool> {
         let mut request = Vec::with_capacity(8);
         proto::put_u64(&mut request, address);
         let body = self.request(proto::op::HOOK_SET, &request)?;
         Ok(proto::Reader::new(&body).u32_or_err()? != 0)
+    }
+
+    /// Adds many native Hook addresses in one Agent publication. Returns
+    /// (newly_added, total, capacity_full).
+    pub fn hook_set_batch(&mut self, addresses: &[u64]) -> Result<(u32, u32, bool)> {
+        if addresses.len() > 32768 {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "Hook batch exceeds 32768 addresses",
+            ));
+        }
+        let mut request = Vec::with_capacity(4 + addresses.len() * 8);
+        proto::put_u32(&mut request, addresses.len() as u32);
+        for address in addresses {
+            proto::put_u64(&mut request, *address);
+        }
+        let body = self.request(proto::op::HOOK_SET_BATCH, &request)?;
+        let mut reader = proto::Reader::new(&body);
+        let added = reader.u32_or_err()?;
+        let total = reader.u32_or_err()?;
+        let capacity_full = reader.u32_or_err()? != 0;
+        Ok((added, total, capacity_full))
+    }
+
+    /// Scan a bounded target code range by instruction class and optionally
+    /// publish every match as an ordinary (non-function) instruction Hook.
+    pub fn hook_range(
+        &mut self,
+        start: u64,
+        end: u64,
+        kind_mask: u32,
+        apply: bool,
+    ) -> Result<HookRangeResult> {
+        let mut request = Vec::with_capacity(21);
+        proto::put_u64(&mut request, start);
+        proto::put_u64(&mut request, end);
+        proto::put_u32(&mut request, kind_mask);
+        request.push(apply as u8);
+        let body = self.request(proto::op::HOOK_RANGE, &request)?;
+        let mut reader = proto::Reader::new(&body);
+        let decoded = reader.u64_or_err()?;
+        let matched = reader.u64_or_err()?;
+        let count = reader.u32_or_err()? as usize;
+        let added = reader.u32_or_err()?;
+        let total = reader.u32_or_err()?;
+        let flags = reader.u32_or_err()?;
+        let mut addresses = Vec::with_capacity(count);
+        for _ in 0..count {
+            addresses.push(reader.u64_or_err()?);
+        }
+        Ok(HookRangeResult {
+            decoded,
+            matched,
+            added,
+            total,
+            capacity_full: flags & 1 != 0,
+            truncated: flags & 2 != 0,
+            complete: flags & 4 != 0,
+            applied: flags & 8 != 0,
+            addresses,
+        })
     }
 
     pub fn hook_remove(&mut self, address: u64) -> Result<()> {
@@ -554,6 +853,47 @@ impl Client {
             out.push(r.u64_or_err()?);
         }
         Ok(out)
+    }
+
+    /// Function-entry Hooks that emit both entry arguments and normal return
+    /// values. This is the subset armed through the batched/DLL path.
+    pub fn hook_function_list(&mut self) -> Result<Vec<u64>> {
+        let body = self.request(proto::op::HOOK_FUNCTION_LIST, &[])?;
+        let mut r = proto::Reader::new(&body);
+        let count = r.u32_or_err()?;
+        let mut out = Vec::with_capacity(count as usize);
+        for _ in 0..count {
+            out.push(r.u64_or_err()?);
+        }
+        Ok(out)
+    }
+
+    /// Publish the compact ABI layout used by Agent to capture typed
+    /// function arguments and floating-point returns at the right location.
+    pub fn hook_signature_set(
+        &mut self,
+        address: u64,
+        calling_convention: u32,
+        return_kind: u32,
+        parameter_count: u32,
+        float_parameter_mask: u32,
+    ) -> Result<bool> {
+        let mut request = Vec::with_capacity(24);
+        proto::put_u64(&mut request, address);
+        proto::put_u32(&mut request, calling_convention);
+        proto::put_u32(&mut request, return_kind);
+        proto::put_u32(&mut request, parameter_count);
+        proto::put_u32(&mut request, float_parameter_mask);
+        let body = self.request(proto::op::HOOK_SIGNATURE_SET, &request)?;
+        let mut reader = proto::Reader::new(&body);
+        Ok(reader.u32_or_err()? != 0)
+    }
+
+    pub fn hook_signature_remove(&mut self, address: u64) -> Result<()> {
+        let mut request = Vec::with_capacity(8);
+        proto::put_u64(&mut request, address);
+        self.request(proto::op::HOOK_SIGNATURE_REMOVE, &request)?;
+        Ok(())
     }
 
     /// Adds or replaces a synchronous native Hook action rule. Register ids
@@ -619,7 +959,10 @@ impl Client {
         path: &str,
     ) -> Result<()> {
         if ranges.is_empty() || ranges.len() > 16 || threads.len() > 64 {
-            return Err(Error::new(ErrorKind::InvalidInput, "invalid trace spec size"));
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "invalid trace spec size",
+            ));
         }
         let mut kinds_mask: u32 = 0;
         for kind in kinds {
@@ -631,7 +974,8 @@ impl Client {
         if path.len() > u16::MAX as usize {
             return Err(Error::new(ErrorKind::InvalidInput, "trace path too long"));
         }
-        let mut request = Vec::with_capacity(8 + ranges.len() * 16 + threads.len() * 4 + path.len());
+        let mut request =
+            Vec::with_capacity(8 + ranges.len() * 16 + threads.len() * 4 + path.len());
         proto::put_u32(&mut request, kinds_mask);
         request.extend_from_slice(&(ranges.len() as u16).to_le_bytes());
         for (lo, hi) in ranges {
@@ -656,7 +1000,10 @@ impl Client {
     /// before subsequent ring claims.
     pub fn trace_extend(&mut self, ranges: &[(u64, u64)]) -> Result<()> {
         if ranges.is_empty() || ranges.len() > 16 {
-            return Err(Error::new(ErrorKind::InvalidInput, "invalid trace extension size"));
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "invalid trace extension size",
+            ));
         }
         let mut request = Vec::with_capacity(2 + ranges.len() * 16);
         request.extend_from_slice(&(ranges.len() as u16).to_le_bytes());
@@ -681,10 +1028,108 @@ impl Client {
             base: r.u64_or_err()?,
             size: r.u64_or_err()?,
             allocation_base: r.u64_or_err()?,
+            allocation_protect: r.u32_or_err()?,
             protect: r.u32_or_err()?,
             state: r.u32_or_err()?,
             kind: r.u32_or_err()?,
         }))
+    }
+
+    /// Enumerates the target virtual memory map, process heap roots and
+    /// loaded images with their real Pin/PE section layout.
+    pub fn memory_map(&mut self) -> Result<MemoryMap> {
+        let body = self.request(proto::op::MEMORY_MAP, &[])?;
+        let mut r = proto::Reader::new(&body);
+
+        let region_count = r.u32_or_err()? as usize;
+        if region_count > 65_536 {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "memory map region count exceeds limit",
+            ));
+        }
+        let mut regions = Vec::with_capacity(region_count);
+        for _ in 0..region_count {
+            regions.push(MemoryRegion {
+                base: r.u64_or_err()?,
+                size: r.u64_or_err()?,
+                allocation_base: r.u64_or_err()?,
+                allocation_protect: r.u32_or_err()?,
+                protect: r.u32_or_err()?,
+                state: r.u32_or_err()?,
+                kind: r.u32_or_err()?,
+            });
+        }
+
+        let heap_count = r.u32_or_err()? as usize;
+        if heap_count > 16_384 {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "heap count exceeds limit",
+            ));
+        }
+        let mut heaps = Vec::with_capacity(heap_count);
+        for _ in 0..heap_count {
+            heaps.push(r.u64_or_err()?);
+        }
+
+        let module_count = r.u32_or_err()? as usize;
+        if module_count > 512 {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "module count exceeds limit",
+            ));
+        }
+        let mut modules = Vec::with_capacity(module_count);
+        for _ in 0..module_count {
+            let low = r.u64_or_err()?;
+            let high = r.u64_or_err()?;
+            let entry = r.u64_or_err()?;
+            let mapped_size = r.u64_or_err()?;
+            let image_type = r.u32_or_err()?;
+            let is_main = r.u8_or_err()? != 0;
+            let name = read_layout_string(&mut r, "module name")?;
+            let section_count = r.u32_or_err()? as usize;
+            if section_count > 256 {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    "section count exceeds limit",
+                ));
+            }
+            let mut sections = Vec::with_capacity(section_count);
+            for _ in 0..section_count {
+                let address = r.u64_or_err()?;
+                let size = r.u64_or_err()?;
+                let kind = r.u32_or_err()?;
+                let flags = r.u8_or_err()?;
+                let name = read_layout_string(&mut r, "section name")?;
+                sections.push(MemoryMapSection {
+                    address,
+                    size,
+                    kind,
+                    readable: flags & 1 != 0,
+                    writable: flags & 2 != 0,
+                    executable: flags & 4 != 0,
+                    mapped: flags & 8 != 0,
+                    name,
+                });
+            }
+            modules.push(MemoryMapModule {
+                low,
+                high,
+                entry,
+                mapped_size,
+                image_type,
+                is_main,
+                name,
+                sections,
+            });
+        }
+        Ok(MemoryMap {
+            regions,
+            heaps,
+            modules,
+        })
     }
 
     /// Stops the recording session (waits for the file drain, ~5s bound).
@@ -722,6 +1167,19 @@ impl Client {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HookRangeResult {
+    pub decoded: u64,
+    pub matched: u64,
+    pub added: u32,
+    pub total: u32,
+    pub capacity_full: bool,
+    pub truncated: bool,
+    pub complete: bool,
+    pub applied: bool,
+    pub addresses: Vec<u64>,
+}
+
 pub struct TraceStatus {
     pub state: u8,
     pub active: bool,
@@ -742,14 +1200,59 @@ impl TraceStatus {
     }
 }
 
+fn read_layout_string(r: &mut proto::Reader<'_>, label: &str) -> Result<String> {
+    let len = r.u32_or_err()? as usize;
+    let bytes = r.remaining();
+    if bytes.len() < len {
+        return Err(Error::new(ErrorKind::InvalidData, format!("short {label}")));
+    }
+    let value = String::from_utf8_lossy(&bytes[..len]).into_owned();
+    r.skip(len)
+        .ok_or_else(|| Error::new(ErrorKind::InvalidData, format!("short {label}")))?;
+    Ok(value)
+}
+
 /// Windows VirtualQuery result for a target address.
+#[derive(Clone, Debug)]
 pub struct MemoryRegion {
     pub base: u64,
     pub size: u64,
     pub allocation_base: u64,
+    pub allocation_protect: u32,
     pub protect: u32,
     pub state: u32,
     pub kind: u32,
+}
+
+#[derive(Clone, Debug)]
+pub struct MemoryMapSection {
+    pub address: u64,
+    pub size: u64,
+    pub kind: u32,
+    pub readable: bool,
+    pub writable: bool,
+    pub executable: bool,
+    pub mapped: bool,
+    pub name: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct MemoryMapModule {
+    pub low: u64,
+    pub high: u64,
+    pub entry: u64,
+    pub mapped_size: u64,
+    pub image_type: u32,
+    pub is_main: bool,
+    pub name: String,
+    pub sections: Vec<MemoryMapSection>,
+}
+
+#[derive(Clone, Debug)]
+pub struct MemoryMap {
+    pub regions: Vec<MemoryRegion>,
+    pub heaps: Vec<u64>,
+    pub modules: Vec<MemoryMapModule>,
 }
 
 /// SCRIPT_STATUS snapshot; state: 0 none, 1 running, 2 error.
@@ -767,6 +1270,43 @@ pub struct ScriptListEntry {
     pub state: u8,
     pub delivered: u64,
     pub dropped: u64,
+}
+
+pub struct ScriptInventory {
+    pub scripts: Vec<ScriptListEntry>,
+    pub breakpoints: Vec<ScriptBreakpointBinding>,
+    pub decisions: Vec<ScriptDecisionBinding>,
+}
+
+pub struct ScriptBreakpointBinding {
+    pub id: u32,
+    pub plugin: String,
+    pub callback: String,
+    pub description: String,
+    pub once: bool,
+    pub thread_id: Option<u32>,
+    pub last_stop_generation: u64,
+    pub last_action: Option<String>,
+    pub last_return: Option<String>,
+    pub last_error: Option<String>,
+}
+
+pub struct ScriptDecisionBinding {
+    pub id: u64,
+    pub plugin: String,
+    pub selector: String,
+    pub callback: String,
+    pub description: String,
+    pub once: bool,
+    /// Exact native Hook instruction address when the selector is
+    /// hook.entry/hook.return. Other interceptor kinds leave this empty.
+    pub address: Option<u64>,
+    pub thread_id: Option<u32>,
+    /// None means all exception codes; Some(empty) deliberately matches none.
+    pub codes: Option<Vec<u32>>,
+    pub last_generation: u64,
+    pub last_return: Option<String>,
+    pub last_error: Option<String>,
 }
 
 /// One plugin output line from SCRIPT_OUTPUT.
@@ -787,7 +1327,10 @@ pub struct Resolution {
 impl Resolution {
     pub fn display(&self) -> Option<String> {
         match self.kind {
-            2 if self.offset > 0 => Some(format!("{}!{}+0x{:x}", self.module, self.symbol, self.offset)),
+            2 if self.offset > 0 => Some(format!(
+                "{}!{}+0x{:x}",
+                self.module, self.symbol, self.offset
+            )),
             2 => Some(format!("{}!{}", self.module, self.symbol)),
             1 => Some(format!("{}+0x{:x}", self.module, self.offset)),
             _ => None,

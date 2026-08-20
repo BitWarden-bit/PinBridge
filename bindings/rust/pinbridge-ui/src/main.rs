@@ -1,3 +1,5 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 //! Trusted human adapter for the PinBridge Hub.
 //!
 //! The Tauri process owns the embedded `HubService`.  UI commands never keep
@@ -71,6 +73,10 @@ struct AppState {
     ipc: Mutex<Option<IpcServerHandle>>,
     backend: Arc<Mutex<Option<Child>>>,
     target: Mutex<Option<String>>,
+    /// Operator released the workspace while the local Pin backend and target
+    /// remain alive. The owned Child handle is deliberately retained so the
+    /// same UI can either reattach or explicitly terminate it later.
+    released: Mutex<bool>,
 }
 
 fn map_args(entries: impl IntoIterator<Item = (&'static str, Value)>) -> Map<String, Value> {
@@ -106,6 +112,28 @@ fn parse_addr(text: &str) -> Result<u64, String> {
 fn decimal(v: u64) -> Value {
     Value::String(v.to_string())
 }
+
+fn parse_agent_endpoint(address: &str) -> Result<u16, String> {
+    let text = address
+        .trim()
+        .strip_prefix("tcp://")
+        .unwrap_or(address.trim());
+    let (host, port_text) = text
+        .rsplit_once(':')
+        .ok_or_else(|| "Agent address must be host:port".to_string())?;
+    let host = host.trim_matches(['[', ']']);
+    if !matches!(host, "127.0.0.1" | "localhost" | "::1") {
+        return Err("PinBridge Agent only accepts loopback attachments".into());
+    }
+    let port = port_text
+        .parse::<u16>()
+        .map_err(|_| format!("invalid Agent port: {port_text}"))?;
+    if port == 0 {
+        return Err("Agent port must be greater than zero".into());
+    }
+    Ok(port)
+}
+
 fn string_field<'a>(v: &'a Value, key: &str) -> Result<&'a str, String> {
     v.get(key)
         .and_then(Value::as_str)
@@ -152,6 +180,7 @@ fn decimal_strings(v: &Value, key: &str) -> Vec<Value> {
 #[tauri::command]
 fn cmd_session(state: State<'_, Arc<AppState>>) -> serde_json::Value {
     let owned = state.backend.lock().map(|g| g.is_some()).unwrap_or(false);
+    let released = state.released.lock().map(|value| *value).unwrap_or(false);
     let status = system_call(&state, "session_status", Map::new()).ok();
     let connected = status
         .as_ref()
@@ -172,16 +201,23 @@ fn cmd_session(state: State<'_, Arc<AppState>>) -> serde_json::Value {
                 .and_then(Value::as_str)
                 .map(str::to_owned)
         });
-    json!({ "running": owned || connected, "target": target })
+    let port = state.port.lock().map(|value| *value).unwrap_or(0);
+    json!({
+        "running": !released && (owned || connected),
+        "released": released,
+        "address": format!("127.0.0.1:{port}"),
+        "target": target,
+        "backend_owned": owned,
+    })
 }
 
-#[tauri::command]
-fn cmd_launch(
-    state: State<'_, Arc<AppState>>,
+fn launch_blocking(
+    state: &AppState,
     target: String,
     pin: Option<String>,
     entry_bp: Option<bool>,
     probe_mode: Option<bool>,
+    arguments: Option<Vec<String>>,
 ) -> Result<(), String> {
     if state.backend.lock().map_err(|e| e.to_string())?.is_some() {
         return Err("backend already running; kill it first".into());
@@ -196,10 +232,12 @@ fn cmd_launch(
         port: 0,
         entry_bp: entry_bp.unwrap_or(true),
         probe_mode: probe_mode.unwrap_or(false),
+        show_target_console: true,
     };
-    let (child, port) =
-        launch::launch_for_target(&options, std::slice::from_ref(&target), STARTUP_TIMEOUT)
-            .map_err(|e| e.to_string())?;
+    let mut command = vec![target.clone()];
+    command.extend(arguments.unwrap_or_default());
+    let (child, port) = launch::launch_for_target(&options, &command, STARTUP_TIMEOUT)
+        .map_err(|e| e.to_string())?;
     let connected = human_call(
         &state,
         "session_set_agent_port",
@@ -213,8 +251,108 @@ fn cmd_launch(
     *state.backend.lock().map_err(|e| e.to_string())? = Some(child);
     *state.port.lock().map_err(|e| e.to_string())? = port;
     *state.target.lock().map_err(|e| e.to_string())? = Some(target.clone());
+    *state.released.lock().map_err(|e| e.to_string())? = false;
     state.hub.set_target(Some(target));
     Ok(())
+}
+
+#[tauri::command]
+async fn cmd_launch(
+    state: State<'_, Arc<AppState>>,
+    target: String,
+    pin: Option<String>,
+    entry_bp: Option<bool>,
+    probe_mode: Option<bool>,
+    arguments: Option<Vec<String>>,
+) -> Result<(), String> {
+    let state = Arc::clone(state.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        launch_blocking(&state, target, pin, entry_bp, probe_mode, arguments)
+    })
+    .await
+    .map_err(|error| format!("launch worker failed: {error}"))?
+}
+
+#[tauri::command]
+fn cmd_attach_agent(
+    state: State<'_, Arc<AppState>>,
+    address: String,
+) -> Result<serde_json::Value, String> {
+    let port = parse_agent_endpoint(&address)?;
+    let backend_owned = state.backend.lock().map_err(|e| e.to_string())?.is_some();
+    let released = *state.released.lock().map_err(|e| e.to_string())?;
+    let current_port = *state.port.lock().map_err(|e| e.to_string())?;
+    if backend_owned && (!released || port != current_port) {
+        return Err(if released {
+            format!(
+                "a released local backend is still alive at 127.0.0.1:{current_port}; reattach it or terminate it before attaching another Agent"
+            )
+        } else {
+            "a locally launched backend is already attached; release or terminate it first".into()
+        });
+    }
+    let previous = *state.port.lock().map_err(|e| e.to_string())?;
+    human_call(
+        &state,
+        "session_set_agent_port",
+        map_args([("agent_port", decimal(port as u64))]),
+    )?;
+    *state.port.lock().map_err(|e| e.to_string())? = port;
+    let session = system_call(&state, "session_status", Map::new());
+    match session {
+        Ok(value) => {
+            let target = value
+                .get("session")
+                .and_then(|item| item.get("target"))
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            *state.target.lock().map_err(|e| e.to_string())? = target.clone();
+            *state.released.lock().map_err(|e| e.to_string())? = false;
+            state.hub.set_target(target);
+            Ok(value)
+        }
+        Err(error) => {
+            let _ = human_call(
+                &state,
+                "session_set_agent_port",
+                map_args([("agent_port", decimal(previous as u64))]),
+            );
+            *state.port.lock().map_err(|e| e.to_string())? = previous;
+            Err(format!("could not attach to Agent at {address}: {error}"))
+        }
+    }
+}
+
+#[tauri::command]
+fn cmd_environment(state: State<'_, Arc<AppState>>) -> serde_json::Value {
+    let pin = state
+        .pin
+        .as_deref()
+        .map(std::path::PathBuf::from)
+        .or_else(|| launch::resolve_pin(None, pinbridge_client::Arch::X64).ok());
+    let agent = state
+        .agent
+        .as_deref()
+        .map(std::path::PathBuf::from)
+        .or_else(|| launch::default_agent_dll(pinbridge_client::Arch::X64).ok());
+    json!({
+        "pin": {
+            "available": pin.as_ref().is_some_and(|path| path.is_file()),
+            "path": pin.map(|path| path.display().to_string())
+        },
+        "agent": {
+            "available": agent.as_ref().is_some_and(|path| path.is_file()),
+            "path": agent.as_ref().map(|path| path.display().to_string())
+        },
+        "python": {
+            "available": agent.as_ref().is_some_and(|path| path.is_file()),
+            "detail": "validated by the embedded Agent at launch"
+        },
+        "hub": {
+            "available": state.ai_adapter_available,
+            "detail": if state.ai_adapter_available { "embedded Hub ready" } else { "AI IPC adapter unavailable" }
+        }
+    })
 }
 
 #[tauri::command]
@@ -227,6 +365,7 @@ fn cmd_kill_backend(state: State<'_, Arc<AppState>>) -> Result<(), String> {
     }
     *state.backend.lock().map_err(|e| e.to_string())? = None;
     *state.target.lock().map_err(|e| e.to_string())? = None;
+    *state.released.lock().map_err(|e| e.to_string())? = false;
     let port = *state.port.lock().map_err(|e| e.to_string())?;
     let _ = human_call(
         &state,
@@ -235,6 +374,32 @@ fn cmd_kill_backend(state: State<'_, Arc<AppState>>) -> Result<(), String> {
     );
     state.hub.set_target(None);
     Ok(())
+}
+
+#[tauri::command]
+fn cmd_release_session(state: State<'_, Arc<AppState>>) -> Result<Value, String> {
+    let owned = state.backend.lock().map_err(|e| e.to_string())?.is_some();
+    let session = system_call(&state, "session_status", Map::new())?;
+    let connected = session
+        .get("session")
+        .and_then(|value| value.get("connected"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if !owned && !connected {
+        return Err("no live local backend or Agent connection to release".into());
+    }
+    // A released workspace must never leave AI autonomous writes enabled.
+    let _ = human_call(&state, "control_takeover_manual", Map::new());
+    *state.released.lock().map_err(|e| e.to_string())? = true;
+    let port = *state.port.lock().map_err(|e| e.to_string())?;
+    let target = state.target.lock().map_err(|e| e.to_string())?.clone();
+    Ok(json!({
+        "released": true,
+        "address": format!("127.0.0.1:{port}"),
+        "target": target,
+        "backend_owned": owned,
+        "detail": "workspace control released; target and Pin backend remain alive"
+    }))
 }
 
 #[tauri::command]
@@ -299,6 +464,107 @@ fn cmd_bp_list(state: State<'_, Arc<AppState>>) -> Result<Value, String> {
     Ok(normalize_bp(&value))
 }
 
+#[tauri::command]
+async fn cmd_breakpoint_inventory(state: State<'_, Arc<AppState>>) -> Result<Value, String> {
+    let state = Arc::clone(state.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        system_call(&state, "breakpoint_inventory", Map::new())
+    })
+    .await
+    .map_err(|error| format!("breakpoint inventory worker failed: {error}"))?
+}
+
+#[tauri::command]
+fn cmd_script_get(state: State<'_, Arc<AppState>>, name: String) -> Result<Value, String> {
+    human_call(
+        &state,
+        "script_get",
+        map_args([("name", Value::String(name))]),
+    )
+}
+
+#[tauri::command]
+fn cmd_script_list(state: State<'_, Arc<AppState>>) -> Result<Value, String> {
+    system_call(&state, "script_list", Map::new())
+}
+
+#[tauri::command]
+fn cmd_script_inject(
+    state: State<'_, Arc<AppState>>,
+    name: String,
+    source: String,
+    kind: Option<String>,
+) -> Result<Value, String> {
+    let mut args = map_args([
+        ("name", Value::String(name)),
+        ("source", Value::String(source)),
+    ]);
+    if let Some(kind) = kind {
+        args.insert("kind".into(), Value::String(kind));
+    }
+    human_call(&state, "script_inject", args)
+}
+
+#[tauri::command]
+fn cmd_script_replace(
+    state: State<'_, Arc<AppState>>,
+    name: String,
+    source: String,
+    kind: Option<String>,
+) -> Result<Value, String> {
+    let mut args = map_args([
+        ("name", Value::String(name)),
+        ("source", Value::String(source)),
+    ]);
+    if let Some(kind) = kind {
+        args.insert("kind".into(), Value::String(kind));
+    }
+    human_call(&state, "script_replace", args)
+}
+
+#[tauri::command]
+fn cmd_script_start(state: State<'_, Arc<AppState>>, name: String) -> Result<Value, String> {
+    human_call(
+        &state,
+        "script_start",
+        map_args([("name", Value::String(name))]),
+    )
+}
+
+#[tauri::command]
+fn cmd_script_stop(state: State<'_, Arc<AppState>>, name: String) -> Result<Value, String> {
+    human_call(
+        &state,
+        "script_stop",
+        map_args([("name", Value::String(name))]),
+    )
+}
+
+#[tauri::command]
+fn cmd_script_remove(state: State<'_, Arc<AppState>>, name: String) -> Result<Value, String> {
+    human_call(
+        &state,
+        "script_remove",
+        map_args([("name", Value::String(name))]),
+    )
+}
+
+#[tauri::command]
+fn cmd_script_output(
+    state: State<'_, Arc<AppState>>,
+    cursor: String,
+    limit: String,
+) -> Result<Value, String> {
+    system_call(
+        &state,
+        "script_output",
+        map_args([
+            ("cursor", Value::String(cursor)),
+            ("limit", Value::String(limit)),
+        ]),
+    )
+}
+
 fn normalize_bp(value: &Value) -> Value {
     let rows = value.get("breakpoints").and_then(Value::as_array).cloned().unwrap_or_default().into_iter().map(|b| json!({
         "id": decimal_string_or(&b, "id", 0), "address": b.get("address").cloned().unwrap_or_else(|| json!("0x0")), "hits": decimal_string_or(&b, "hits", 0),
@@ -312,6 +578,357 @@ fn cmd_modules(state: State<'_, Arc<AppState>>) -> Result<Value, String> {
     Ok(Value::Array(value.get("modules").and_then(Value::as_array).cloned().unwrap_or_default().into_iter().map(|m| json!({
         "low": m.get("base").cloned().unwrap_or_else(|| json!("0x0")), "high": m.get("end").cloned().unwrap_or_else(|| json!("0x0")), "main": m.get("is_main").and_then(Value::as_bool).unwrap_or(false), "name": m.get("name").cloned().unwrap_or_else(|| json!("")),
     })).collect()))
+}
+
+#[tauri::command]
+fn cmd_module_exports(state: State<'_, Arc<AppState>>, module: String) -> Result<Value, String> {
+    system_call(
+        &state,
+        "module_exports",
+        map_args([("module", Value::String(module))]),
+    )
+}
+
+#[tauri::command]
+fn cmd_hook_set(state: State<'_, Arc<AppState>>, address: String) -> Result<Value, String> {
+    human_call(
+        &state,
+        "hook_set",
+        map_args([("address", decimal(parse_addr(&address)?))]),
+    )
+}
+
+#[tauri::command]
+fn cmd_hook_function_set(
+    state: State<'_, Arc<AppState>>,
+    address: String,
+    signature: String,
+    signature_source: String,
+    signature_confidence: String,
+) -> Result<Value, String> {
+    human_call(
+        &state,
+        "hook_function_set",
+        map_args([
+            ("address", decimal(parse_addr(&address)?)),
+            ("signature", Value::String(signature)),
+            ("signature_source", Value::String(signature_source)),
+            ("signature_confidence", Value::String(signature_confidence)),
+        ]),
+    )
+}
+
+#[tauri::command]
+fn cmd_hook_signature_set(
+    state: State<'_, Arc<AppState>>,
+    address: String,
+    signature: String,
+    signature_source: String,
+    signature_confidence: String,
+) -> Result<Value, String> {
+    human_call(
+        &state,
+        "hook_signature_set",
+        map_args([
+            ("address", decimal(parse_addr(&address)?)),
+            ("signature", Value::String(signature)),
+            ("signature_source", Value::String(signature_source)),
+            ("signature_confidence", Value::String(signature_confidence)),
+        ]),
+    )
+}
+
+#[tauri::command]
+fn cmd_hook_signature_remove(
+    state: State<'_, Arc<AppState>>,
+    address: String,
+) -> Result<Value, String> {
+    human_call(
+        &state,
+        "hook_signature_remove",
+        map_args([("address", decimal(parse_addr(&address)?))]),
+    )
+}
+
+#[tauri::command]
+fn cmd_hook_remove(state: State<'_, Arc<AppState>>, address: String) -> Result<Value, String> {
+    human_call(
+        &state,
+        "hook_remove",
+        map_args([("address", decimal(parse_addr(&address)?))]),
+    )
+}
+
+#[tauri::command]
+fn cmd_hook_clear(state: State<'_, Arc<AppState>>) -> Result<Value, String> {
+    human_call(&state, "hook_clear", Map::new())
+}
+
+#[tauri::command]
+fn cmd_hook_inventory(
+    state: State<'_, Arc<AppState>>,
+    offset: u64,
+    limit: u64,
+    kind: Option<String>,
+) -> Result<Value, String> {
+    let mut args = map_args([
+        ("offset", Value::String(offset.to_string())),
+        ("limit", Value::String(limit.to_string())),
+    ]);
+    if let Some(kind) = kind {
+        args.insert("kind".into(), Value::String(kind));
+    }
+    system_call(&state, "hook_inventory", args)
+}
+
+#[tauri::command]
+fn cmd_hook_list(state: State<'_, Arc<AppState>>) -> Result<Value, String> {
+    system_call(&state, "hook_list", Map::new())
+}
+
+#[tauri::command]
+fn cmd_hook_monitor(
+    state: State<'_, Arc<AppState>>,
+    limit: u64,
+    before: Option<String>,
+) -> Result<Value, String> {
+    let mut args = map_args([("limit", decimal(limit.clamp(1, 4096)))]);
+    if let Some(before) = before.filter(|value| value != "0" && !value.is_empty()) {
+        args.insert("before".into(), Value::String(before));
+    }
+    system_call(&state, "hook_monitor", args)
+}
+
+#[tauri::command]
+fn cmd_hook_events_query(state: State<'_, Arc<AppState>>, query: Value) -> Result<Value, String> {
+    let args = query
+        .as_object()
+        .cloned()
+        .ok_or_else(|| "Hook event query must be an object".to_string())?;
+    system_call(&state, "hook_events_query", args)
+}
+
+#[tauri::command]
+fn cmd_hook_events_export(state: State<'_, Arc<AppState>>, query: Value) -> Result<Value, String> {
+    let args = query
+        .as_object()
+        .cloned()
+        .ok_or_else(|| "Hook event export query must be an object".to_string())?;
+    system_call(&state, "hook_events_export", args)
+}
+
+#[tauri::command]
+async fn cmd_trace_scope_query(
+    state: State<'_, Arc<AppState>>,
+    query: Value,
+) -> Result<Value, String> {
+    let args = query
+        .as_object()
+        .cloned()
+        .ok_or_else(|| "Trace scope query must be an object".to_string())?;
+    let state = Arc::clone(state.inner());
+    tauri::async_runtime::spawn_blocking(move || system_call(&state, "trace_scope_query", args))
+        .await
+        .map_err(|error| format!("Trace scope worker failed: {error}"))?
+}
+
+#[tauri::command]
+async fn cmd_trace_record_start(
+    state: State<'_, Arc<AppState>>,
+    query: Value,
+) -> Result<Value, String> {
+    let args = query
+        .as_object()
+        .cloned()
+        .ok_or_else(|| "Trace start request must be an object".to_string())?;
+    let state = Arc::clone(state.inner());
+    tauri::async_runtime::spawn_blocking(move || human_call(&state, "trace_record_start", args))
+        .await
+        .map_err(|error| format!("Trace start worker failed: {error}"))?
+}
+
+#[tauri::command]
+async fn cmd_trace_record_status(state: State<'_, Arc<AppState>>) -> Result<Value, String> {
+    let state = Arc::clone(state.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        system_call(&state, "trace_record_status", Map::new())
+    })
+    .await
+    .map_err(|error| format!("Trace status worker failed: {error}"))?
+}
+
+#[tauri::command]
+async fn cmd_trace_record_stop(state: State<'_, Arc<AppState>>) -> Result<Value, String> {
+    let state = Arc::clone(state.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        human_call(&state, "trace_record_stop", Map::new())
+    })
+    .await
+    .map_err(|error| format!("Trace stop worker failed: {error}"))?
+}
+
+#[tauri::command]
+async fn cmd_trace_index_query(
+    state: State<'_, Arc<AppState>>,
+    query: Value,
+) -> Result<Value, String> {
+    let args = query
+        .as_object()
+        .cloned()
+        .ok_or_else(|| "Trace index query must be an object".to_string())?;
+    let state = Arc::clone(state.inner());
+    tauri::async_runtime::spawn_blocking(move || system_call(&state, "trace_index_query", args))
+        .await
+        .map_err(|error| format!("Trace query worker failed: {error}"))?
+}
+
+#[tauri::command]
+async fn cmd_trace_index_export(
+    state: State<'_, Arc<AppState>>,
+    query: Value,
+) -> Result<Value, String> {
+    let args = query
+        .as_object()
+        .cloned()
+        .ok_or_else(|| "Trace index export must be an object".to_string())?;
+    let state = Arc::clone(state.inner());
+    tauri::async_runtime::spawn_blocking(move || system_call(&state, "trace_index_export", args))
+        .await
+        .map_err(|error| format!("Trace export worker failed: {error}"))?
+}
+
+#[tauri::command]
+fn cmd_hook_module(state: State<'_, Arc<AppState>>, module: String) -> Result<Value, String> {
+    human_call(
+        &state,
+        "hook_module",
+        map_args([("module", Value::String(module))]),
+    )
+}
+
+#[tauri::command]
+fn cmd_hook_range_preview(
+    state: State<'_, Arc<AppState>>,
+    start: String,
+    end: String,
+    kinds: Vec<String>,
+) -> Result<Value, String> {
+    system_call(
+        &state,
+        "hook_range_preview",
+        map_args([
+            ("start", decimal(parse_addr(&start)?)),
+            ("end", decimal(parse_addr(&end)?)),
+            (
+                "kinds",
+                Value::Array(kinds.into_iter().map(Value::String).collect()),
+            ),
+        ]),
+    )
+}
+
+#[tauri::command]
+fn cmd_hook_range_set(
+    state: State<'_, Arc<AppState>>,
+    start: String,
+    end: String,
+    kinds: Vec<String>,
+) -> Result<Value, String> {
+    human_call(
+        &state,
+        "hook_range_set",
+        map_args([
+            ("start", decimal(parse_addr(&start)?)),
+            ("end", decimal(parse_addr(&end)?)),
+            (
+                "kinds",
+                Value::Array(kinds.into_iter().map(Value::String).collect()),
+            ),
+        ]),
+    )
+}
+
+#[tauri::command]
+fn cmd_syscall_config_get(state: State<'_, Arc<AppState>>) -> Result<Value, String> {
+    system_call(&state, "syscall_config_get", Map::new())
+}
+
+#[tauri::command]
+fn cmd_syscall_config_set(
+    state: State<'_, Arc<AppState>>,
+    enabled: bool,
+    numbers: Vec<String>,
+    scope: String,
+    module: String,
+    rva_begin: String,
+    rva_end: String,
+) -> Result<Value, String> {
+    human_call(
+        &state,
+        "syscall_config_set",
+        map_args([
+            ("enabled", Value::Bool(enabled)),
+            (
+                "numbers",
+                Value::Array(numbers.into_iter().map(Value::String).collect()),
+            ),
+            ("scope", Value::String(scope)),
+            ("module", Value::String(module)),
+            ("rva_begin", Value::String(rva_begin)),
+            ("rva_end", Value::String(rva_end)),
+        ]),
+    )
+}
+
+#[tauri::command]
+fn cmd_syscall_monitor(state: State<'_, Arc<AppState>>, limit: u64) -> Result<Value, String> {
+    system_call(
+        &state,
+        "syscall_monitor",
+        map_args([("limit", decimal(limit.clamp(1, 512)))]),
+    )
+}
+
+#[tauri::command]
+fn cmd_memory_map(state: State<'_, Arc<AppState>>) -> Result<Value, String> {
+    human_call(&state, "memory_map", Map::new())
+}
+
+#[tauri::command]
+fn cmd_exception_monitor(state: State<'_, Arc<AppState>>, limit: u64) -> Result<Value, String> {
+    system_call(
+        &state,
+        "exception_monitor",
+        map_args([("limit", decimal(limit.clamp(1, 1024)))]),
+    )
+}
+
+#[tauri::command]
+fn cmd_exception_policy_get(state: State<'_, Arc<AppState>>) -> Result<Value, String> {
+    system_call(&state, "exception_policy_get", Map::new())
+}
+
+#[tauri::command]
+fn cmd_exception_policy_set(
+    state: State<'_, Arc<AppState>>,
+    enabled: bool,
+    code: String,
+) -> Result<Value, String> {
+    let code = parse_addr(&code)?;
+    let code = u32::try_from(code).map_err(|_| "exception code exceeds 32 bits".to_string())?;
+    human_call(
+        &state,
+        "exception_policy_set",
+        map_args([
+            ("enabled", Value::Bool(enabled)),
+            ("code", decimal(code as u64)),
+        ]),
+    )
+}
+
+#[tauri::command]
+fn cmd_exception_inventory(state: State<'_, Arc<AppState>>) -> Result<Value, String> {
+    system_call(&state, "exception_inventory", Map::new())
 }
 
 #[tauri::command]
@@ -664,6 +1281,7 @@ fn main() {
             port: 0,
             entry_bp: true,
             probe_mode: false,
+            show_target_console: true,
         };
         match launch::launch_for_target(&options, &config.target, STARTUP_TIMEOUT) {
             Ok((child, p)) => {
@@ -700,6 +1318,7 @@ fn main() {
         ipc: Mutex::new(None),
         backend: Arc::clone(&backend),
         target: Mutex::new(initial_target),
+        released: Mutex::new(false),
     });
     let poller_state = Arc::clone(&state);
     let setup_state = Arc::clone(&state);
@@ -739,13 +1358,54 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             cmd_session,
             cmd_launch,
+            cmd_attach_agent,
+            cmd_environment,
             cmd_kill_backend,
+            cmd_release_session,
             cmd_control,
             cmd_step,
             cmd_bp_set,
             cmd_bp_remove,
             cmd_bp_list,
+            cmd_breakpoint_inventory,
+            cmd_script_get,
+            cmd_script_list,
+            cmd_script_inject,
+            cmd_script_replace,
+            cmd_script_start,
+            cmd_script_stop,
+            cmd_script_remove,
+            cmd_script_output,
             cmd_modules,
+            cmd_module_exports,
+            cmd_hook_set,
+            cmd_hook_function_set,
+            cmd_hook_signature_set,
+            cmd_hook_signature_remove,
+            cmd_hook_remove,
+            cmd_hook_clear,
+            cmd_hook_list,
+            cmd_hook_inventory,
+            cmd_hook_monitor,
+            cmd_hook_events_query,
+            cmd_hook_events_export,
+            cmd_trace_scope_query,
+            cmd_trace_record_start,
+            cmd_trace_record_status,
+            cmd_trace_record_stop,
+            cmd_trace_index_query,
+            cmd_trace_index_export,
+            cmd_hook_module,
+            cmd_hook_range_preview,
+            cmd_hook_range_set,
+            cmd_syscall_config_get,
+            cmd_syscall_config_set,
+            cmd_syscall_monitor,
+            cmd_memory_map,
+            cmd_exception_monitor,
+            cmd_exception_policy_get,
+            cmd_exception_policy_set,
+            cmd_exception_inventory,
             cmd_threads,
             cmd_context,
             cmd_setreg,
@@ -768,8 +1428,19 @@ fn main() {
                 if let Some(server) = exit_state.ipc.lock().unwrap().take() {
                     server.stop();
                 }
-                if let Some(child) = backend.lock().unwrap().as_mut() {
-                    launch::kill_backend(child);
+                let released = exit_state
+                    .released
+                    .lock()
+                    .map(|value| *value)
+                    .unwrap_or(false);
+                if !released {
+                    if let Some(child) = backend.lock().unwrap().as_mut() {
+                        launch::kill_backend(child);
+                    }
+                } else {
+                    // Dropping a Windows Child handle does not terminate the
+                    // process. Do not call kill_backend after explicit release.
+                    backend.lock().unwrap().take();
                 }
             }
         }),
@@ -793,6 +1464,16 @@ mod tests {
     fn ui_addresses_cross_hub_as_decimal_strings() {
         assert_eq!(parse_addr("0x1234").unwrap(), 0x1234);
         assert_eq!(decimal(parse_addr("0x1234").unwrap()), json!("4660"));
+    }
+
+    #[test]
+    fn agent_attach_endpoint_is_loopback_only() {
+        assert_eq!(parse_agent_endpoint("127.0.0.1:9011").unwrap(), 9011);
+        assert_eq!(parse_agent_endpoint("tcp://localhost:9123").unwrap(), 9123);
+        assert_eq!(parse_agent_endpoint("[::1]:9444").unwrap(), 9444);
+        assert!(parse_agent_endpoint("0.0.0.0:9011").is_err());
+        assert!(parse_agent_endpoint("example.com:9011").is_err());
+        assert!(parse_agent_endpoint("127.0.0.1:0").is_err());
     }
 
     #[test]

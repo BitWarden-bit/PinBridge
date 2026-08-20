@@ -22,11 +22,7 @@ pub fn reregister_after_attach() -> PbStatus {
     PB_OK
 }
 
-pub unsafe fn instrument_memory_translation(
-    _ins: pinbridge_sys::PbInsHandle,
-    _address: u64,
-) {
-}
+pub unsafe fn instrument_memory_translation(_ins: pinbridge_sys::PbInsHandle, _address: u64) {}
 
 /// One SCRIPT_LIST row (shape-compatible with `scripting::PluginInfo`).
 #[derive(Clone)]
@@ -35,6 +31,36 @@ pub struct PluginInfo {
     pub state: u8,
     pub delivered: u64,
     pub dropped: u64,
+    pub breakpoints: Vec<BreakpointBindingInfo>,
+    pub decisions: Vec<DecisionBindingInfo>,
+}
+
+#[derive(Clone)]
+pub struct BreakpointBindingInfo {
+    pub id: u32,
+    pub callback_name: String,
+    pub description: String,
+    pub once: bool,
+    pub thread_id: Option<u32>,
+    pub last_stop_generation: u64,
+    pub last_action: Option<String>,
+    pub last_return: Option<String>,
+    pub last_error: Option<String>,
+}
+
+#[derive(Clone)]
+pub struct DecisionBindingInfo {
+    pub id: u64,
+    pub selector: String,
+    pub callback_name: String,
+    pub description: String,
+    pub once: bool,
+    pub address: Option<u64>,
+    pub thread_id: Option<u32>,
+    pub codes: Option<Vec<u32>>,
+    pub last_generation: u64,
+    pub last_return: Option<String>,
+    pub last_error: Option<String>,
 }
 
 pub mod output {
@@ -53,6 +79,8 @@ pub fn py_load_in_flight() -> bool {
     false
 }
 
+pub fn initialize_before_application() {}
+
 /// No thread to spawn: return success so the control plane still comes up.
 pub fn spawn(_port: u16) -> PbStatus {
     crate::log::line("python scripting disabled in this build (no scripting feature)");
@@ -70,6 +98,8 @@ pub fn unload(_name: &str) -> Result<(), String> {
 pub fn list() -> Result<Vec<PluginInfo>, String> {
     Ok(Vec::new())
 }
+
+pub fn note_external_breakpoint_set(_id: u32, _address: u64) {}
 
 pub fn output_page(after: u64, _limit: usize) -> (u64, Vec<output::OutputEntry>) {
     (after, Vec::new())

@@ -1,7 +1,9 @@
 [CmdletBinding()]
 param(
     [ValidateRange(30, 120)]
-    [int]$TimeoutSec = 60
+    [int]$TimeoutSec = 60,
+    [string]$AgentPath = "",
+    [string]$CliPath = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -10,8 +12,8 @@ $repo = (Resolve-Path -LiteralPath (Join-Path $dir "..\..")).Path
 $bundle = Split-Path -Parent $repo
 $target = Join-Path $dir "exception_python_demo_x64.exe"
 $plugin = Join-Path $dir "exception_intercept.py"
-$cli = Join-Path $repo "bindings\rust\target\release\pinbridge-cli.exe"
-$agent = Join-Path $repo "bindings\rust\target\release\pinbridge_agent.dll"
+$cli = if ($CliPath) { $CliPath } else { Join-Path $repo "bindings\rust\target\release\pinbridge-cli.exe" }
+$agent = if ($AgentPath) { $AgentPath } else { Join-Path $repo "bindings\rust\target\release\pinbridge_agent.dll" }
 $pin = Join-Path $bundle "VMP_Offline_Recovery_Kit_20260803_FINAL\runtime\pin\intel64\bin\pin.exe"
 
 foreach ($path in @($target, $plugin, $cli, $agent, $pin)) {
@@ -97,6 +99,7 @@ try {
     foreach ($marker in @(
         "EXCEPTION_INTERCEPT_READY",
         "EXCEPTION_HANDLE_PASS",
+        "EXCEPTION_SYNC_DISASM",
         "EXCEPTION_OBSERVE_NAMED",
         "EXCEPTION_OBSERVE_CONTEXT",
         "CONTEXT_APC_OBSERVE",

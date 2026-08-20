@@ -86,7 +86,7 @@ fn parse_args() -> Result<Config, String> {
 fn usage() {
     eprintln!(
         "pinbridge-cli [--port N] [--limit N] [--pin P] [--agent A] [--arch auto|x86|x64] [--pin-probe] [--entry-bp|--no-entry-bp] [command] [-- target args...]\n\
-         commands: ping | counters | events | hookrule | shell (default when omitted)\n\
+         commands: ping | counters | events | hookevents | hooksig | hookrule | shell (default when omitted)\n\
          a target after `--` is launched first (backend reaped on exit).\n\
          shell reads one command per line from stdin: ping|counters|events [N]|limit N|help|quit"
     );
@@ -117,12 +117,33 @@ fn event_json(event: &proto::EventRecord) -> serde_json::Value {
     })
 }
 
+fn hook_event_json(event: &proto::HookLogRecord) -> serde_json::Value {
+    serde_json::json!({
+        "sequence": event.sequence,
+        "timestamp_unix_ns": event.timestamp_unix_ns,
+        "kind": event.kind,
+        "kind_name": if event.kind == 14 { "hook_return" } else { "hook_regs" },
+        "hook_type": if event.flags & proto::HOOK_LOG_FLAG_SYSCALL != 0 { "syscall" } else if event.flags & proto::HOOK_LOG_FLAG_FUNCTION != 0 { "api" } else { "instruction" },
+        "thread_id": event.thread_id,
+        "address": event.address,
+        "signature_capture": event.flags & proto::HOOK_LOG_FLAG_SIGNATURE != 0,
+        "argument_count": event.argument_count,
+        "arguments": event.arguments[..event.argument_count.min(16) as usize],
+        "return_value": (event.kind == 14).then_some(event.arguments[0]),
+    })
+}
+
 fn parse_u64(text: &str) -> Result<u64, String> {
     let trimmed = text.trim();
-    if let Some(hex) = trimmed.strip_prefix("0x").or_else(|| trimmed.strip_prefix("0X")) {
+    if let Some(hex) = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+    {
         u64::from_str_radix(hex, 16).map_err(|_| format!("bad hex value: {text}"))
     } else {
-        trimmed.parse::<u64>().map_err(|_| format!("bad number: {text}"))
+        trimmed
+            .parse::<u64>()
+            .map_err(|_| format!("bad number: {text}"))
     }
 }
 
@@ -152,10 +173,17 @@ fn from_hex(text: &str) -> Result<Vec<u8>, String> {
         .collect()
 }
 
-fn run_command(words: &[&str], default_limit: u64, client: &mut Client) -> Result<serde_json::Value, String> {
+fn run_command(
+    words: &[&str],
+    default_limit: u64,
+    client: &mut Client,
+) -> Result<serde_json::Value, String> {
     let command = words.first().copied().unwrap_or("");
     let arg = |index: usize| -> Result<&str, String> {
-        words.get(index).copied().ok_or_else(|| format!("{command} needs argument {index}"))
+        words
+            .get(index)
+            .copied()
+            .ok_or_else(|| format!("{command} needs argument {index}"))
     };
     match command {
         "ping" => {
@@ -165,8 +193,7 @@ fn run_command(words: &[&str], default_limit: u64, client: &mut Client) -> Resul
             }))
         }
         "counters" => {
-            let (total, dropped, capacity, kinds) =
-                client.counters().map_err(|e| e.to_string())?;
+            let (total, dropped, capacity, kinds) = client.counters().map_err(|e| e.to_string())?;
             Ok(serde_json::json!({
                 "total": total, "dropped": dropped, "capacity": capacity,
                 "hook_regs": kinds[0], "memory": kinds[1], "exec": kinds[2],
@@ -188,6 +215,47 @@ fn run_command(words: &[&str], default_limit: u64, client: &mut Client) -> Resul
                 "events": events.iter().map(event_json).collect::<Vec<_>>(),
             }))
         }
+        "hookevents" => {
+            let limit = if words.len() > 1 {
+                parse_u64(words[1])?
+            } else {
+                default_limit
+            };
+            let (total, dropped, next, events) = client
+                .hook_events_newest(limit)
+                .map_err(|error| error.to_string())?;
+            Ok(serde_json::json!({
+                "total": total,
+                "dropped": dropped,
+                "next": next,
+                "count": events.len(),
+                "events": events.iter().map(hook_event_json).collect::<Vec<_>>(),
+            }))
+        }
+        "hooksig" => {
+            let address = parse_u64(arg(1)?)?;
+            let calling_convention = parse_u64(arg(2)?)? as u32;
+            let return_kind = parse_u64(arg(3)?)? as u32;
+            let parameter_count = parse_u64(arg(4)?)? as u32;
+            let float_parameter_mask = parse_u64(arg(5)?)? as u32;
+            let accepted = client
+                .hook_signature_set(
+                    address,
+                    calling_convention,
+                    return_kind,
+                    parameter_count,
+                    float_parameter_mask,
+                )
+                .map_err(|error| error.to_string())?;
+            Ok(serde_json::json!({
+                "address": format!("0x{address:x}"),
+                "accepted": accepted,
+                "calling_convention": calling_convention,
+                "return_kind": return_kind,
+                "parameter_count": parameter_count,
+                "float_parameter_mask": format!("0x{float_parameter_mask:x}"),
+            }))
+        }
         "stop" => {
             let stopped = client.stop().map_err(|e| e.to_string())?;
             Ok(serde_json::json!({ "stopped": stopped }))
@@ -199,7 +267,9 @@ fn run_command(words: &[&str], default_limit: u64, client: &mut Client) -> Resul
         "read" => {
             let address = parse_u64(arg(1)?)?;
             let size = parse_u64(arg(2)?)?;
-            let data = client.read_memory(address, size).map_err(|e| e.to_string())?;
+            let data = client
+                .read_memory(address, size)
+                .map_err(|e| e.to_string())?;
             Ok(serde_json::json!({
                 "address": address, "copied": data.len(), "data": to_hex(&data),
             }))
@@ -207,7 +277,9 @@ fn run_command(words: &[&str], default_limit: u64, client: &mut Client) -> Resul
         "write" => {
             let address = parse_u64(arg(1)?)?;
             let data = from_hex(arg(2)?)?;
-            let written = client.write_memory(address, &data).map_err(|e| e.to_string())?;
+            let written = client
+                .write_memory(address, &data)
+                .map_err(|e| e.to_string())?;
             Ok(serde_json::json!({ "address": address, "written": written }))
         }
         "bp" => {
@@ -266,7 +338,12 @@ fn run_command(words: &[&str], default_limit: u64, client: &mut Client) -> Resul
             let pairs = client.context_get(tid).map_err(|e| e.to_string())?;
             let map: serde_json::Map<String, serde_json::Value> = pairs
                 .iter()
-                .map(|(reg, value)| (registers::reg_name(arch, *reg), serde_json::json!(format!("0x{value:016x}"))))
+                .map(|(reg, value)| {
+                    (
+                        registers::reg_name(arch, *reg),
+                        serde_json::json!(format!("0x{value:016x}")),
+                    )
+                })
                 .collect();
             Ok(serde_json::json!({ "thread_id": tid, "registers": map }))
         }
@@ -274,10 +351,12 @@ fn run_command(words: &[&str], default_limit: u64, client: &mut Client) -> Resul
             let tid = parse_u64(arg(1)?)? as u32;
             let name = arg(2)?;
             let arch = runtime_arch(client)?;
-            let reg = registers::reg_id(arch, name)
-                .ok_or_else(|| format!("unknown register: {name}"))?;
+            let reg =
+                registers::reg_id(arch, name).ok_or_else(|| format!("unknown register: {name}"))?;
             let value = parse_u64(arg(3)?)?;
-            client.context_set(tid, reg, value).map_err(|e| e.to_string())?;
+            client
+                .context_set(tid, reg, value)
+                .map_err(|e| e.to_string())?;
             Ok(serde_json::json!({ "thread_id": tid, "register": name, "value": value }))
         }
         "engine" => {
@@ -292,7 +371,8 @@ fn run_command(words: &[&str], default_limit: u64, client: &mut Client) -> Resul
         }
         "exc" => {
             if words.len() < 2 {
-                let (enabled, code, pending) = client.exc_policy_get().map_err(|e| e.to_string())?;
+                let (enabled, code, pending) =
+                    client.exc_policy_get().map_err(|e| e.to_string())?;
                 return Ok(serde_json::json!({
                     "enabled": enabled, "exception_code": code, "pending": pending,
                 }));
@@ -302,7 +382,9 @@ fn run_command(words: &[&str], default_limit: u64, client: &mut Client) -> Resul
                 "all" => (true, 0u32),
                 code_text => (true, parse_u64(code_text)? as u32),
             };
-            client.exc_policy_set(enabled, code).map_err(|e| e.to_string())?;
+            client
+                .exc_policy_set(enabled, code)
+                .map_err(|e| e.to_string())?;
             Ok(serde_json::json!({ "enabled": enabled, "exception_code": code }))
         }
         "si" | "so" => {
@@ -313,7 +395,11 @@ fn run_command(words: &[&str], default_limit: u64, client: &mut Client) -> Resul
         }
         "disasm" => {
             let address = parse_u64(arg(1)?)?;
-            let count = if words.len() > 2 { parse_u64(words[2])? } else { 16 };
+            let count = if words.len() > 2 {
+                parse_u64(words[2])?
+            } else {
+                16
+            };
             let rows = client.disasm(address, count).map_err(|e| e.to_string())?;
             Ok(serde_json::json!({
                 "count": rows.len(),
@@ -364,20 +450,15 @@ fn run_command(words: &[&str], default_limit: u64, client: &mut Client) -> Resul
                 }
             }
             let unique_count = addresses.len();
-            let mut armed = 0usize;
-            let mut capacity_full = false;
-            for address in addresses {
-                if !client.hook_set(address).map_err(|e| e.to_string())? {
-                    capacity_full = true;
-                    break;
-                }
-                armed += 1;
-            }
+            let (armed, total_hooks, capacity_full) = client
+                .hook_set_batch(&addresses)
+                .map_err(|e| e.to_string())?;
             Ok(serde_json::json!({
                 "module": module,
                 "exports": export_count,
                 "unique_addresses": unique_count,
                 "armed": armed,
+                "total_hooks": total_hooks,
                 "skipped_aliases": export_count.saturating_sub(unique_count),
                 "capacity_full": capacity_full,
             }))
@@ -387,17 +468,21 @@ fn run_command(words: &[&str], default_limit: u64, client: &mut Client) -> Resul
             let set_reg_name = arg(2)?;
             let set_value = parse_u64(arg(3)?)?;
             let arch = runtime_arch(client)?;
-            let set_reg = registers::reg_id(arch, set_reg_name)
-                .ok_or_else(|| format!("unknown set register for target architecture: {set_reg_name}"))?;
+            let set_reg = registers::reg_id(arch, set_reg_name).ok_or_else(|| {
+                format!("unknown set register for target architecture: {set_reg_name}")
+            })?;
             let (match_reg, match_mask, match_value, match_name) = if words.len() >= 7 {
                 let name = words[4];
-                let reg = registers::reg_id(arch, name)
-                    .ok_or_else(|| format!("unknown match register for target architecture: {name}"))?;
+                let reg = registers::reg_id(arch, name).ok_or_else(|| {
+                    format!("unknown match register for target architecture: {name}")
+                })?;
                 (reg, parse_u64(words[5])?, parse_u64(words[6])?, Some(name))
             } else if words.len() == 4 {
                 (0, 0, 0, None)
             } else {
-                return Err("hookrule needs ADDR SETREG VALUE [MATCHREG MASK VALUE] [TID]".to_string());
+                return Err(
+                    "hookrule needs ADDR SETREG VALUE [MATCHREG MASK VALUE] [TID]".to_string(),
+                );
             };
             let thread_id = if words.len() >= 8 {
                 parse_u64(words[7])? as u32
@@ -459,7 +544,9 @@ fn run_command(words: &[&str], default_limit: u64, client: &mut Client) -> Resul
                 other => return Err(format!("bad syscallfilter mode: {other}")),
             };
             let count = numbers.len();
-            client.syscall_filter(mode, &numbers).map_err(|e| e.to_string())?;
+            client
+                .syscall_filter(mode, &numbers)
+                .map_err(|e| e.to_string())?;
             Ok(serde_json::json!({
                 "mode": if mode == 0 { "all" } else { "only" }, "count": count,
             }))
@@ -578,10 +665,12 @@ fn run_command(words: &[&str], default_limit: u64, client: &mut Client) -> Resul
             match words.get(1).copied() {
                 Some("run") => {
                     let path = arg(2)?;
-                    let source = std::fs::read_to_string(path)
-                        .map_err(|e| format!("read {path}: {e}"))?;
+                    let source =
+                        std::fs::read_to_string(path).map_err(|e| format!("read {path}: {e}"))?;
                     let name = path.rsplit(['\\', '/']).next().unwrap_or(path);
-                    let id = client.script_load(name, &source).map_err(|e| e.to_string())?;
+                    let id = client
+                        .script_load(name, &source)
+                        .map_err(|e| e.to_string())?;
                     Ok(serde_json::json!({ "id": id, "name": name }))
                 }
                 Some("off") => {
@@ -657,7 +746,7 @@ fn shell(mut client: Client, default_limit: u64) -> i32 {
         match first {
             "quit" | "exit" | "q" => break,
             "help" | "?" => {
-                println!("commands: ping | counters | events [N] | stop | resume | read A S | region A | write A HEX | bp A | bps | bc ID | modules | threads | context TID | setreg TID REG V | engine KIND on|off | exc [off|all|CODE] | exports MOD | hook A | hookall MOD | hookrule ADDR SETREG VALUE [MATCHREG MASK VALUE] [TID] | hookrulesclear | hooks | hookdel A | hookclear | syscallfilter all|only [N...] | trace start KINDS LO HI PATH | trace start-spec KINDS LO-HI[,LO-HI] THREADS|all PATH | trace extend LO-HI[,LO-HI] | trace stop | trace status | tracest | script run FILE | script off [NAME|all] | script list | script output [--follow] | limit N | quit");
+                println!("commands: ping | counters | events [N] | hookevents [N] | hooksig ADDR CONV RET_KIND PARAM_COUNT FLOAT_MASK | stop | resume | read A S | region A | write A HEX | bp A | bps | bc ID | modules | threads | context TID | setreg TID REG V | engine KIND on|off | exc [off|all|CODE] | exports MOD | hook A | hookall MOD | hookrule ADDR SETREG VALUE [MATCHREG MASK VALUE] [TID] | hookrulesclear | hooks | hookdel A | hookclear | syscallfilter all|only [N...] | trace start KINDS LO HI PATH | trace start-spec KINDS LO-HI[,LO-HI] THREADS|all PATH | trace extend LO-HI[,LO-HI] | trace stop | trace status | tracest | script run FILE | script off [NAME|all] | script list | script output [--follow] | limit N | quit");
                 continue;
             }
             "limit" => {
@@ -705,6 +794,7 @@ fn main() {
             port: config.port,
             entry_bp: config.entry_bp,
             probe_mode: config.pin_probe,
+            show_target_console: false,
         };
         match launch::launch_for_target(&options, &config.target, STARTUP_TIMEOUT) {
             Ok((child, _port)) => backend = Some(child),
@@ -720,7 +810,8 @@ fn main() {
             .map_err(|e| format!("connect 127.0.0.1:{}: {e}", config.port));
         match connected {
             Ok(mut client) => {
-                if config.command.is_empty() || config.command == "shell" || config.command == "run" {
+                if config.command.is_empty() || config.command == "shell" || config.command == "run"
+                {
                     shell(client, config.limit)
                 } else {
                     let mut words: Vec<&str> = vec![config.command.as_str()];

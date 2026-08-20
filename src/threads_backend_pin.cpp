@@ -16,7 +16,7 @@ PbStatus PbBackendThreadResumeApplication(PbThreadId t){PIN_ResumeApplicationThr
 PbStatus PbBackendThreadSetData(PbTlsKey k,const void*d,PbThreadId t,uint8_t*o){*o=PIN_SetThreadData(k,d,t)?1:0;return PB_OK;}
 PbStatus PbBackendThreadSleep(uint32_t m){PIN_Sleep(m);return PB_OK;}
 PbStatus PbBackendThreadSpawnApplication(PbConstContextHandle c,uint8_t*o){*o=PIN_SpawnApplicationThread(reinterpret_cast<const CONTEXT*>(c))?1:0;return PB_OK;}
-PbStatus PbBackendThreadSpawnInternal(PbThreadRootCallback f,void*a,uint64_t s,PbThreadId*t,PbPinThreadUid*u){*t=PIN_SpawnInternalThread(reinterpret_cast<ROOT_THREAD_FUNC*>(f),a,static_cast<size_t>(s),u);return PB_OK;}
+PbStatus PbBackendThreadSpawnInternal(PbThreadRootCallback f,void*a,uint64_t s,PbThreadId*t,PbPinThreadUid*u){*t=PIN_SpawnInternalThread(reinterpret_cast<ROOT_THREAD_FUNC*>(f),a,static_cast<size_t>(s),u);return *t==INVALID_THREADID?PB_ERR_INTERNAL:PB_OK;}
 PbStatus PbBackendThreadStopApplication(PbThreadId t,uint8_t*o){*o=PIN_StopApplicationThreads(t)?1:0;return PB_OK;}
 PbStatus PbBackendThreadId(PbThreadId*o){*o=PIN_ThreadId();return PB_OK;}
 PbStatus PbBackendThreadUid(PbPinThreadUid*o){*o=PIN_ThreadUid();return PB_OK;}

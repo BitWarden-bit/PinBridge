@@ -3,8 +3,8 @@
 use core::ffi::{c_char, c_void};
 
 pub const PB_ABI_VERSION_MAJOR: u32 = 1;
-pub const PB_ABI_VERSION_MINOR: u32 = 10;
-pub const PB_ABI_VERSION: u32 = 65546;
+pub const PB_ABI_VERSION_MINOR: u32 = 11;
+pub const PB_ABI_VERSION: u32 = 65547;
 pub const PB_TRI_YES: PbTri = 0;
 pub const PB_TRI_NO: PbTri = 1;
 pub const PB_TRI_MAYBE: PbTri = 2;
@@ -1513,6 +1513,7 @@ pub type PbTraceBufferCallback = Option<unsafe extern "C" fn(id: PbBufferId, thr
 pub type PbSyscallEntryCallback = Option<unsafe extern "C" fn(thread_id: PbThreadId, context: PbContextHandle, standard: PbSyscallStandard, user_data: *mut c_void)>;
 pub type PbSyscallExitCallback = Option<unsafe extern "C" fn(thread_id: PbThreadId, context: PbContextHandle, standard: PbSyscallStandard, user_data: *mut c_void)>;
 pub type PbInsCaptureRegsCallback = Option<unsafe extern "C" fn(address: u64, thread_id: u32, rcx: u64, rdx: u64, r8: u64, r9: u64, user_data: *mut c_void)>;
+pub type PbInsHookMonitorCallback = Option<unsafe extern "C" fn(address: u64, thread_id: u32, arg0: u64, arg1: u64, arg2: u64, arg3: u64, stack_pointer: u64, return_value: u64, user_data: *mut c_void)>;
 pub type PbInsContextCaptureRegsCallback = Option<unsafe extern "C" fn(address: u64, thread_id: u32, context: PbContextHandle, rcx: u64, rdx: u64, r8: u64, r9: u64, user_data: *mut c_void)>;
 pub type PbInsMemoryOperandCallback = Option<unsafe extern "C" fn(instruction_address: u64, thread_id: u32, memory_address: u64, size: u32, access: u32, user_data: *mut c_void)>;
 pub type PbInsMemoryTranslateCallback = Option<unsafe extern "C" fn(instruction_address: u64, thread_id: u32, memory_address: u64, size: u32, memory_operation: u32, user_data: *mut c_void) -> u64>;
@@ -1696,6 +1697,7 @@ unsafe extern "C" {
     pub fn pb_ins_insert_fill_buffer_predicated(ins: PbInsHandle, ipoint: PbIpoint, id: PbBufferId, field_offset: u32) -> PbStatus;
     pub fn pb_ins_insert_fill_buffer_then(ins: PbInsHandle, ipoint: PbIpoint, id: PbBufferId, field_offset: u32) -> PbStatus;
     pub fn pb_ins_insert_capture_regs(ins: PbInsHandle, callback: PbInsCaptureRegsCallback, user_data: *mut c_void) -> PbStatus;
+    pub fn pb_ins_insert_hook_monitor(ins: PbInsHandle, callback: PbInsHookMonitorCallback, user_data: *mut c_void) -> PbStatus;
     pub fn pb_ins_insert_capture_regs_ctx(ins: PbInsHandle, callback: PbInsContextCaptureRegsCallback, user_data: *mut c_void) -> PbStatus;
     pub fn pb_ins_insert_memory_operands(ins: PbInsHandle, callback: PbInsMemoryOperandCallback, user_data: *mut c_void) -> PbStatus;
     pub fn pb_ins_insert_memory_address_translation(ins: PbInsHandle, callback: PbInsMemoryTranslateCallback, user_data: *mut c_void, scratch_reg0: PbRegId, scratch_reg1: PbRegId) -> PbStatus;
@@ -2148,6 +2150,7 @@ unsafe extern "C" {
     pub fn pb_pin_fetch_original_code(copy_buffer: *mut c_void, address: u64, max_size: u64, exception_info: PbExceptionInfoHandle, out_copied: *mut u64) -> PbStatus;
     pub fn pb_pin_add_internal_exception_handler(callback: PbInternalExceptionCallback, user_data: *mut c_void, out_callback: *mut PbCallbackHandle) -> PbStatus;
     pub fn pb_pin_enable_single_step_passthrough(out_callback: *mut PbCallbackHandle) -> PbStatus;
+    pub fn pb_pin_set_single_step_passthrough(thread_id: PbThreadId, enabled: u8) -> PbStatus;
     pub fn pb_pin_try_start(thread_id: PbThreadId, callback: PbInternalExceptionCallback, user_data: *mut c_void, out_scope: *mut PbCallbackHandle) -> PbStatus;
     pub fn pb_pin_try_end(thread_id: PbThreadId, scope: *mut PbCallbackHandle) -> PbStatus;
     pub fn pb_pin_add_memory_address_trans_function(callback: PbMemoryAddressTransCallback, user_data: *mut c_void) -> PbStatus;

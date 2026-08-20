@@ -8,6 +8,26 @@ use super::{extract_word, publish_interests, response_set, sort_handlers, Handle
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
+const MAX_INTERCEPT_RETURN_BYTES: usize = 4096;
+
+fn bounded_return(value: &Bound<'_, PyAny>) -> String {
+    let mut rendered = value
+        .repr()
+        .map(|value| value.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| "<return repr failed>".to_string());
+    if rendered.len() <= MAX_INTERCEPT_RETURN_BYTES {
+        return rendered;
+    }
+    let suffix = "…<truncated>";
+    let mut end = MAX_INTERCEPT_RETURN_BYTES.saturating_sub(suffix.len());
+    while !rendered.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    rendered.truncate(end);
+    rendered.push_str(suffix);
+    rendered
+}
+
 fn parse_response(
     value: &Bound<'_, PyAny>,
 ) -> Result<crate::sync_intercept::InterceptResponse, String> {
@@ -134,17 +154,23 @@ pub(super) fn dispatch(request: crate::sync_intercept::InterceptRequest) {
             let _ = event.set_item("code", request.exception_code);
             let _ = event.set_item("from_registers", from_registers);
             let _ = event.set_item("registers", registers);
-            let result = with_plugin_context(&handler.plugin, || {
+            let callback_result = with_plugin_context(&handler.plugin, || {
                 let _guard = PythonDecisionGuard::enter();
                 handler
                     .callback
                     .call1(py, (event,))
                     .map_err(|error| error.to_string())
-                    .and_then(|value| parse_response(value.bind(py)))
-                    .and_then(|response| {
-                        merge_response(&mut aggregate, &response).map(|_| response)
-                    })
             });
+            let (result, last_return) = match callback_result {
+                Ok(value) => {
+                    let rendered = bounded_return(value.bind(py));
+                    let result = parse_response(value.bind(py)).and_then(|response| {
+                        merge_response(&mut aggregate, &response).map(|_| response)
+                    });
+                    (result, Some(rendered))
+                }
+                Err(error) => (Err(error), None),
+            };
             let error = result.err();
             if error.is_some() {
                 valid = false;
@@ -152,6 +178,11 @@ pub(super) fn dispatch(request: crate::sync_intercept::InterceptRequest) {
             with_registry_mut(|registry| {
                 if let Some(plugin) = registry.get_mut(&handler.plugin) {
                     plugin.delivered = plugin.delivered.saturating_add(1);
+                    if let Some(binding) = plugin.decisions.get_mut(&handler.id) {
+                        binding.last_generation = request.generation;
+                        binding.last_return = last_return.clone();
+                        binding.last_error = error.clone();
+                    }
                     if error.is_some() {
                         plugin.state = STATE_ERROR;
                         registry_changed = true;
@@ -172,9 +203,9 @@ pub(super) fn dispatch(request: crate::sync_intercept::InterceptRequest) {
                 ));
             }
         }
+        super::super::publish_list_snapshot();
         if registry_changed {
             publish_interests();
-            super::super::publish_list_snapshot();
         }
         if !valid {
             super::super::native_policies::refresh_best_effort("exception interceptor failed");

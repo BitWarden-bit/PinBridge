@@ -29,6 +29,11 @@ int main(void)
     if (pb_pin_enable_single_step_passthrough(&callback) != PB_OK ||
         callback.opaque != UINT64_C(0x3203))
         return 6;
+    if (pb_pin_set_single_step_passthrough(7u, 1u) != PB_OK ||
+        pb_pin_set_single_step_passthrough(7u, 0u) != PB_OK ||
+        pb_pin_set_single_step_passthrough(8u, 1u) != PB_ERR_INVALID_ARGUMENT ||
+        pb_pin_set_single_step_passthrough(7u, 2u) != PB_ERR_INVALID_ARGUMENT)
+        return 7;
     if (pb_pin_try_start(7u, OnInternalException, &g_calls, &scope) != PB_OK ||
         scope.opaque != UINT64_C(0x3202) || g_calls != 2u)
         return 2;

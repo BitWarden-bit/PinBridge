@@ -42,9 +42,10 @@ pub const EVENT_REPEAT: u32 = 12;
 /// Per-instruction register snapshot component. arg0=register id, arg1/arg2
 /// contain the value (low/high), arg3=value width, arg7=frame id.
 pub const EVENT_REG_SNAPSHOT: u32 = 13;
-/// Runtime hook placed on a function's `ret` instruction. `arg0` is the
-/// pre-action return register (RAX/EAX), `arg1..arg4` are the captured integer
-/// register slots, and `arg5..arg7` are the first three ABI stack arguments.
+/// Runtime Hook return. For an explicit instruction Hook on `ret`, `arg0` is
+/// the pre-action return register and the remaining slots retain diagnostics.
+/// For one-click function logging, `address` is the function entry and `arg0`
+/// is the value supplied by Pin at the routine's normal exit point.
 pub const EVENT_HOOK_RETURN: u32 = 14;
 
 // Low-frequency process lifecycle kinds.  They use the same wire record as
@@ -117,6 +118,14 @@ pub const EVENT_BBL_INSTRUMENT: u32 = 31;
 /// arg3=hit count, arg4=stop generation, arg5=option flags, arg6=thread
 /// filter (u32::MAX means all threads).
 pub const EVENT_EXECUTION_TRAP: u32 = 32;
+/// Final disposition of a target exception after synchronous Python
+/// interceptors had a chance to patch the destination context.
+/// address=source IP, arg0=exception code, arg1=context generation,
+/// arg2=OS/Pin destination IP before interception, arg3=final destination IP,
+/// arg4=patched GP-register mask, arg5=interceptor-ran, arg6=final-IP-known,
+/// arg7=original-destination-known. This event is retained only in the
+/// dedicated priority lane.
+pub const EVENT_EXCEPTION_DISPOSITION: u32 = 33;
 
 pub const EVENT_KIND_COUNT: usize = 9;
 

@@ -147,6 +147,7 @@ pb_ins_insert_exec
 pb_ins_insert_fill_buffer
 pb_ins_insert_fill_buffer_predicated
 pb_ins_insert_fill_buffer_then
+pb_ins_insert_hook_monitor
 pb_ins_insert_if_call_before
 pb_ins_insert_if_predicated_call_before
 pb_ins_insert_indirect_jump
@@ -449,6 +450,7 @@ pb_pin_set_debug_mode
 pb_pin_set_exception_address
 pb_pin_set_physical_context_fxsave
 pb_pin_set_physical_context_reg
+pb_pin_set_single_step_passthrough
 pb_pin_set_smc_support
 pb_pin_set_syntax_att
 pb_pin_set_syntax_intel

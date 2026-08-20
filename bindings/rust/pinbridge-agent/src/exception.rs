@@ -3,7 +3,7 @@
 //! compatibility rings with one generation. This preserves signal/APC/
 //! callback transitions as well as exceptions during telemetry floods.
 
-use crate::event::{Event, EVENT_CONTEXT_CHANGE};
+use crate::event::{Event, EVENT_CONTEXT_CHANGE, EVENT_EXCEPTION_DISPOSITION};
 use crate::ring::submit;
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -69,15 +69,40 @@ unsafe extern "C" fn on_context_change(
     crate::record::submit_global(from, event);
 
     if reason == PB_CONTEXT_CHANGE_REASON_EXCEPTION {
-        if let Some(response) = crate::sync_intercept::decide_exception(
-            thread_id,
-            reason,
-            from,
-            to,
-            info as u32,
-        ) {
+        let mut interceptor_ran = false;
+        let mut register_mask = 0u32;
+        if let Some(response) =
+            crate::sync_intercept::decide_exception(thread_id, reason, from, to, info as u32)
+        {
+            interceptor_ran = true;
+            register_mask = response.register_mask;
             crate::sync_intercept::apply_exception_response(to, &response);
         }
+
+        // The context-change record above describes the OS/Pin destination
+        // before interception. Read it again after applying the response so
+        // monitoring clients can prove where execution will actually go.
+        let mut final_ip = 0u64;
+        let final_ip_known = !to.is_null()
+            && pb_pin_get_context_reg(
+                to as PbConstContextHandle,
+                crate::arch::instr_ptr_reg(),
+                &mut final_ip,
+            ) == PB_OK;
+        crate::priority::submit(Event {
+            kind: EVENT_EXCEPTION_DISPOSITION,
+            thread_id,
+            address: from_ip,
+            arg0: info as i64 as u64,
+            arg1: context_generation,
+            arg2: to_ip,
+            arg3: final_ip,
+            arg4: register_mask as u64,
+            arg5: interceptor_ran as u64,
+            arg6: final_ip_known as u64,
+            arg7: to_ip_known as u64,
+            ..Event::EMPTY
+        });
     }
 
     if reason == PB_CONTEXT_CHANGE_REASON_EXCEPTION

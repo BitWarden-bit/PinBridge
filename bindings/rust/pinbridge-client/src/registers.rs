@@ -7,9 +7,9 @@
 //! `pinbridge_sys::PbRegId`) so that host-side tools stay free of the Pin SDK
 //! dependency; both agree on the same numeric ids.
 
-use pinbridge_proto::ARCH_X86;
 #[cfg(test)]
 use pinbridge_proto::ARCH_X64;
+use pinbridge_proto::ARCH_X86;
 
 /// Virtual register ids reserved by the Hook action protocol for ABI-aware
 /// stack arguments. They are deliberately outside Pin's PbRegId range.

@@ -8,6 +8,12 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc, Mutex,
 };
+use std::time::{Duration, Instant};
+
+// The Hub closes an IPC worker after 30 seconds without a request. Reopen a
+// quiet connection before that boundary so the next MCP tool call does not
+// have to fail once merely to discover that its socket has expired.
+const IPC_RECONNECT_IDLE: Duration = Duration::from_secs(25);
 
 #[derive(Clone, Debug)]
 pub struct HubResult {
@@ -53,8 +59,13 @@ impl<T: HubClient + ?Sized> HubClient for Arc<T> {
 pub struct IpcHubClient {
     endpoint: Vec<SocketAddr>,
     credential: String,
-    connection: Mutex<Option<pinbridge_hub_core::ipc::IpcClient>>,
+    connection: Mutex<ConnectionState>,
     next_request_id: AtomicU64,
+}
+
+struct ConnectionState {
+    client: Option<pinbridge_hub_core::ipc::IpcClient>,
+    last_activity: Option<Instant>,
 }
 
 impl IpcHubClient {
@@ -69,7 +80,10 @@ impl IpcHubClient {
         Ok(Self {
             endpoint,
             credential,
-            connection: Mutex::new(None),
+            connection: Mutex::new(ConnectionState {
+                client: None,
+                last_activity: None,
+            }),
             next_request_id: AtomicU64::new(1),
         })
     }
@@ -95,7 +109,14 @@ impl HubClient for IpcHubClient {
             .connection
             .lock()
             .map_err(|_| HubError::Unavailable("Hub connection lock poisoned".into()))?;
-        if connection.is_none() {
+        if connection
+            .last_activity
+            .is_some_and(|last| last.elapsed() >= IPC_RECONNECT_IDLE)
+        {
+            connection.client = None;
+            connection.last_activity = None;
+        }
+        if connection.client.is_none() {
             let client = pinbridge_hub_core::ipc::IpcClient::connect(
                 self.endpoint.as_slice(),
                 pinbridge_hub_core::ipc::IpcHello {
@@ -104,7 +125,7 @@ impl HubClient for IpcHubClient {
                 },
             )
             .map_err(|e| HubError::Unavailable(format!("Hub unavailable: {e}")))?;
-            *connection = Some(client);
+            connection.client = Some(client);
         }
         let params = arguments.as_object().cloned().unwrap_or_default();
         let request_id = format!(
@@ -117,18 +138,24 @@ impl HubClient for IpcHubClient {
             params,
         };
         let response = match connection
+            .client
             .as_mut()
             .expect("connection initialized")
             .call(request)
         {
-            Ok(response) => response,
+            Ok(response) => {
+                connection.last_activity = Some(Instant::now());
+                response
+            }
             Err(error) => {
-                *connection = None;
+                connection.client = None;
+                connection.last_activity = None;
                 return Err(HubError::Unavailable(format!("Hub unavailable: {error}")));
             }
         };
         if response.id != Value::String(request_id) {
-            *connection = None;
+            connection.client = None;
+            connection.last_activity = None;
             return Err(HubError::Unavailable("Hub response id mismatch".into()));
         }
         let response_operation_id = response.operation_id;
@@ -233,6 +260,48 @@ mod tests {
         });
         let reconnected = client.call("session_status", &json!({})).unwrap();
         assert_eq!(reconnected.operation_id.as_deref(), Some("op-3"));
+        thread.join().unwrap();
+    }
+
+    #[test]
+    fn idle_ipc_connection_is_refreshed_before_the_next_request() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let endpoint = listener.local_addr().unwrap().to_string();
+        let thread = std::thread::spawn(move || {
+            for n in 1..=2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let hello: IpcHello =
+                    serde_json::from_value(read_frame(&mut stream).unwrap()).unwrap();
+                assert_eq!(hello.channel, "ai");
+                let request: IpcRequest =
+                    serde_json::from_value(read_frame(&mut stream).unwrap()).unwrap();
+                write_frame(
+                    &mut stream,
+                    &serde_json::to_value(IpcResponse {
+                        id: request.id,
+                        ok: true,
+                        result: Some(json!({"n":n})),
+                        error: None,
+                        operation_id: Some(format!("op-{n}")),
+                    })
+                    .unwrap(),
+                )
+                .unwrap();
+            }
+        });
+        let client = IpcHubClient::new(endpoint, "ai-secret-123456789".into()).unwrap();
+        assert_eq!(
+            client.call("session_status", &json!({})).unwrap().value["n"],
+            1
+        );
+        {
+            let mut connection = client.connection.lock().unwrap();
+            connection.last_activity = Some(Instant::now() - IPC_RECONNECT_IDLE);
+        }
+        assert_eq!(
+            client.call("session_status", &json!({})).unwrap().value["n"],
+            2
+        );
         thread.join().unwrap();
     }
 

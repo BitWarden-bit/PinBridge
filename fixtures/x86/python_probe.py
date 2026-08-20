@@ -62,7 +62,12 @@ def pb_init():
         raise RuntimeError("could not decode x86 entry instructions")
     flow_target = rows[0][3]
     next_address = flow_target if flow_target else rows[1][0]
-    pb.breakpoint(next_address, on_next_instruction, once=True)
+    pb.breakpoint(
+        next_address,
+        on_next_instruction,
+        description="Verify x86 execution reaches the decoded entry successor",
+        once=True,
+    )
     pb.print(
         "X86_PYTHON_READY control_port=%d entry=0x%x eip=0x%x breakpoint=0x%x"
         % (pb.control_port(), entry, stopped_eip, next_address)

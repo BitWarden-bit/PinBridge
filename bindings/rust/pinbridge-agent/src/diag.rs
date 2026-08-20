@@ -1,8 +1,6 @@
-//! TEMPORARY diagnostics: first-chance vectored handler that dumps the
-//! faulting thread's stack (module + offset per frame) to a crash file with
-//! RAW Win32 writes — no log.rs mutex (it may be held by the dying thread),
-//! no Rust TLS. Pin's UPC dispatcher still runs afterwards and kills the
-//! process; we only observe. Remove when the script-host crash is fixed.
+//! Opt-in crash diagnostics. The native VEH is disabled during normal runs:
+//! installing a first-priority handler changes the observable exception chain
+//! of protected targets. Set `PINBRIDGE_DIAG_VEH=1` only for Agent crash hunts.
 
 use core::ffi::c_void;
 
@@ -52,7 +50,13 @@ extern "system" {
         flags: u32,
         template: *mut c_void,
     ) -> *mut c_void;
-    fn WriteFile(file: *mut c_void, buffer: *const u8, size: u32, written: *mut u32, overlapped: *mut c_void) -> i32;
+    fn WriteFile(
+        file: *mut c_void,
+        buffer: *const u8,
+        size: u32,
+        written: *mut u32,
+        overlapped: *mut c_void,
+    ) -> i32;
     fn CloseHandle(handle: *mut c_void) -> i32;
 }
 
@@ -81,7 +85,10 @@ pub fn heap_check_fast_enabled() -> bool {
         1 => false,
         _ => {
             let on = std::env::var("PINBRIDGE_HEAP_CHECK_FAST").ok().as_deref() == Some("1");
-            ON.store(if on { 2 } else { 1 }, core::sync::atomic::Ordering::Relaxed);
+            ON.store(
+                if on { 2 } else { 1 },
+                core::sync::atomic::Ordering::Relaxed,
+            );
             on
         }
     }
@@ -117,7 +124,10 @@ pub fn heap_check(where_from: &str) {
         1 => return,
         _ => {
             let on = std::env::var("PINBRIDGE_HEAP_CHECK").ok().as_deref() == Some("1");
-            ON.store(if on { 2 } else { 1 }, core::sync::atomic::Ordering::Relaxed);
+            ON.store(
+                if on { 2 } else { 1 },
+                core::sync::atomic::Ordering::Relaxed,
+            );
             if !on {
                 return;
             }
@@ -178,11 +188,16 @@ pub fn heap_check(where_from: &str) {
     }
 }
 
-
 fn write_all(file: *mut c_void, text: &str) {
     let mut written: u32 = 0;
     unsafe {
-        WriteFile(file, text.as_ptr(), text.len() as u32, &mut written, core::ptr::null_mut());
+        WriteFile(
+            file,
+            text.as_ptr(),
+            text.len() as u32,
+            &mut written,
+            core::ptr::null_mut(),
+        );
     }
 }
 
@@ -281,7 +296,13 @@ unsafe extern "system" fn on_fault(pointers: *mut ExceptionPointers) -> i32 {
     push(&mut line, &mut len, &dec[index..]);
     push(&mut line, &mut len, b"\n");
     let mut written: u32 = 0;
-    WriteFile(file, line.as_ptr(), len as u32, &mut written, core::ptr::null_mut());
+    WriteFile(
+        file,
+        line.as_ptr(),
+        len as u32,
+        &mut written,
+        core::ptr::null_mut(),
+    );
     // raw frame addresses only — module resolution takes the loader lock
     let mut frames: [*mut c_void; 48] = [core::ptr::null_mut(); 48];
     let captured = RtlCaptureStackBackTrace(0, 48, frames.as_mut_ptr(), core::ptr::null_mut());
@@ -291,24 +312,33 @@ unsafe extern "system" fn on_fault(pointers: *mut ExceptionPointers) -> i32 {
         push(&mut line, &mut len, b"  0x");
         push(&mut line, &mut len, hex(*frame as u64, &mut buf));
         push(&mut line, &mut len, b"\n");
-        WriteFile(file, line.as_ptr(), len as u32, &mut written, core::ptr::null_mut());
+        WriteFile(
+            file,
+            line.as_ptr(),
+            len as u32,
+            &mut written,
+            core::ptr::null_mut(),
+        );
     }
     CloseHandle(file);
     0 // keep searching: Pin's own dispatcher still reports and kills
 }
 
 pub fn install(install_pin_handler: bool) {
-    // Pre-widen the crash path: the vectored handler must stay allocation-
-    // free, and CreateFileA's A->W conversion allocates from the process heap.
-    unsafe {
-        for (index, byte) in CRASH_PATH.iter().take(259).enumerate() {
-            CRASH_PATH_W[index] = *byte as u16;
+    let native_veh = std::env::var("PINBRIDGE_DIAG_VEH").ok().as_deref() == Some("1");
+    if native_veh {
+        // Pre-widen the crash path: the vectored handler must stay allocation-
+        // free, and CreateFileA's A->W conversion allocates from the process heap.
+        unsafe {
+            for (index, byte) in CRASH_PATH.iter().take(259).enumerate() {
+                CRASH_PATH_W[index] = *byte as u16;
+            }
         }
+        let handler = unsafe { AddVectoredExceptionHandler(1, on_fault as *mut c_void) };
+        crate::log::line(&format!("opt-in crash VEH -> {handler:p}"));
+    } else {
+        crate::log::line("native crash VEH disabled");
     }
-    // NOTE: no OS-loader work here — agent_main runs inside Pin's tool-load
-    // sequence; LoadLibrary here killed the process (ntdll TPP fault).
-    let handler = unsafe { AddVectoredExceptionHandler(1, on_fault as *mut c_void) };
-    crate::log::line(&format!("crash dump handler -> {handler:p}"));
     if !install_pin_handler {
         crate::log::line("pin crash handler disabled in probe mode");
         return;
@@ -336,8 +366,7 @@ unsafe extern "C" fn on_pin_fault(
     let mut address: u64 = 0;
     pinbridge_sys::pb_pin_get_exception_code(exception_info, &mut code);
     pinbridge_sys::pb_pin_get_exception_address(exception_info, &mut address);
-    let mut exception_class: pinbridge_sys::PbExceptionClass =
-        pinbridge_sys::PB_EXCEPTCLASS_NONE;
+    let mut exception_class: pinbridge_sys::PbExceptionClass = pinbridge_sys::PB_EXCEPTCLASS_NONE;
     let _ = pinbridge_sys::pb_pin_get_exception_class(code, &mut exception_class);
     let mut fault_address = 0u64;
     let mut fault_address_known = 0u8;
@@ -479,7 +508,11 @@ unsafe extern "C" fn on_pin_fault(
             let (base, name) = module_of(ret as *mut c_void);
             write_all(
                 file,
-                &format!("  ret 0x{ret:x} {}+0x{:x}\n", name, ret.wrapping_sub(base as u64)),
+                &format!(
+                    "  ret 0x{ret:x} {}+0x{:x}\n",
+                    name,
+                    ret.wrapping_sub(base as u64)
+                ),
             );
             if prev <= frame {
                 break;

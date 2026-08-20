@@ -43,6 +43,7 @@ def pb_init():
     breakpoint_id = pb.breakpoint(
         address,
         on_target_breakpoint,
+        description="Capture the target call context and stack, then resume execution",
         once=False,
         thread_id=None,
     )

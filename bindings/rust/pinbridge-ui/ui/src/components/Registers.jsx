@@ -9,6 +9,22 @@ const REG_NAMES = {
   18: "r15", 26: "rip", 25: "rflags",
 };
 
+// RFLAGS (25, x64) / EFLAGS (57, x86) ship as one raw value; the individual
+// status bits are what a human actually reads, so they are parsed out here.
+const FLAGS_IDS = [25, 57];
+const FLAG_BITS = [
+  ["CF", 0], ["PF", 2], ["AF", 4], ["ZF", 6], ["SF", 7],
+  ["TF", 8], ["IF", 9], ["DF", 10], ["OF", 11],
+];
+
+function parseFlags(text) {
+  try {
+    return BigInt(text);
+  } catch {
+    return null;
+  }
+}
+
 export default function Registers({ tid, regs, onChanged }) {
   const t = useT();
   async function edit(reg, oldv) {
@@ -17,8 +33,16 @@ export default function Registers({ tid, regs, onChanged }) {
     await api.setreg(tid, reg, value);
     onChanged();
   }
+  async function toggleFlag(flagsId, current, bit) {
+    if (tid == null) return;
+    const next = current ^ (1n << BigInt(bit));
+    await api.setreg(tid, flagsId, "0x" + next.toString(16));
+    onChanged();
+  }
   const map = {};
   regs.forEach((r) => (map[r.reg] = r.value));
+  const flagsId = FLAGS_IDS.find((id) => map[id] != null) ?? null;
+  const flags = flagsId != null ? parseFlags(map[flagsId]) : null;
   const half = Math.ceil(REG_ORDER.length / 2);
   const columns = [REG_ORDER.slice(0, half), REG_ORDER.slice(half)];
   return (
@@ -41,6 +65,23 @@ export default function Registers({ tid, regs, onChanged }) {
           </table>
         ))}
       </div>
+      {flags != null && (
+        <div className="flags-row">
+          {FLAG_BITS.map(([name, bit]) => {
+            const on = ((flags >> BigInt(bit)) & 1n) === 1n;
+            return (
+              <span
+                key={name}
+                className={on ? "on" : ""}
+                title={tid != null ? `${name} = ${on ? 1 : 0} · ${t("flagToggleHint")}` : `${name} = ${on ? 1 : 0}`}
+                onClick={() => toggleFlag(flagsId, flags, bit)}
+              >
+                {name}
+              </span>
+            );
+          })}
+        </div>
+      )}
     </div>
   );
 }

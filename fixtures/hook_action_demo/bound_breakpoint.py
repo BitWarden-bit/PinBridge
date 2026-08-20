@@ -53,5 +53,10 @@ def pb_init():
     if address is None:
         pb.print("BOUND_BP_NO_EXPORT")
         return
-    bp_id = pb.breakpoint(address, on_demo_api, once=False)
+    bp_id = pb.breakpoint(
+        address,
+        on_demo_api,
+        description="Observe DemoApi context and apply the fixture stop action",
+        once=False,
+    )
     pb.print("BOUND_BP_READY id=%d address=0x%x" % (bp_id, address))

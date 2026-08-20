@@ -10,13 +10,13 @@
 
 mod ui;
 
-use pinbridge_client::client::{Client, ScriptListEntry, Snapshot};
-use pinbridge_client::launch;
 use crossterm::event::{Event, KeyCode, KeyEventKind};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
+use pinbridge_client::client::{Client, ScriptListEntry, Snapshot};
+use pinbridge_client::launch;
 use pinbridge_proto as proto;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
@@ -85,7 +85,11 @@ fn probe(port: u16) -> i32 {
             let counters = client.counters();
             let newest = client.ring_newest(3);
             match (ping, counters, newest) {
-                (Ok((major, minor, pid, _)), Ok((_, dropped, capacity, kinds)), Ok((_, events))) => {
+                (
+                    Ok((major, minor, pid, _)),
+                    Ok((_, dropped, capacity, kinds)),
+                    Ok((_, events)),
+                ) => {
                     println!("probe ok: abi={major}.{minor} pid={pid} dropped={dropped} capacity={capacity}");
                     println!(
                         "hook_regs={} memory={} exec={} branch_edge={}",
@@ -94,8 +98,12 @@ fn probe(port: u16) -> i32 {
                     for event in &events {
                         println!(
                             "  event #{:<9} kind={} tid={} ip=0x{:x} arg0=0x{:x} arg1=0x{:x}",
-                            event.sequence, event.kind, event.thread_id, event.address,
-                            event.arg0, event.arg1
+                            event.sequence,
+                            event.kind,
+                            event.thread_id,
+                            event.address,
+                            event.arg0,
+                            event.arg1
                         );
                     }
                     0
@@ -126,6 +134,7 @@ fn maybe_spawn_backend(config: &Config) -> Option<Child> {
         port: config.port,
         entry_bp: config.entry_bp,
         probe_mode: config.pin_probe,
+        show_target_console: false,
     };
     match launch::launch_for_target(&options, &config.target, STARTUP_TIMEOUT) {
         Ok((child, _port)) => Some(child),
@@ -159,7 +168,10 @@ fn poller(port: u16, tx: std::sync::mpsc::Sender<Poll>) {
                 let mut last_list = Instant::now() - LIST_PERIOD;
                 loop {
                     let mut poll = Poll {
-                        snapshot: Snapshot { connected: true, ..Snapshot::default() },
+                        snapshot: Snapshot {
+                            connected: true,
+                            ..Snapshot::default()
+                        },
                         output: Vec::new(),
                         plugins: None,
                     };
@@ -264,7 +276,9 @@ fn run_dashboard(port: u16) {
         // Only redraw when something changed: full-screen repaints on a fixed
         // timer visibly flicker on the Windows console host.
         if dirty {
-            terminal.draw(|frame| ui::draw(frame, &state)).expect("draw");
+            terminal
+                .draw(|frame| ui::draw(frame, &state))
+                .expect("draw");
         }
 
         if crossterm::event::poll(Duration::from_millis(100)).unwrap_or(false) {

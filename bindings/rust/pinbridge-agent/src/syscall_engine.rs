@@ -1,14 +1,14 @@
 //! Syscall entry/exit capture engine. Registered once at startup; runtime
 //! gating is a single atomic check inside the callback (no re-JIT needed).
 //!
-//! Optional number filter (SYSCALL_FILTER op): an immutable snapshot behind
+//! Optional number/address filter (SYSCALL_FILTER op): an immutable snapshot behind
 //! an atomic pointer. The analysis callbacks only ever *read* the pointer
 //! (lock-free, no allocation, no std locks); the query-server thread builds
 //! a new boxed snapshot and swaps it in. Retired snapshots are never freed:
 //! a callback preempted between the lock-free load and the bitmap read would
 //! otherwise chase freed memory (no safe reclamation point exists without
-//! hazard slots; snapshots are 516 bytes and updates are rare). A null
-//! pointer means "mode all" (record everything).
+//! hazard slots; snapshots are small and updates are rare). A null
+//! pointer means "mode all, all addresses" (record everything).
 
 use crate::event::{Event, EVENT_SYSCALL};
 use crate::ring::submit;
@@ -65,6 +65,9 @@ fn canonical_number(number: u64) -> u64 {
 struct FilterSnapshot {
     mode: u8, // 0 = all, 1 = only listed numbers
     bitmap: [u64; SYSCALL_NUMBER_LIMIT / 64],
+    // [scope_start, scope_end), or 0/0 for every caller address.
+    scope_start: u64,
+    scope_end: u64,
 }
 
 static FILTER: AtomicPtr<FilterSnapshot> = AtomicPtr::new(core::ptr::null_mut());
@@ -72,21 +75,28 @@ static FILTER: AtomicPtr<FilterSnapshot> = AtomicPtr::new(core::ptr::null_mut())
 /// Send). NEVER freed — see set_filter for why reclamation is unsafe.
 static RETIRED: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
 
-/// Lock-free hot-path check: may this syscall number be recorded?
+/// Lock-free hot-path check: may this syscall number at this caller address be
+/// recorded? The syscall-entry context supplies the user-mode syscall site;
+/// exit callbacks deliberately reuse the entry decision stored in Pin TLS.
 #[inline]
-fn number_allowed(number: u64) -> bool {
+fn capture_allowed(number: u64, instruction_pointer: u64) -> bool {
     let snapshot = FILTER.load(Ordering::Acquire);
     if snapshot.is_null() {
         return true;
     }
     let snapshot = unsafe { &*snapshot };
-    if snapshot.mode == 0 {
-        return true;
+    if snapshot.scope_end != 0
+        && (instruction_pointer < snapshot.scope_start || instruction_pointer >= snapshot.scope_end)
+    {
+        return false;
     }
-    if number as usize >= SYSCALL_NUMBER_LIMIT {
-        return false; // not representable in the bitmap: treat as unlisted
+    if snapshot.mode != 0 {
+        if number as usize >= SYSCALL_NUMBER_LIMIT {
+            return false; // not representable in the bitmap: treat as unlisted
+        }
+        return snapshot.bitmap[number as usize / 64] & (1u64 << (number % 64)) != 0;
     }
-    snapshot.bitmap[number as usize / 64] & (1u64 << (number % 64)) != 0
+    true
 }
 
 /// Pin does not guarantee that the syscall-number register still contains the
@@ -94,26 +104,30 @@ fn number_allowed(number: u64) -> bool {
 /// value). Store `number + 1` as an opaque, non-null Pin TLS value at entry;
 /// syscall numbers are small integers, so this needs no allocation.
 #[inline]
-fn encode_syscall_number(number: u64) -> Option<*const c_void> {
-    let encoded = number.checked_add(1)?;
+fn encode_syscall_state(number: u64, capture: bool) -> Option<*const c_void> {
+    let encoded = number
+        .checked_mul(2)?
+        .checked_add(capture as u64)?
+        .checked_add(1)?;
     let encoded = usize::try_from(encoded).ok()?;
     Some(encoded as *const c_void)
 }
 
 #[inline]
-fn decode_syscall_number(data: *mut c_void) -> Option<u64> {
+fn decode_syscall_state(data: *mut c_void) -> Option<(u64, bool)> {
     let encoded = data as usize;
     if encoded == 0 {
         None
     } else {
-        Some((encoded - 1) as u64)
+        let value = (encoded - 1) as u64;
+        Some((value >> 1, value & 1 != 0))
     }
 }
 
 #[inline]
-unsafe fn remember_syscall_number(thread_id: PbThreadId, number: u64) -> bool {
+unsafe fn remember_syscall_state(thread_id: PbThreadId, number: u64, capture: bool) -> bool {
     let key = SYSCALL_TLS_KEY.load(Ordering::Acquire);
-    let Some(data) = encode_syscall_number(number) else {
+    let Some(data) = encode_syscall_state(number, capture) else {
         return false;
     };
     if key == PB_INVALID_TLS_KEY {
@@ -124,7 +138,7 @@ unsafe fn remember_syscall_number(thread_id: PbThreadId, number: u64) -> bool {
 }
 
 #[inline]
-unsafe fn take_syscall_number(thread_id: PbThreadId) -> Option<u64> {
+unsafe fn take_syscall_state(thread_id: PbThreadId) -> Option<(u64, bool)> {
     let key = SYSCALL_TLS_KEY.load(Ordering::Acquire);
     if key == PB_INVALID_TLS_KEY {
         return None;
@@ -138,16 +152,18 @@ unsafe fn take_syscall_number(thread_id: PbThreadId) -> Option<u64> {
     // sequence cannot reuse a stale syscall number.
     let mut cleared = 0u8;
     let _ = pb_pin_set_thread_data(key, core::ptr::null(), thread_id, &mut cleared);
-    decode_syscall_number(data)
+    decode_syscall_state(data)
 }
 
 /// Installs a new filter (query-server thread). mode 0 = record all,
 /// mode 1 = record only listed numbers. Numbers >= 0x1000 are ignored
 /// (unrepresentable in the bitmap).
-pub fn set_filter(mode: u8, numbers: &[u32]) {
+pub fn set_filter(mode: u8, numbers: &[u32], scope_start: u64, scope_end: u64) {
     let mut snapshot = Box::new(FilterSnapshot {
         mode,
         bitmap: [0; SYSCALL_NUMBER_LIMIT / 64],
+        scope_start,
+        scope_end,
     });
     if mode != 0 {
         for &number in numbers {
@@ -161,7 +177,7 @@ pub fn set_filter(mode: u8, numbers: &[u32]) {
     // pointer lock-free and can be preempted (or suspended by the breaker)
     // between the load and the bitmap read for an unbounded time, so no
     // reclamation point is provably safe without hazard slots. Filter updates
-    // are rare (plugin load/unload, UI command) and each snapshot is 516
+    // are rare (plugin load/unload, UI command) and each snapshot is small;
     // bytes; retiring permanently trades a bounded leak for freedom from
     // use-after-free reads. ("Freed on the next update" was a real UAF
     // window: two quick swaps freed a snapshot a preempted reader could
@@ -179,10 +195,16 @@ unsafe extern "C" fn on_entry(
     _user_data: *mut c_void,
 ) {
     // Clear any unpaired value before beginning a new entry/exit pair.
-    let _ = take_syscall_number(thread_id);
+    let _ = take_syscall_state(thread_id);
     let mut number: u64 = 0;
+    let mut instruction_pointer = 0u64;
     let mut args = [0u64; 6];
     pb_pin_get_syscall_number(context, standard, &mut number);
+    let _ = pb_pin_get_context_reg(
+        context as PbConstContextHandle,
+        crate::arch::instr_ptr_reg(),
+        &mut instruction_pointer,
+    );
     number = canonical_number(number);
     for (index, slot) in args.iter_mut().enumerate() {
         pb_pin_get_syscall_argument(context, standard, index as u32, slot);
@@ -204,10 +226,10 @@ unsafe extern "C" fn on_entry(
             &response,
         );
     }
-    let capture = enabled() && number_allowed(number);
+    let capture = enabled() && capture_allowed(number, instruction_pointer);
     let intercept_exit =
         crate::sync_intercept::syscall_interested(crate::sync_intercept::SYSCALL_EXIT, number);
-    if (capture || intercept_exit) && !remember_syscall_number(thread_id, number) {
+    if (capture || intercept_exit) && !remember_syscall_state(thread_id, number, capture) {
         return;
     }
     if !capture {
@@ -232,6 +254,7 @@ unsafe extern "C" fn on_entry(
     if observation_enabled() {
         crate::observation::submit(event);
     }
+    crate::hook_events::submit_syscall(event);
     submit(event);
     crate::record::submit_global(context as PbConstContextHandle, event);
 }
@@ -244,10 +267,10 @@ unsafe extern "C" fn on_exit(
 ) {
     // Always consume the entry decision, even if capture was disabled between
     // entry and exit, so a later syscall can never reuse stale TLS state.
-    let number = take_syscall_number(thread_id);
+    let state = take_syscall_state(thread_id);
     let mut return_value: u64 = 0;
     let mut errno: u64 = 0;
-    let Some(number) = number else {
+    let Some((number, capture)) = state else {
         return;
     };
     pb_pin_get_syscall_return(context, standard, &mut return_value);
@@ -269,7 +292,7 @@ unsafe extern "C" fn on_exit(
             &response,
         );
     }
-    if !enabled() || !number_allowed(number) {
+    if !capture {
         return;
     }
     let event = Event {
@@ -285,6 +308,7 @@ unsafe extern "C" fn on_exit(
     if observation_enabled() {
         crate::observation::submit(event);
     }
+    crate::hook_events::submit_syscall(event);
     submit(event);
     crate::record::submit_global(context as PbConstContextHandle, event);
 }
@@ -311,30 +335,31 @@ pub fn register() -> PbStatus {
         if status != PB_OK {
             return status;
         }
-        pb_pin_add_syscall_exit_function(
-            Some(on_exit),
-            core::ptr::null_mut(),
-            &mut handle_exit,
-        )
+        pb_pin_add_syscall_exit_function(Some(on_exit), core::ptr::null_mut(), &mut handle_exit)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_syscall_number, encode_syscall_number};
+    use super::{decode_syscall_state, encode_syscall_state};
 
     #[test]
     fn syscall_number_tls_encoding_round_trips() {
         for number in [0, 0x46, 0xfff] {
-            let encoded = encode_syscall_number(number).unwrap();
-            assert!(!encoded.is_null());
-            assert_eq!(decode_syscall_number(encoded.cast_mut()), Some(number));
+            for capture in [false, true] {
+                let encoded = encode_syscall_state(number, capture).unwrap();
+                assert!(!encoded.is_null());
+                assert_eq!(
+                    decode_syscall_state(encoded.cast_mut()),
+                    Some((number, capture))
+                );
+            }
         }
     }
 
     #[test]
     fn syscall_number_tls_encoding_rejects_invalid_values() {
-        assert_eq!(decode_syscall_number(core::ptr::null_mut()), None);
-        assert!(encode_syscall_number(u64::MAX).is_none());
+        assert_eq!(decode_syscall_state(core::ptr::null_mut()), None);
+        assert!(encode_syscall_state(u64::MAX, true).is_none());
     }
 }

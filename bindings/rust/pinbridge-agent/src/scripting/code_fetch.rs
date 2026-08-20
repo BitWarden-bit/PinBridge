@@ -149,12 +149,7 @@ unsafe extern "C" fn on_fetch(
                     .get(next)
                     .map(|segment| (segment.start - cursor).min(remaining as u64) as usize)
                     .unwrap_or(remaining);
-                let amount = fetch_original(
-                    destination.add(copied),
-                    cursor,
-                    gap,
-                    exception_info,
-                );
+                let amount = fetch_original(destination.add(copied), cursor, gap, exception_info);
                 copied += amount;
                 if amount < gap {
                     break;
@@ -237,7 +232,9 @@ pub fn publish() -> Result<u64, PbStatus> {
     let total_bytes = specs
         .iter()
         .flat_map(|(_, spec)| &spec.segments)
-        .try_fold(0usize, |total, segment| total.checked_add(segment.bytes.len()))
+        .try_fold(0usize, |total, segment| {
+            total.checked_add(segment.bytes.len())
+        })
         .ok_or(PB_ERR_INVALID_ARGUMENT)?;
     if segment_count > MAX_SEGMENTS || total_bytes > MAX_TOTAL_BYTES {
         return Err(PB_ERR_INVALID_ARGUMENT);
@@ -261,10 +258,7 @@ pub fn publish() -> Result<u64, PbStatus> {
         }
     }
     segments.sort_unstable_by_key(|segment| segment.start);
-    if segments
-        .windows(2)
-        .any(|pair| pair[1].start < pair[0].end)
-    {
+    if segments.windows(2).any(|pair| pair[1].start < pair[0].end) {
         return Err(PB_ERR_INVALID_ARGUMENT);
     }
 
@@ -314,8 +308,6 @@ mod tests {
     #[test]
     fn adjacent_segments_are_not_overlaps() {
         let segments = [segment(0x1000, &[1, 2]), segment(0x1002, &[3])];
-        assert!(!segments
-            .windows(2)
-            .any(|pair| pair[1].start < pair[0].end));
+        assert!(!segments.windows(2).any(|pair| pair[1].start < pair[0].end));
     }
 }

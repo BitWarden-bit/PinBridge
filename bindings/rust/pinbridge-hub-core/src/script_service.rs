@@ -9,6 +9,30 @@ pub const MAX_SCRIPT_NAME_BYTES: usize = 256;
 pub const MAX_SCRIPT_SOURCE_BYTES: usize = 1024 * 1024;
 pub const MAX_OUTPUT_LIMIT: u32 = 1024;
 pub const MAX_OUTPUT_TEXT_BYTES: usize = 64 * 1024;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ScriptKind {
+    Module,
+    Callback,
+}
+
+impl ScriptKind {
+    fn parse(value: Option<&str>) -> Result<Self, String> {
+        match value.unwrap_or("module") {
+            "module" => Ok(Self::Module),
+            "callback" => Ok(Self::Callback),
+            _ => Err("kind must be module or callback".into()),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Module => "module",
+            Self::Callback => "callback",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize)]
 pub struct ScriptRequest {
     pub name: String,
@@ -28,9 +52,14 @@ fn default_limit() -> String {
 pub struct ScriptResource {
     pub script_id: String,
     pub name: String,
+    pub kind: String,
     pub generation: String,
     pub source_hash: String,
     pub state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_by: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub modified_by: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -56,8 +85,12 @@ pub struct OutputLine {
 #[derive(Clone)]
 struct Record {
     script_id: String,
+    kind: ScriptKind,
     generation: u64,
     source_hash: String,
+    source: String,
+    created_by: String,
+    modified_by: String,
     agent_id: Option<String>,
     state: String,
 }
@@ -97,8 +130,17 @@ impl<A: AgentApi> ScriptService<A> {
         }
         Ok(())
     }
-    fn apply(&self, r: ScriptRequest, replace: bool) -> Result<ScriptResource, String> {
+    fn apply(
+        &self,
+        r: ScriptRequest,
+        replace: bool,
+        actor: &str,
+        requested_kind: Option<&str>,
+    ) -> Result<ScriptResource, String> {
         Self::validate(&r)?;
+        let requested_kind = requested_kind
+            .map(|kind| ScriptKind::parse(Some(kind)))
+            .transpose()?;
         // Keep the Agent mutation and the corresponding local bookkeeping in
         // one transaction.  The Agent transport gate alone cannot prevent a
         // remove from landing between script_load and records.insert.
@@ -115,6 +157,48 @@ impl<A: AgentApi> ScriptService<A> {
             .map_err(|_| "script state poisoned")?
             .get(&r.name)
             .cloned();
+        if let (Some(old), Some(requested)) = (&old, requested_kind) {
+            if old.kind != requested {
+                return Err(format!(
+                    "script kind mismatch: {} is {}, not {}",
+                    r.name,
+                    old.kind.as_str(),
+                    requested.as_str()
+                ));
+            }
+        }
+        let kind = old
+            .as_ref()
+            .map(|record| record.kind)
+            .or(requested_kind)
+            .unwrap_or(ScriptKind::Module);
+
+        // Updating a stopped module saves a new source generation without
+        // implicitly executing it. Callback scripts have binding-scoped
+        // lifetimes and therefore retain the historical hot-reload behavior.
+        if replace
+            && kind == ScriptKind::Module
+            && old.as_ref().is_some_and(|record| record.state == "stopped")
+        {
+            let old = old.expect("checked above");
+            let rec = Record {
+                script_id: old.script_id,
+                kind,
+                generation: old.generation + 1,
+                source_hash: hash(&r.source),
+                source: r.source,
+                created_by: old.created_by,
+                modified_by: actor.to_string(),
+                agent_id: None,
+                state: "stopped".into(),
+            };
+            let out = resource(&r.name, &rec, None);
+            self.records
+                .lock()
+                .map_err(|_| "script state poisoned")?
+                .insert(r.name, rec);
+            return Ok(out);
+        }
         let agent_exists = if replace && old.is_none() {
             self.agent
                 .script_list()
@@ -136,20 +220,25 @@ impl<A: AgentApi> ScriptService<A> {
         // its established identity/generation.  Recovered rows use a stable
         // name-derived id because the Agent only exposes script names.
         let current = rows.get(&r.name).cloned();
-        let (sid, g) = if let Some(o) = current.or(old) {
-            (o.script_id, o.generation + 1)
+        let existing = current.clone().or_else(|| old.clone());
+        let (sid, g, created_by) = if let Some(o) = existing {
+            (o.script_id, o.generation + 1, o.created_by)
         } else if agent_exists {
-            (format!("agent:{}", r.name), 1)
+            (format!("agent:{}", r.name), 1, "unknown".to_string())
         } else {
             let mut n = self.next.lock().map_err(|_| "script id poisoned")?;
             let x = format!("script-{n}");
             *n += 1;
-            (x, 1)
+            (x, 1, actor.to_string())
         };
         let rec = Record {
             script_id: sid,
+            kind,
             generation: g,
             source_hash: hash(&r.source),
+            source: r.source.clone(),
+            created_by,
+            modified_by: actor.to_string(),
             agent_id: Some(id.to_string()),
             state: if replace {
                 "replacement_staged".into()
@@ -162,10 +251,95 @@ impl<A: AgentApi> ScriptService<A> {
         Ok(out)
     }
     pub fn inject(&self, r: ScriptRequest) -> Result<ScriptResource, String> {
-        self.apply(r, false)
+        self.inject_as(r, "system")
     }
     pub fn replace(&self, r: ScriptRequest) -> Result<ScriptResource, String> {
-        self.apply(r, true)
+        self.replace_as(r, "system")
+    }
+    pub fn inject_as(&self, r: ScriptRequest, actor: &str) -> Result<ScriptResource, String> {
+        self.apply(r, false, actor, None)
+    }
+    pub fn replace_as(&self, r: ScriptRequest, actor: &str) -> Result<ScriptResource, String> {
+        self.apply(r, true, actor, None)
+    }
+    pub fn inject_kind_as(
+        &self,
+        r: ScriptRequest,
+        kind: Option<&str>,
+        actor: &str,
+    ) -> Result<ScriptResource, String> {
+        self.apply(r, false, actor, kind)
+    }
+    pub fn replace_kind_as(
+        &self,
+        r: ScriptRequest,
+        kind: Option<&str>,
+        actor: &str,
+    ) -> Result<ScriptResource, String> {
+        self.apply(r, true, actor, kind)
+    }
+    pub fn stop(&self, name: &str) -> Result<ScriptResource, String> {
+        validate_name(name)?;
+        let _mutation = self
+            .mutation
+            .lock()
+            .map_err(|_| "script mutation state poisoned")?;
+        let current = self
+            .records
+            .lock()
+            .map_err(|_| "script state poisoned")?
+            .get(name)
+            .cloned()
+            .ok_or_else(|| {
+                "module source unavailable: script was not loaded through this Hub".to_string()
+            })?;
+        if current.kind != ScriptKind::Module {
+            return Err("callback scripts are stopped by removing their owning binding".into());
+        }
+        if current.state == "stopped" {
+            return Ok(resource(name, &current, None));
+        }
+        self.agent.script_unload(name).map_err(format_agent)?;
+        let mut rows = self.records.lock().map_err(|_| "script state poisoned")?;
+        let record = rows
+            .get_mut(name)
+            .ok_or_else(|| "script disappeared during stop".to_string())?;
+        record.state = "stopped".into();
+        record.agent_id = None;
+        Ok(resource(name, record, None))
+    }
+    pub fn start(&self, name: &str) -> Result<ScriptResource, String> {
+        validate_name(name)?;
+        let _mutation = self
+            .mutation
+            .lock()
+            .map_err(|_| "script mutation state poisoned")?;
+        let current = self
+            .records
+            .lock()
+            .map_err(|_| "script state poisoned")?
+            .get(name)
+            .cloned()
+            .ok_or_else(|| {
+                "module source unavailable: script was not loaded through this Hub".to_string()
+            })?;
+        if current.kind != ScriptKind::Module {
+            return Err("callback scripts start with their owning binding".into());
+        }
+        if current.state != "stopped" {
+            return Err("module is already active".into());
+        }
+        let id = self
+            .agent
+            .script_load(name, &current.source)
+            .map_err(format_agent)?;
+        let mut rows = self.records.lock().map_err(|_| "script state poisoned")?;
+        let record = rows
+            .get_mut(name)
+            .ok_or_else(|| "script disappeared during start".to_string())?;
+        record.state = "load_staged".into();
+        record.agent_id = Some(id.to_string());
+        Ok(resource(name, record, None))
     }
     pub fn remove(&self, name: &str) -> Result<Value, String> {
         validate_name(name)?;
@@ -173,7 +347,15 @@ impl<A: AgentApi> ScriptService<A> {
             .mutation
             .lock()
             .map_err(|_| "script mutation state poisoned")?;
-        self.agent.script_unload(name).map_err(format_agent)?;
+        let stopped = self
+            .records
+            .lock()
+            .map_err(|_| "script state poisoned")?
+            .get(name)
+            .is_some_and(|record| record.state == "stopped");
+        if !stopped {
+            self.agent.script_unload(name).map_err(format_agent)?;
+        }
         let mut rows = self.records.lock().map_err(|_| "script state poisoned")?;
         if let Some(r) = rows.remove(name) {
             Ok(
@@ -197,9 +379,12 @@ impl<A: AgentApi> ScriptService<A> {
                 out.push(ScriptResource {
                     script_id: format!("agent:{}", a.name),
                     name: a.name,
+                    kind: "unknown".into(),
                     generation: "0".into(),
                     source_hash: "unknown".into(),
                     state: "agent_reported".into(),
+                    created_by: None,
+                    modified_by: None,
                     agent_id: None,
                     registration: reg,
                 })
@@ -212,6 +397,27 @@ impl<A: AgentApi> ScriptService<A> {
         }
         out.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(out)
+    }
+    pub fn get(&self, name: &str) -> Result<Value, String> {
+        validate_name(name)?;
+        let rows = self.records.lock().map_err(|_| "script state poisoned")?;
+        let record = rows.get(name).ok_or_else(|| {
+            "script source unavailable: script was not loaded through this Hub".to_string()
+        })?;
+        let mut value = serde_json::to_value(resource(name, record, None))
+            .map_err(|error| error.to_string())?;
+        if let Value::Object(ref mut object) = value {
+            object.insert("source".into(), Value::String(record.source.clone()));
+            object.insert("source_available".into(), Value::Bool(true));
+        }
+        Ok(value)
+    }
+    pub fn provenance(&self, name: &str) -> Option<(String, String)> {
+        self.records
+            .lock()
+            .ok()?
+            .get(name)
+            .map(|record| (record.created_by.clone(), record.modified_by.clone()))
     }
     pub fn status(&self, name: Option<&str>) -> Result<Value, String> {
         let rows = self.list()?;
@@ -296,9 +502,12 @@ fn resource(n: &str, r: &Record, reg: Option<Registration>) -> ScriptResource {
     ScriptResource {
         script_id: r.script_id.clone(),
         name: n.into(),
+        kind: r.kind.as_str().into(),
         generation: r.generation.to_string(),
         source_hash: r.source_hash.clone(),
         state: r.state.clone(),
+        created_by: Some(r.created_by.clone()),
+        modified_by: Some(r.modified_by.clone()),
         agent_id: r.agent_id.clone(),
         registration: reg,
     }
@@ -434,6 +643,33 @@ mod tests {
     }
 
     #[test]
+    fn source_get_preserves_creator_and_modifier() {
+        let s = ScriptService::new(Fake::new());
+        s.inject_as(
+            ScriptRequest {
+                name: "callback.py".into(),
+                source: "return_stay = True".into(),
+            },
+            "ai",
+        )
+        .unwrap();
+        s.replace_as(
+            ScriptRequest {
+                name: "callback.py".into(),
+                source: "return_stay = False".into(),
+            },
+            "human",
+        )
+        .unwrap();
+
+        let value = s.get("callback.py").unwrap();
+        assert_eq!(value["source"], "return_stay = False");
+        assert_eq!(value["created_by"], "ai");
+        assert_eq!(value["modified_by"], "human");
+        assert_eq!(s.provenance("callback.py").unwrap().0, "ai");
+    }
+
+    #[test]
     fn replace_recovers_agent_script_after_local_restart() {
         let fake = Fake::new();
         fake.agent_scripts.lock().unwrap().push(AgentScript {
@@ -521,5 +757,89 @@ mod tests {
             })
             .unwrap_err();
         assert!(error.contains("exceeds u32"));
+    }
+
+    #[test]
+    fn script_kinds_are_explicit_and_default_to_module() {
+        let s = ScriptService::new(Fake::new());
+        let module = s
+            .inject(ScriptRequest {
+                name: "analysis.py".into(),
+                source: "x = 1".into(),
+            })
+            .unwrap();
+        let callback = s
+            .inject_kind_as(
+                ScriptRequest {
+                    name: "breakpoint_callback.py".into(),
+                    source: "x = 2".into(),
+                },
+                Some("callback"),
+                "human",
+            )
+            .unwrap();
+
+        assert_eq!(module.kind, "module");
+        assert_eq!(callback.kind, "callback");
+        assert!(s
+            .stop("breakpoint_callback.py")
+            .unwrap_err()
+            .contains("binding"));
+    }
+
+    #[test]
+    fn stopped_module_retains_source_and_can_restart() {
+        let fake = Fake::new();
+        let loads = fake.loads.clone();
+        let s = ScriptService::new(fake);
+        s.inject(ScriptRequest {
+            name: "workflow.py".into(),
+            source: "version = 1".into(),
+        })
+        .unwrap();
+
+        let stopped = s.stop("workflow.py").unwrap();
+        assert_eq!(stopped.state, "stopped");
+        assert_eq!(s.get("workflow.py").unwrap()["source"], "version = 1");
+
+        let saved = s
+            .replace(ScriptRequest {
+                name: "workflow.py".into(),
+                source: "version = 2".into(),
+            })
+            .unwrap();
+        assert_eq!(saved.state, "stopped");
+        assert_eq!(*loads.lock().unwrap(), 1);
+
+        let started = s.start("workflow.py").unwrap();
+        assert_eq!(started.state, "load_staged");
+        assert_eq!(*loads.lock().unwrap(), 2);
+        assert_eq!(s.get("workflow.py").unwrap()["source"], "version = 2");
+    }
+
+    #[test]
+    fn explicit_kind_cannot_reclassify_existing_script() {
+        let s = ScriptService::new(Fake::new());
+        s.inject_kind_as(
+            ScriptRequest {
+                name: "focused.py".into(),
+                source: "x = 1".into(),
+            },
+            Some("callback"),
+            "human",
+        )
+        .unwrap();
+
+        let error = s
+            .replace_kind_as(
+                ScriptRequest {
+                    name: "focused.py".into(),
+                    source: "x = 2".into(),
+                },
+                Some("module"),
+                "human",
+            )
+            .unwrap_err();
+        assert!(error.contains("kind mismatch"));
     }
 }

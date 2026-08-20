@@ -8,6 +8,7 @@ namespace
 {
 
 typedef PbPersistentCallbackState<PbInsCaptureRegsCallback> CaptureRegsState;
+typedef PbPersistentCallbackState<PbInsHookMonitorCallback> HookMonitorState;
 typedef PbPersistentCallbackState<PbInsContextCaptureRegsCallback>
     ContextCaptureRegsState;
 typedef PbPersistentCallbackState<PbInsMemoryOperandCallback> MemoryOperandState;
@@ -19,6 +20,7 @@ typedef PbPersistentCallbackState<PbInsMemoryOperandValueCallback>
     MemoryOperandValueState;
 
 CaptureRegsState* g_capture_regs_states = 0;
+HookMonitorState* g_hook_monitor_states = 0;
 ContextCaptureRegsState* g_context_capture_regs_states = 0;
 MemoryOperandState* g_memory_operand_states = 0;
 MemoryTranslateState* g_memory_translate_states = 0;
@@ -44,6 +46,20 @@ VOID OnCaptureRegs(
         static_cast<uint64_t>(rcx), static_cast<uint64_t>(rdx),
         static_cast<uint64_t>(r8), static_cast<uint64_t>(r9),
         state->user_data);
+}
+
+VOID OnHookMonitor(
+    ADDRINT address, THREADID thread_id,
+    ADDRINT arg0, ADDRINT arg1, ADDRINT arg2, ADDRINT arg3,
+    ADDRINT stack_pointer, ADDRINT return_value, VOID* raw_state)
+{
+    HookMonitorState* state = static_cast<HookMonitorState*>(raw_state);
+    state->callback(
+        static_cast<uint64_t>(address), static_cast<uint32_t>(thread_id),
+        static_cast<uint64_t>(arg0), static_cast<uint64_t>(arg1),
+        static_cast<uint64_t>(arg2), static_cast<uint64_t>(arg3),
+        static_cast<uint64_t>(stack_pointer),
+        static_cast<uint64_t>(return_value), state->user_data);
 }
 
 VOID OnContextCaptureRegs(
@@ -228,6 +244,31 @@ PbStatus PbBackendInsInsertCaptureRegs(
         // remaining general-purpose registers as ECX, EDX, EAX, EBX.
         IARG_REG_VALUE, REG_ECX, IARG_REG_VALUE, REG_EDX,
         IARG_REG_VALUE, REG_EAX, IARG_REG_VALUE, REG_EBX,
+#endif
+        IARG_PTR, state, IARG_END);
+    return PB_OK;
+}
+
+PbStatus PbBackendInsInsertHookMonitor(
+    PbInsHandle ins, PbInsHookMonitorCallback callback, void* user_data)
+{
+    if (PIN_IsProbeMode())
+        return PB_ERR_INVALID_STATE;
+    HookMonitorState* state = PbInternPersistentCallbackState(
+        g_hook_monitor_states, callback, user_data);
+    if (!state)
+        return PB_ERR_OUT_OF_MEMORY;
+    INS_InsertPredicatedCall(
+        ToIns(ins), IPOINT_BEFORE, AFUNPTR(OnHookMonitor),
+        IARG_INST_PTR, IARG_THREAD_ID,
+#if defined(TARGET_IA32E)
+        IARG_REG_VALUE, REG_RCX, IARG_REG_VALUE, REG_RDX,
+        IARG_REG_VALUE, REG_R8, IARG_REG_VALUE, REG_R9,
+        IARG_REG_VALUE, REG_RSP, IARG_REG_VALUE, REG_RAX,
+#else
+        IARG_REG_VALUE, REG_ECX, IARG_REG_VALUE, REG_EDX,
+        IARG_REG_VALUE, REG_EAX, IARG_REG_VALUE, REG_EBX,
+        IARG_REG_VALUE, REG_ESP, IARG_REG_VALUE, REG_EAX,
 #endif
         IARG_PTR, state, IARG_END);
     return PB_OK;

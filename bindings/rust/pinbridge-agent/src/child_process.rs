@@ -139,7 +139,9 @@ fn sanitize_tool_arguments(
             index += 1;
             continue;
         };
-        let value = raw.get(index + 1).ok_or("agent port option needs a value")?;
+        let value = raw
+            .get(index + 1)
+            .ok_or("agent port option needs a value")?;
         *destination = Some(parse_port(value)?);
         index += 2;
     }
@@ -481,7 +483,10 @@ mod tests {
     use super::*;
 
     fn arguments(values: &[&str]) -> Vec<Vec<u8>> {
-        values.iter().map(|value| value.as_bytes().to_vec()).collect()
+        values
+            .iter()
+            .map(|value| value.as_bytes().to_vec())
+            .collect()
     }
 
     #[test]

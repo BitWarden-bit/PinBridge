@@ -10,21 +10,40 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use pyo3::prelude::*;
 
 static NEXT_ORDER: AtomicU64 = AtomicU64::new(1);
+static SCRIPT_NATIVE_SET_ADDRESS: AtomicU64 = AtomicU64::new(0);
 
 pub struct BreakpointSubscription {
     pub callback: Py<PyAny>,
+    pub callback_name: String,
+    pub description: String,
     pub once: bool,
     pub thread_id: Option<u32>,
     pub order: u64,
+    pub last_stop_generation: u64,
+    pub last_action: Option<String>,
+    pub last_return: Option<String>,
+    pub last_error: Option<String>,
 }
 
 impl BreakpointSubscription {
-    pub fn new(callback: Py<PyAny>, once: bool, thread_id: Option<u32>) -> Self {
+    pub fn new(
+        callback: Py<PyAny>,
+        callback_name: String,
+        description: String,
+        once: bool,
+        thread_id: Option<u32>,
+    ) -> Self {
         Self {
             callback,
+            callback_name,
+            description,
             once,
             thread_id,
             order: NEXT_ORDER.fetch_add(1, Ordering::Relaxed),
+            last_stop_generation: 0,
+            last_action: None,
+            last_return: None,
+            last_error: None,
         }
     }
 }
@@ -38,6 +57,15 @@ pub enum StopAction {
 }
 
 impl StopAction {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Stay => "stay",
+            Self::Resume => "resume",
+            Self::StepInto => "step_into",
+            Self::StepOver => "step_over",
+        }
+    }
+
     pub fn from_name(name: &str) -> Option<Self> {
         match name.trim().to_ascii_lowercase().as_str() {
             "stay" | "stop" => Some(Self::Stay),
@@ -124,6 +152,45 @@ pub fn acquire_native(id: u32, created_by_scripts: bool) {
     });
 }
 
+/// True when the native breakpoint existed before the first script attached
+/// to it. A callback may inspect the hit, but it must not auto-resume over a
+/// breakpoint owned by the traditional debugger.
+pub fn has_external_owner(id: u32) -> bool {
+    with_leases(|leases| {
+        leases
+            .get(&id)
+            .map(|lease| !lease.remove_at_zero)
+            .unwrap_or(false)
+    })
+}
+
+/// Marks an already-leased native breakpoint as additionally owned by the
+/// ordinary debugger. This covers the ordering where a traditional owner is
+/// added after a script created the native breakpoint.
+pub fn mark_external_owner(id: u32) {
+    with_leases(|leases| {
+        if let Some(lease) = leases.get_mut(&id) {
+            lease.remove_at_zero = false;
+        }
+    });
+}
+
+pub fn with_script_native_set<R>(address: u64, operation: impl FnOnce() -> R) -> R {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            SCRIPT_NATIVE_SET_ADDRESS.store(0, Ordering::Release);
+        }
+    }
+    SCRIPT_NATIVE_SET_ADDRESS.store(address, Ordering::Release);
+    let _reset = Reset;
+    operation()
+}
+
+pub fn native_set_is_script(address: u64) -> bool {
+    SCRIPT_NATIVE_SET_ADDRESS.load(Ordering::Acquire) == address
+}
+
 fn cancel_pending_removal(id: u32) -> bool {
     unsafe {
         let pending = &mut *core::ptr::addr_of_mut!(PENDING_NATIVE_REMOVALS);
@@ -140,8 +207,15 @@ fn cancel_pending_removal(id: u32) -> bool {
 /// removed now; false means another plugin or a legacy owner still needs it.
 pub fn release_native(id: u32) -> bool {
     with_leases(|leases| {
-        let remove_native = leases.get_mut(&id).map(NativeLease::release).unwrap_or(false);
-        if leases.get(&id).map(|lease| lease.subscribers == 0).unwrap_or(false) {
+        let remove_native = leases
+            .get_mut(&id)
+            .map(NativeLease::release)
+            .unwrap_or(false);
+        if leases
+            .get(&id)
+            .map(|lease| lease.subscribers == 0)
+            .unwrap_or(false)
+        {
             leases.remove(&id);
         }
         remove_native
@@ -186,7 +260,10 @@ mod tests {
     fn stop_action_names_are_explicit() {
         assert_eq!(StopAction::from_name("stay"), Some(StopAction::Stay));
         assert_eq!(StopAction::from_name("continue"), Some(StopAction::Resume));
-        assert_eq!(StopAction::from_name("step_into"), Some(StopAction::StepInto));
+        assert_eq!(
+            StopAction::from_name("step_into"),
+            Some(StopAction::StepInto)
+        );
         assert_eq!(StopAction::from_name("over"), Some(StopAction::StepOver));
         assert_eq!(StopAction::from_name("skip"), None);
     }

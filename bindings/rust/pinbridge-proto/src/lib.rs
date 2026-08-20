@@ -19,6 +19,10 @@ pub mod op {
     pub const PING: u8 = 0x01;
     pub const COUNTERS: u8 = 0x02;
     pub const RING_PAGE: u8 = 0x03;
+    /// Newest retained events from the rare/high-priority lane. This lane is
+    /// where target context changes and Pin-internal exceptions are mirrored,
+    /// so debugger UIs do not lose exceptions behind execution telemetry.
+    pub const PRIORITY_NEWEST: u8 = 0x04;
 
     // control plane
     pub const STOP: u8 = 0x10;
@@ -54,6 +58,7 @@ pub mod op {
 
     // Target memory layout inspection.
     pub const MEMORY_REGION: u8 = 0x28;
+    pub const MEMORY_MAP: u8 = 0x29;
 
     // script host
     pub const SCRIPT_LOAD: u8 = 0x40;
@@ -71,6 +76,23 @@ pub mod op {
     pub const HOOK_LIST: u8 = 0x53;
     pub const HOOK_RULE_SET: u8 = 0x54;
     pub const HOOK_RULE_CLEAR: u8 = 0x55;
+    /// Batched address insertion: one immutable snapshot publication and
+    /// coalesced Pin JIT invalidation for large DLL export sets. Addresses
+    /// accepted through this path also emit routine return values.
+    pub const HOOK_SET_BATCH: u8 = 0x56;
+    /// Function-call logging subset: [u32 count][count x u64 entry address].
+    pub const HOOK_FUNCTION_LIST: u8 = 0x57;
+    /// Newest records from the Hook-only bounded lane.
+    pub const HOOK_EVENTS_NEWEST: u8 = 0x58;
+    /// Install the compact ABI capture layout for one function entry.
+    pub const HOOK_SIGNATURE_SET: u8 = 0x59;
+    /// Remove the compact ABI capture layout for one function entry.
+    pub const HOOK_SIGNATURE_REMOVE: u8 = 0x5a;
+    /// Scan one bounded code range by instruction class and optionally add
+    /// every match as a plain instruction Hook in one snapshot publication.
+    pub const HOOK_RANGE: u8 = 0x5b;
+    /// Newest records from the Syscall-only timestamped lane.
+    pub const SYSCALL_EVENTS_NEWEST: u8 = 0x5c;
 }
 
 pub const STATUS_OK: u8 = 0;
@@ -155,10 +177,90 @@ impl EventRecord {
     }
 }
 
-pub fn write_frame(stream: &mut impl Write, op_code: u8, status: u8, payload: &[u8]) -> std::io::Result<()> {
+/// Dedicated one-click function-call record. Unlike the compatibility event
+/// record this carries up to sixteen signature-resolved argument slots.
+#[repr(C)]
+#[derive(Copy, Clone, Default, Debug)]
+pub struct HookLogRecord {
+    pub sequence: u64,
+    /// UTC Unix time captured in Agent at the actual Hook hit.
+    pub timestamp_unix_ns: u64,
+    pub kind: u32,
+    pub thread_id: u32,
+    pub address: u64,
+    pub argument_count: u32,
+    /// Bit 0: values were captured using an installed function signature.
+    pub flags: u32,
+    pub arguments: [u64; 16],
+}
+
+pub const HOOK_LOG_WIRE_LEN: usize = 168;
+pub const HOOK_LOG_FLAG_SIGNATURE: u32 = 1;
+/// The record belongs to an API/function-call Hook, not a plain instruction Hook.
+pub const HOOK_LOG_FLAG_FUNCTION: u32 = 1 << 1;
+/// The record belongs to the dedicated Syscall event lane.
+pub const HOOK_LOG_FLAG_SYSCALL: u32 = 1 << 2;
+
+impl HookLogRecord {
+    pub const EMPTY: HookLogRecord = HookLogRecord {
+        sequence: 0,
+        timestamp_unix_ns: 0,
+        kind: 0,
+        thread_id: 0,
+        address: 0,
+        argument_count: 0,
+        flags: 0,
+        arguments: [0; 16],
+    };
+
+    pub fn encode(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.sequence.to_le_bytes());
+        out.extend_from_slice(&self.timestamp_unix_ns.to_le_bytes());
+        out.extend_from_slice(&self.kind.to_le_bytes());
+        out.extend_from_slice(&self.thread_id.to_le_bytes());
+        out.extend_from_slice(&self.address.to_le_bytes());
+        out.extend_from_slice(&self.argument_count.to_le_bytes());
+        out.extend_from_slice(&self.flags.to_le_bytes());
+        for argument in self.arguments {
+            out.extend_from_slice(&argument.to_le_bytes());
+        }
+    }
+
+    pub fn decode(bytes: &[u8]) -> Option<HookLogRecord> {
+        if bytes.len() < HOOK_LOG_WIRE_LEN {
+            return None;
+        }
+        let u64_at = |index: usize| u64::from_le_bytes(bytes[index..index + 8].try_into().unwrap());
+        let u32_at = |index: usize| u32::from_le_bytes(bytes[index..index + 4].try_into().unwrap());
+        let mut arguments = [0u64; 16];
+        for (index, argument) in arguments.iter_mut().enumerate() {
+            *argument = u64_at(40 + index * 8);
+        }
+        Some(HookLogRecord {
+            sequence: u64_at(0),
+            timestamp_unix_ns: u64_at(8),
+            kind: u32_at(16),
+            thread_id: u32_at(20),
+            address: u64_at(24),
+            argument_count: u32_at(32),
+            flags: u32_at(36),
+            arguments,
+        })
+    }
+}
+
+pub fn write_frame(
+    stream: &mut impl Write,
+    op_code: u8,
+    status: u8,
+    payload: &[u8],
+) -> std::io::Result<()> {
     let len = (payload.len() + 2) as u32;
     if len > MAX_FRAME {
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "frame too large"));
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "frame too large",
+        ));
     }
     stream.write_all(&len.to_le_bytes())?;
     stream.write_all(&[op_code, status])?;
@@ -171,7 +273,10 @@ pub fn read_frame(stream: &mut impl Read) -> std::io::Result<(u8, u8, Vec<u8>)> 
     stream.read_exact(&mut header)?;
     let len = u32::from_le_bytes(header[0..4].try_into().unwrap());
     if len < 2 || len > MAX_FRAME {
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "bad frame length"));
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "bad frame length",
+        ));
     }
     let op_code = header[4];
     let status = header[5];
@@ -193,6 +298,42 @@ pub fn put_u64(out: &mut Vec<u8>, value: u64) {
 pub struct Reader<'a> {
     bytes: &'a [u8],
     pos: usize,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hook_log_record_round_trips_all_signature_slots() {
+        let mut arguments = [0u64; 16];
+        for (index, argument) in arguments.iter_mut().enumerate() {
+            *argument = 0x1000 + index as u64;
+        }
+        let record = HookLogRecord {
+            sequence: 42,
+            timestamp_unix_ns: 1_777_777_777_123_456_700,
+            kind: 14,
+            thread_id: 7,
+            address: 0x7ff6_1234_5678,
+            argument_count: 16,
+            flags: HOOK_LOG_FLAG_SIGNATURE,
+            arguments,
+        };
+        let mut encoded = Vec::new();
+        record.encode(&mut encoded);
+        assert_eq!(encoded.len(), HOOK_LOG_WIRE_LEN);
+        let decoded = HookLogRecord::decode(&encoded).unwrap();
+        assert_eq!(decoded.sequence, record.sequence);
+        assert_eq!(decoded.timestamp_unix_ns, record.timestamp_unix_ns);
+        assert_eq!(decoded.kind, record.kind);
+        assert_eq!(decoded.thread_id, record.thread_id);
+        assert_eq!(decoded.address, record.address);
+        assert_eq!(decoded.argument_count, record.argument_count);
+        assert_eq!(decoded.flags, record.flags);
+        assert_eq!(decoded.arguments, record.arguments);
+        assert!(HookLogRecord::decode(&encoded[..HOOK_LOG_WIRE_LEN - 1]).is_none());
+    }
 }
 
 impl<'a> Reader<'a> {

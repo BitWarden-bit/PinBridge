@@ -15,8 +15,7 @@ use std::net::{TcpListener, TcpStream};
 
 /// The loopback port the query server actually bound (0 = not bound).
 /// The in-process script host dials this port for all its debugger work.
-pub static BOUND_PORT: core::sync::atomic::AtomicU16 =
-    core::sync::atomic::AtomicU16::new(0);
+pub static BOUND_PORT: core::sync::atomic::AtomicU16 = core::sync::atomic::AtomicU16::new(0);
 
 fn to_record(event: &Event) -> proto::EventRecord {
     proto::EventRecord {
@@ -45,9 +44,9 @@ fn handle_ping() -> Vec<u8> {
     }
     proto::put_u32(&mut out, pid as u32);
     proto::put_u64(&mut out, ring::ring_total()); // lock-free content edge: never parks the accept loop
-    // Additive tail: arch + pointer width. Pre-extension readers parse only
-    // the first four fields and ignore these trailing bytes, so the extension
-    // is wire-backward-compatible.
+                                                  // Additive tail: arch + pointer width. Pre-extension readers parse only
+                                                  // the first four fields and ignore these trailing bytes, so the extension
+                                                  // is wire-backward-compatible.
     proto::put_u32(&mut out, crate::arch::wire_id());
     proto::put_u32(&mut out, crate::arch::pointer_width());
     out
@@ -83,7 +82,10 @@ const RING_PAGE_MAX_LIMIT: u64 = 2048;
 fn handle_ring_page(payload: &[u8]) -> Result<Vec<u8>, u8> {
     let mut reader = proto::Reader::new(payload);
     let after = reader.u64().ok_or(proto::STATUS_BAD_REQUEST)?;
-    let limit = reader.u64().ok_or(proto::STATUS_BAD_REQUEST)?.min(RING_PAGE_MAX_LIMIT);
+    let limit = reader
+        .u64()
+        .ok_or(proto::STATUS_BAD_REQUEST)?
+        .min(RING_PAGE_MAX_LIMIT);
 
     let mut events = Vec::with_capacity(limit as usize); // allocated OUTSIDE the lock
     let (missed, total) = match ring::try_page(after, limit as usize, &mut events) {
@@ -102,11 +104,127 @@ fn handle_ring_page(payload: &[u8]) -> Result<Vec<u8>, u8> {
     Ok(out)
 }
 
+const PRIORITY_PAGE_MAX_LIMIT: u64 = 1024;
+
+/// PRIORITY_NEWEST: [u64 limit] -> [u64 total][u64 dropped][u64 next]
+/// [u64 count][events...]. The priority lane is bounded independently from
+/// the normal telemetry ring and therefore remains useful during trace floods.
+fn handle_priority_newest(payload: &[u8]) -> Result<Vec<u8>, u8> {
+    let mut reader = proto::Reader::new(payload);
+    let limit = reader
+        .u64()
+        .ok_or(proto::STATUS_BAD_REQUEST)?
+        .clamp(1, PRIORITY_PAGE_MAX_LIMIT);
+    let total = crate::priority::total();
+    let after = total.saturating_sub(limit);
+    let mut events = Vec::with_capacity(limit as usize);
+    let (_, live_total) =
+        crate::priority::try_page(after, limit as usize, &mut events).unwrap_or((0, total));
+    let mut out = Vec::with_capacity(32 + events.len() * proto::EVENT_WIRE_LEN);
+    proto::put_u64(&mut out, live_total);
+    proto::put_u64(&mut out, crate::priority::dropped());
+    proto::put_u64(
+        &mut out,
+        events.last().map(|event| event.sequence).unwrap_or(after),
+    );
+    proto::put_u64(&mut out, events.len() as u64);
+    for event in &events {
+        to_record(event).encode(&mut out);
+    }
+    Ok(out)
+}
+
+/// HOOK_EVENTS_NEWEST: [u64 limit][optional u64 before-exclusive] ->
+/// [u64 total][u64 producer_drops]
+/// [u64 next][u64 count][events...]. This lane is independent from generic
+/// instruction/memory tracing so Hook call logs are not displaced by it.
+fn handle_hook_events_newest(payload: &[u8]) -> Result<Vec<u8>, u8> {
+    const MAX_LIMIT: u64 = 4096;
+    let mut reader = proto::Reader::new(payload);
+    let limit = reader
+        .u64()
+        .ok_or(proto::STATUS_BAD_REQUEST)?
+        .clamp(1, MAX_LIMIT);
+    let total = crate::hook_events::total();
+    let requested_before = reader.u64().unwrap_or(0);
+    let before = if requested_before == 0 {
+        0
+    } else {
+        requested_before.min(total.saturating_add(1))
+    };
+    let after = if before == 0 {
+        total.saturating_sub(limit)
+    } else {
+        before.saturating_sub(limit.saturating_add(1))
+    };
+    let mut events = Vec::with_capacity(limit as usize);
+    let (_, live_total) =
+        crate::hook_events::try_page(after, limit as usize, &mut events).unwrap_or((0, total));
+    if before != 0 {
+        events.retain(|event| event.sequence < before);
+    }
+    let mut out = Vec::with_capacity(32 + events.len() * proto::HOOK_LOG_WIRE_LEN);
+    proto::put_u64(&mut out, live_total);
+    proto::put_u64(&mut out, crate::hook_events::dropped());
+    proto::put_u64(
+        &mut out,
+        events.last().map(|event| event.sequence).unwrap_or(after),
+    );
+    proto::put_u64(&mut out, events.len() as u64);
+    for event in &events {
+        event.encode(&mut out);
+    }
+    Ok(out)
+}
+
+/// SYSCALL_EVENTS_NEWEST uses the HookLogRecord wire image but reads the
+/// independent Syscall lane, preserving actual Agent timestamps without
+/// allowing Syscall volume to evict API or instruction Hook history.
+fn handle_syscall_events_newest(payload: &[u8]) -> Result<Vec<u8>, u8> {
+    const MAX_LIMIT: u64 = 4096;
+    let mut reader = proto::Reader::new(payload);
+    let limit = reader
+        .u64()
+        .ok_or(proto::STATUS_BAD_REQUEST)?
+        .clamp(1, MAX_LIMIT);
+    let total = crate::hook_events::syscall_total();
+    let requested_before = reader.u64().unwrap_or(0);
+    let before = if requested_before == 0 {
+        0
+    } else {
+        requested_before.min(total.saturating_add(1))
+    };
+    let after = if before == 0 {
+        total.saturating_sub(limit)
+    } else {
+        before.saturating_sub(limit.saturating_add(1))
+    };
+    let mut events = Vec::with_capacity(limit as usize);
+    let (_, live_total) = crate::hook_events::try_syscall_page(after, limit as usize, &mut events)
+        .unwrap_or((0, total));
+    if before != 0 {
+        events.retain(|event| event.sequence < before);
+    }
+    let mut out = Vec::with_capacity(32 + events.len() * proto::HOOK_LOG_WIRE_LEN);
+    proto::put_u64(&mut out, live_total);
+    proto::put_u64(&mut out, crate::hook_events::syscall_dropped());
+    proto::put_u64(
+        &mut out,
+        events.last().map(|event| event.sequence).unwrap_or(after),
+    );
+    proto::put_u64(&mut out, events.len() as u64);
+    for event in &events {
+        event.encode(&mut out);
+    }
+    Ok(out)
+}
+
 fn handle_bp_set(payload: &[u8]) -> Result<Vec<u8>, u8> {
     let mut reader = proto::Reader::new(payload);
     let address = reader.u64().ok_or(proto::STATUS_BAD_REQUEST)?;
     match bp::set(address) {
         Ok(id) => {
+            crate::scripting::note_external_breakpoint_set(id, address);
             crate::log::line(&format!("breakpoint set id={id} at 0x{address:x}"));
             let mut out = Vec::with_capacity(4);
             proto::put_u32(&mut out, id);
@@ -170,7 +288,9 @@ fn handle_exc_policy_set(payload: &[u8]) -> Result<Vec<u8>, u8> {
     let enabled = reader.u8().ok_or(proto::STATUS_BAD_REQUEST)? != 0;
     let code = reader.u32().ok_or(proto::STATUS_BAD_REQUEST)?;
     exception::set_policy(enabled, code);
-    crate::log::line(&format!("exception policy enabled={enabled} code=0x{code:x}"));
+    crate::log::line(&format!(
+        "exception policy enabled={enabled} code=0x{code:x}"
+    ));
     Ok(Vec::new())
 }
 
@@ -183,9 +303,11 @@ fn handle_exc_policy_get() -> Vec<u8> {
     out
 }
 
-/// SYSCALL_FILTER: [u8 mode (0=all, 1=only listed)][u16 count][count × u32 number]
-/// -> empty. The filter snapshot swaps in atomically; syscall entry/exit
-/// callbacks read it lock-free.
+/// SYSCALL_FILTER: [u8 number-mode (0=all, 1=only listed)][u16 count]
+/// [count × u32 number][optional u64 caller-start][optional u64 caller-end]
+/// -> empty. 0/0 means every caller address; otherwise the address range is
+/// half-open. The filter snapshot swaps in atomically and entry callbacks read
+/// it lock-free. Old clients that omit the final 16 bytes remain compatible.
 fn handle_syscall_filter(payload: &[u8]) -> Result<Vec<u8>, u8> {
     const MAX_FILTER_NUMBERS: usize = 4096;
     let mut reader = proto::Reader::new(payload);
@@ -201,12 +323,25 @@ fn handle_syscall_filter(payload: &[u8]) -> Result<Vec<u8>, u8> {
     for _ in 0..count {
         numbers.push(reader.u32().ok_or(proto::STATUS_BAD_REQUEST)?);
     }
-    syscall_engine::set_filter(mode, &numbers);
-    crate::log::line(&format!("syscall filter mode={mode} count={count}"));
+    let (scope_start, scope_end) = match reader.remaining().len() {
+        0 => (0, 0),
+        16 => (
+            reader.u64().ok_or(proto::STATUS_BAD_REQUEST)?,
+            reader.u64().ok_or(proto::STATUS_BAD_REQUEST)?,
+        ),
+        _ => return Err(proto::STATUS_BAD_REQUEST),
+    };
+    if (scope_start == 0) != (scope_end == 0) || (scope_end != 0 && scope_end <= scope_start) {
+        return Err(proto::STATUS_BAD_REQUEST);
+    }
+    syscall_engine::set_filter(mode, &numbers, scope_start, scope_end);
+    crate::log::line(&format!(
+        "syscall filter mode={mode} count={count} caller=0x{scope_start:x}-0x{scope_end:x}"
+    ));
     Ok(Vec::new())
 }
 
-/// HOOK_SET: [u64 addr] -> [u32 ok] (0 = set full at 4096 points).
+/// HOOK_SET: [u64 addr] -> [u32 ok] (0 = set full at 32768 points).
 fn handle_hook_set(payload: &[u8]) -> Result<Vec<u8>, u8> {
     let mut reader = proto::Reader::new(payload);
     let address = reader.u64().ok_or(proto::STATUS_BAD_REQUEST)?;
@@ -214,6 +349,72 @@ fn handle_hook_set(payload: &[u8]) -> Result<Vec<u8>, u8> {
     crate::log::line(&format!("hook set 0x{address:x} -> {ok}"));
     let mut out = Vec::with_capacity(4);
     proto::put_u32(&mut out, ok as u32);
+    Ok(out)
+}
+
+/// HOOK_SET_BATCH: [u32 count][count x u64 address]
+/// -> [u32 added][u32 total][u32 capacity_full].
+fn handle_hook_set_batch(payload: &[u8]) -> Result<Vec<u8>, u8> {
+    let mut reader = proto::Reader::new(payload);
+    let count = reader.u32().ok_or(proto::STATUS_BAD_REQUEST)? as usize;
+    if count > hooks::MAX_HOOK_POINTS || reader.remaining().len() != count * 8 {
+        return Err(proto::STATUS_BAD_REQUEST);
+    }
+    let mut addresses = Vec::with_capacity(count);
+    for _ in 0..count {
+        addresses.push(reader.u64().ok_or(proto::STATUS_BAD_REQUEST)?);
+    }
+    let (added, total, capacity_full) = hooks::set_batch(&addresses);
+    crate::log::line(&format!(
+        "hook batch requested={count} added={added} total={total} capacity_full={capacity_full}"
+    ));
+    let mut out = Vec::with_capacity(12);
+    proto::put_u32(&mut out, added as u32);
+    proto::put_u32(&mut out, total as u32);
+    proto::put_u32(&mut out, capacity_full as u32);
+    Ok(out)
+}
+
+/// HOOK_RANGE: [u64 start][u64 end-exclusive][u32 kind-mask][u8 apply]
+/// -> [u64 decoded][u64 matched][u32 address-count][u32 added][u32 total]
+///    [u32 flags][address-count x u64 address].
+/// flags: bit0 capacity-full, bit1 result-truncated, bit2 scan-complete,
+/// bit3 changes-applied.
+fn handle_hook_range(payload: &[u8]) -> Result<Vec<u8>, u8> {
+    let mut reader = proto::Reader::new(payload);
+    let start = reader.u64().ok_or(proto::STATUS_BAD_REQUEST)?;
+    let end = reader.u64().ok_or(proto::STATUS_BAD_REQUEST)?;
+    let kind_mask = reader.u32().ok_or(proto::STATUS_BAD_REQUEST)?;
+    let apply = reader.u8().ok_or(proto::STATUS_BAD_REQUEST)? != 0;
+    if !reader.remaining().is_empty() {
+        return Err(proto::STATUS_BAD_REQUEST);
+    }
+    let scan = crate::disasm::scan_range(start, end, kind_mask)?;
+    let (added, total, capacity_full, applied) = if apply && scan.complete {
+        let (added, total, capacity_full) = hooks::set_plain_batch(&scan.addresses);
+        (added, total, capacity_full, true)
+    } else {
+        (0, hooks::list().len(), false, false)
+    };
+    let mut flags = 0u32;
+    flags |= capacity_full as u32;
+    flags |= (scan.truncated as u32) << 1;
+    flags |= (scan.complete as u32) << 2;
+    flags |= (applied as u32) << 3;
+    crate::log::line(&format!(
+        "hook range 0x{start:x}-0x{end:x} mask=0x{kind_mask:x} decoded={} matched={} added={added} complete={} truncated={}",
+        scan.decoded, scan.matched, scan.complete, scan.truncated
+    ));
+    let mut out = Vec::with_capacity(32 + scan.addresses.len() * 8);
+    proto::put_u64(&mut out, scan.decoded);
+    proto::put_u64(&mut out, scan.matched);
+    proto::put_u32(&mut out, scan.addresses.len() as u32);
+    proto::put_u32(&mut out, added as u32);
+    proto::put_u32(&mut out, total as u32);
+    proto::put_u32(&mut out, flags);
+    for address in scan.addresses {
+        proto::put_u64(&mut out, address);
+    }
     Ok(out)
 }
 
@@ -234,6 +435,41 @@ fn handle_hook_list() -> Vec<u8> {
         proto::put_u64(&mut out, address);
     }
     out
+}
+
+/// HOOK_FUNCTION_LIST: empty -> [u32 count][count x u64 function entry].
+fn handle_hook_function_list() -> Vec<u8> {
+    let addresses = hooks::function_list();
+    let mut out = Vec::with_capacity(4 + addresses.len() * 8);
+    proto::put_u32(&mut out, addresses.len() as u32);
+    for address in addresses {
+        proto::put_u64(&mut out, address);
+    }
+    out
+}
+
+/// HOOK_SIGNATURE_SET: [address u64][calling convention u32]
+/// [return kind u32][parameter count u32][float parameter mask u32].
+fn handle_hook_signature_set(payload: &[u8]) -> Result<Vec<u8>, u8> {
+    let mut reader = proto::Reader::new(payload);
+    let layout = hooks::FunctionSignatureLayout {
+        address: reader.u64().ok_or(proto::STATUS_BAD_REQUEST)?,
+        calling_convention: reader.u32().ok_or(proto::STATUS_BAD_REQUEST)?,
+        return_kind: reader.u32().ok_or(proto::STATUS_BAD_REQUEST)?,
+        parameter_count: reader.u32().ok_or(proto::STATUS_BAD_REQUEST)?,
+        float_parameter_mask: reader.u32().ok_or(proto::STATUS_BAD_REQUEST)?,
+    };
+    let ok = hooks::set_function_signature(layout);
+    let mut out = Vec::with_capacity(4);
+    proto::put_u32(&mut out, ok as u32);
+    Ok(out)
+}
+
+fn handle_hook_signature_remove(payload: &[u8]) -> Result<Vec<u8>, u8> {
+    let mut reader = proto::Reader::new(payload);
+    let address = reader.u64().ok_or(proto::STATUS_BAD_REQUEST)?;
+    hooks::remove_function_signature(address);
+    Ok(Vec::new())
 }
 
 /// HOOK_RULE_SET: [addr u64][thread u32][match_reg u32][mask u64]
@@ -270,7 +506,12 @@ fn handle_hook_rule_set(payload: &[u8]) -> Result<Vec<u8>, u8> {
 /// record channel and flushes the window's JIT (see record.rs).
 fn handle_trace_start(payload: &[u8]) -> (u8, Vec<u8>) {
     let mut reader = proto::Reader::new(payload);
-    let bad = || (proto::STATUS_BAD_REQUEST, b"bad trace_start payload".to_vec());
+    let bad = || {
+        (
+            proto::STATUS_BAD_REQUEST,
+            b"bad trace_start payload".to_vec(),
+        )
+    };
     let Some(kinds_mask) = reader.u32() else {
         return bad();
     };
@@ -302,25 +543,50 @@ fn handle_trace_start(payload: &[u8]) -> (u8, Vec<u8>) {
 /// TRACE_START and keeps the old payload/API wire-compatible.
 fn handle_trace_start_spec(payload: &[u8]) -> (u8, Vec<u8>) {
     let mut reader = proto::Reader::new(payload);
-    let bad = || (proto::STATUS_BAD_REQUEST, b"bad trace_start_spec payload".to_vec());
-    let Some(kinds_mask) = reader.u32() else { return bad(); };
-    let Some(range_count) = reader.u16() else { return bad(); };
-    if range_count == 0 || range_count > 16 { return bad(); }
+    let bad = || {
+        (
+            proto::STATUS_BAD_REQUEST,
+            b"bad trace_start_spec payload".to_vec(),
+        )
+    };
+    let Some(kinds_mask) = reader.u32() else {
+        return bad();
+    };
+    let Some(range_count) = reader.u16() else {
+        return bad();
+    };
+    if range_count == 0 || range_count > 16 {
+        return bad();
+    }
     let mut ranges = Vec::with_capacity(range_count as usize);
     for _ in 0..range_count {
-        let Some(lo) = reader.u64() else { return bad(); };
-        let Some(hi) = reader.u64() else { return bad(); };
+        let Some(lo) = reader.u64() else {
+            return bad();
+        };
+        let Some(hi) = reader.u64() else {
+            return bad();
+        };
         ranges.push((lo, hi));
     }
-    let Some(thread_count) = reader.u16() else { return bad(); };
-    if thread_count > 64 { return bad(); }
+    let Some(thread_count) = reader.u16() else {
+        return bad();
+    };
+    if thread_count > 64 {
+        return bad();
+    }
     let mut threads = Vec::with_capacity(thread_count as usize);
     for _ in 0..thread_count {
-        let Some(tid) = reader.u32() else { return bad(); };
+        let Some(tid) = reader.u32() else {
+            return bad();
+        };
         threads.push(tid);
     }
-    let Some(path_len) = reader.u16() else { return bad(); };
-    let Some(path) = take_str(&mut reader, path_len as usize) else { return bad(); };
+    let Some(path_len) = reader.u16() else {
+        return bad();
+    };
+    let Some(path) = take_str(&mut reader, path_len as usize) else {
+        return bad();
+    };
     match crate::record::start_spec(kinds_mask, ranges, threads, path) {
         Ok(()) => {
             let mut out = Vec::with_capacity(4);
@@ -335,13 +601,26 @@ fn handle_trace_start_spec(payload: &[u8]) -> (u8, Vec<u8>) {
 /// active recorder without changing its kind or thread filters.
 fn handle_trace_extend(payload: &[u8]) -> (u8, Vec<u8>) {
     let mut reader = proto::Reader::new(payload);
-    let bad = || (proto::STATUS_BAD_REQUEST, b"bad trace_extend payload".to_vec());
-    let Some(count) = reader.u16() else { return bad(); };
-    if count == 0 || count > 16 { return bad(); }
+    let bad = || {
+        (
+            proto::STATUS_BAD_REQUEST,
+            b"bad trace_extend payload".to_vec(),
+        )
+    };
+    let Some(count) = reader.u16() else {
+        return bad();
+    };
+    if count == 0 || count > 16 {
+        return bad();
+    }
     let mut ranges = Vec::with_capacity(count as usize);
     for _ in 0..count {
-        let Some(lo) = reader.u64() else { return bad(); };
-        let Some(hi) = reader.u64() else { return bad(); };
+        let Some(lo) = reader.u64() else {
+            return bad();
+        };
+        let Some(hi) = reader.u64() else {
+            return bad();
+        };
         ranges.push((lo, hi));
     }
     match crate::record::extend_ranges(ranges) {
@@ -395,7 +674,12 @@ fn take_str(reader: &mut proto::Reader, len: usize) -> Option<String> {
 /// COMPILE only; the top level and pb_init() run on the next host tick.
 fn handle_script_load(payload: &[u8]) -> (u8, Vec<u8>) {
     let mut reader = proto::Reader::new(payload);
-    let bad = || (proto::STATUS_BAD_REQUEST, b"bad script_load payload".to_vec());
+    let bad = || {
+        (
+            proto::STATUS_BAD_REQUEST,
+            b"bad script_load payload".to_vec(),
+        )
+    };
     let Some(name_len) = reader.u16() else {
         return bad();
     };
@@ -422,7 +706,12 @@ fn handle_script_load(payload: &[u8]) -> (u8, Vec<u8>) {
 /// plugins.
 fn handle_script_unload(payload: &[u8]) -> (u8, Vec<u8>) {
     let mut reader = proto::Reader::new(payload);
-    let bad = || (proto::STATUS_BAD_REQUEST, b"bad script_unload payload".to_vec());
+    let bad = || {
+        (
+            proto::STATUS_BAD_REQUEST,
+            b"bad script_unload payload".to_vec(),
+        )
+    };
     let Some(name_len) = reader.u16() else {
         return bad();
     };
@@ -436,11 +725,20 @@ fn handle_script_unload(payload: &[u8]) -> (u8, Vec<u8>) {
 }
 
 /// SCRIPT_LIST: empty -> [u32 count][count × (u16 nlen, name, u8 state,
-/// u64 delivered, u64 dropped)]. state: 1 = running, 2 = error.
+/// u64 delivered, u64 dropped)][u32 binding_count][bindings...].
+/// Each binding is u32 id, short plugin/callback/description strings, u8 once, u32
+/// thread-id (u32::MAX = any), u64 last generation, short action/return/error.
+/// The next additive tail is [u32 decision_count][decision rows...] for
+/// return-valued pb.intercept subscriptions.
+/// state: 1 = running, 2 = error. The binding tail is additive so older
+/// clients can stop after the original script rows.
 /// An unavailable scripting host answers with an empty list.
 fn handle_script_list() -> Vec<u8> {
     let entries = crate::scripting::list().unwrap_or_default();
     let mut out = Vec::with_capacity(4 + entries.len() * 32);
+    let mut bindings = Vec::new();
+    let mut decisions = Vec::new();
+    let mut decision_metadata = Vec::new();
     proto::put_u32(&mut out, entries.len() as u32);
     for entry in entries {
         out.extend_from_slice(&(entry.name.len() as u16).to_le_bytes());
@@ -448,8 +746,101 @@ fn handle_script_list() -> Vec<u8> {
         out.push(entry.state);
         proto::put_u64(&mut out, entry.delivered);
         proto::put_u64(&mut out, entry.dropped);
+        bindings.extend(
+            entry
+                .breakpoints
+                .into_iter()
+                .map(|binding| (entry.name.clone(), binding)),
+        );
+        decisions.extend(
+            entry
+                .decisions
+                .into_iter()
+                .map(|binding| (entry.name.clone(), binding)),
+        );
+    }
+    proto::put_u32(&mut out, bindings.len() as u32);
+    for (plugin, binding) in bindings {
+        let callback = short_wire_text(binding.callback_name);
+        let description = short_wire_text(binding.description);
+        let action = short_wire_text(binding.last_action.unwrap_or_default());
+        let last_return = short_wire_text(binding.last_return.unwrap_or_default());
+        let error = short_wire_text(binding.last_error.unwrap_or_default());
+        proto::put_u32(&mut out, binding.id);
+        out.extend_from_slice(&(plugin.len() as u16).to_le_bytes());
+        out.extend_from_slice(plugin.as_bytes());
+        out.extend_from_slice(&(callback.len() as u16).to_le_bytes());
+        out.extend_from_slice(callback.as_bytes());
+        out.extend_from_slice(&(description.len() as u16).to_le_bytes());
+        out.extend_from_slice(description.as_bytes());
+        out.push(u8::from(binding.once));
+        proto::put_u32(&mut out, binding.thread_id.unwrap_or(u32::MAX));
+        proto::put_u64(&mut out, binding.last_stop_generation);
+        out.extend_from_slice(&(action.len() as u16).to_le_bytes());
+        out.extend_from_slice(action.as_bytes());
+        out.extend_from_slice(&(last_return.len() as u16).to_le_bytes());
+        out.extend_from_slice(last_return.as_bytes());
+        out.extend_from_slice(&(error.len() as u16).to_le_bytes());
+        out.extend_from_slice(error.as_bytes());
+    }
+    proto::put_u32(&mut out, decisions.len() as u32);
+    for (plugin, binding) in decisions {
+        let decision_id = binding.id;
+        let decision_address = binding.address;
+        let selector = short_wire_text(binding.selector);
+        let callback = short_wire_text(binding.callback_name);
+        let last_return = short_wire_text(binding.last_return.unwrap_or_default());
+        let error = short_wire_text(binding.last_error.unwrap_or_default());
+        proto::put_u64(&mut out, binding.id);
+        out.extend_from_slice(&(plugin.len() as u16).to_le_bytes());
+        out.extend_from_slice(plugin.as_bytes());
+        out.extend_from_slice(&(selector.len() as u16).to_le_bytes());
+        out.extend_from_slice(selector.as_bytes());
+        out.extend_from_slice(&(callback.len() as u16).to_le_bytes());
+        out.extend_from_slice(callback.as_bytes());
+        out.push(u8::from(binding.once));
+        proto::put_u32(&mut out, binding.thread_id.unwrap_or(u32::MAX));
+        match binding.codes {
+            None => out.push(0),
+            Some(codes) => {
+                out.push(1);
+                proto::put_u32(&mut out, codes.len() as u32);
+                for code in codes {
+                    proto::put_u32(&mut out, code);
+                }
+            }
+        }
+        proto::put_u64(&mut out, binding.last_generation);
+        out.extend_from_slice(&(last_return.len() as u16).to_le_bytes());
+        out.extend_from_slice(last_return.as_bytes());
+        out.extend_from_slice(&(error.len() as u16).to_le_bytes());
+        out.extend_from_slice(error.as_bytes());
+        decision_metadata.push((decision_id, decision_address, binding.description));
+    }
+    // Additive decision metadata tail. Older clients stop after the decision
+    // rows; newer clients use this to associate synchronous Hook callbacks
+    // with their exact native instruction address.
+    proto::put_u32(&mut out, decision_metadata.len() as u32);
+    for (id, address, description) in decision_metadata {
+        let description = short_wire_text(description);
+        proto::put_u64(&mut out, id);
+        proto::put_u64(&mut out, address.unwrap_or(0));
+        out.extend_from_slice(&(description.len() as u16).to_le_bytes());
+        out.extend_from_slice(description.as_bytes());
     }
     out
+}
+
+fn short_wire_text(mut value: String) -> String {
+    if value.len() <= u16::MAX as usize {
+        return value;
+    }
+    let mut end = u16::MAX as usize;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value.truncate(end);
+    value
 }
 
 /// SCRIPT_OUTPUT: [u64 after][u32 limit] -> [u64 next][u32 count]
@@ -459,7 +850,10 @@ fn handle_script_output(payload: &[u8]) -> Result<Vec<u8>, u8> {
     const OUTPUT_PAGE_MAX: u32 = 1024;
     let mut reader = proto::Reader::new(payload);
     let after = reader.u64().ok_or(proto::STATUS_BAD_REQUEST)?;
-    let limit = reader.u32().ok_or(proto::STATUS_BAD_REQUEST)?.min(OUTPUT_PAGE_MAX) as usize;
+    let limit = reader
+        .u32()
+        .ok_or(proto::STATUS_BAD_REQUEST)?
+        .min(OUTPUT_PAGE_MAX) as usize;
     let (next, entries) = crate::scripting::output_page(after, limit);
     let mut out = Vec::with_capacity(12 + entries.len() * 48);
     proto::put_u64(&mut out, next);
@@ -510,7 +904,12 @@ pub fn handle_step(payload: &[u8]) -> Result<Vec<u8>, u8> {
         let mut buffer = [0u8; 8];
         let mut copied: u64 = 0;
         unsafe {
-            pb_pin_safe_copy(buffer.as_mut_ptr() as *mut c_void, address, width as u64, &mut copied);
+            pb_pin_safe_copy(
+                buffer.as_mut_ptr() as *mut c_void,
+                address,
+                width as u64,
+                &mut copied,
+            );
         }
         if copied as usize == width {
             Some(u64::from_le_bytes(buffer))
@@ -542,14 +941,15 @@ pub fn handle_step(payload: &[u8]) -> Result<Vec<u8>, u8> {
     // shares ownership with an ordinary user/Python breakpoint.
     if decoded && over && flow.kind == 2 {
         let fallthrough = next_ip(flow.size);
-        stepper::arm_candidates(tid, rip, &[fallthrough])
-            .map_err(|_| proto::STATUS_INTERNAL)?;
+        stepper::arm_candidates(tid, rip, &[fallthrough]).map_err(|_| proto::STATUS_INTERNAL)?;
         bp::arm_step_watchdog(100); // ~5s: auto-pause if the call never returns
         if !bp::control_command(bp::CMD_RESUME) {
             stepper::cancel();
             return Err(proto::STATUS_INTERNAL);
         }
-        crate::log::line(&format!("step over tid={tid} from 0x{rip:x} bp=0x{fallthrough:x}"));
+        crate::log::line(&format!(
+            "step over tid={tid} from 0x{rip:x} bp=0x{fallthrough:x}"
+        ));
         return Ok(vec![1]);
     }
 
@@ -576,7 +976,11 @@ pub fn handle_step(payload: &[u8]) -> Result<Vec<u8>, u8> {
             };
             if let Some(base) = base {
                 let mut ea = base
-                    .wrapping_add(read_reg(flow.index_reg).unwrap_or(0).wrapping_mul(flow.scale))
+                    .wrapping_add(
+                        read_reg(flow.index_reg)
+                            .unwrap_or(0)
+                            .wrapping_mul(flow.scale),
+                    )
                     .wrapping_add(flow.disp as u64);
                 if crate::arch::pointer_width() == 4 {
                     ea &= u32::MAX as u64;
@@ -588,7 +992,9 @@ pub fn handle_step(payload: &[u8]) -> Result<Vec<u8>, u8> {
         }
         if flow.kind == 3 {
             // ret: successor is the pointer at [rsp]/[esp]
-            if let Some(value) = read_reg(crate::arch::stack_ptr_reg() as i32).and_then(read_mem_ptr) {
+            if let Some(value) =
+                read_reg(crate::arch::stack_ptr_reg() as i32).and_then(read_mem_ptr)
+            {
                 candidates.push(value);
             }
         }
@@ -612,7 +1018,7 @@ pub fn handle_step(payload: &[u8]) -> Result<Vec<u8>, u8> {
 
     // fallback: exec-capture stepper (imprecise on huge traces, but works
     // without a decodable instruction)
-    stepper::arm(tid, rip, false);
+    stepper::arm(tid, rip, false).map_err(|_| proto::STATUS_INTERNAL)?;
     bp::arm_step_watchdog(100);
     if !bp::control_command(bp::CMD_RESUME) {
         return Err(proto::STATUS_INTERNAL);
@@ -641,8 +1047,7 @@ fn qs_trace(op_code: u8, entry: bool) {
         2 => {}
         1 => return,
         _ => {
-            let on =
-                std::env::var("PINBRIDGE_QS_TRACE").ok().as_deref() == Some("1");
+            let on = std::env::var("PINBRIDGE_QS_TRACE").ok().as_deref() == Some("1");
             ON.store(
                 if on { 2 } else { 1 },
                 core::sync::atomic::Ordering::Relaxed,
@@ -675,6 +1080,8 @@ fn requires_jit(op_code: u8) -> bool {
             | proto::op::TRACE_START_SPEC
             | proto::op::TRACE_EXTEND
             | proto::op::HOOK_SET
+            | proto::op::HOOK_SET_BATCH
+            | proto::op::HOOK_RANGE
             | proto::op::HOOK_REMOVE
             | proto::op::HOOK_CLEAR
             | proto::op::HOOK_RULE_SET
@@ -698,119 +1105,149 @@ fn serve_client(stream: &mut TcpStream) {
             )
         } else {
             match op_code {
-            proto::op::PING => (proto::STATUS_OK, handle_ping()),
-            proto::op::COUNTERS => (proto::STATUS_OK, handle_counters()),
-            proto::op::RING_PAGE => match handle_ring_page(&payload) {
-                Ok(body) => (proto::STATUS_OK, body),
-                Err(code) => (code, Vec::new()),
-            },
-            proto::op::STOP => (proto::STATUS_OK, control::handle_stop()),
-            proto::op::RESUME => (proto::STATUS_OK, control::handle_resume()),
-            proto::op::READ_MEM => match control::handle_read_mem(&payload) {
-                Ok(body) => (proto::STATUS_OK, body),
-                Err(code) => (code, Vec::new()),
-            },
-            proto::op::MEMORY_REGION => match control::handle_memory_region(&payload) {
-                Ok(body) => (proto::STATUS_OK, body),
-                Err(code) => (code, Vec::new()),
-            },
-            proto::op::WRITE_MEM => match control::handle_write_mem(&payload) {
-                Ok(body) => (proto::STATUS_OK, body),
-                Err(code) => (code, Vec::new()),
-            },
-            proto::op::MODULES => (proto::STATUS_OK, control::handle_modules()),
-            proto::op::BP_SET => match handle_bp_set(&payload) {
-                Ok(body) => (proto::STATUS_OK, body),
-                Err(code) => (code, Vec::new()),
-            },
-            proto::op::BP_LIST => (proto::STATUS_OK, handle_bp_list()),
-            proto::op::BP_REMOVE => match handle_bp_remove(&payload) {
-                Ok(body) => (proto::STATUS_OK, body),
-                Err(code) => (code, Vec::new()),
-            },
-            proto::op::THREADS => (proto::STATUS_OK, context::handle_threads()),
-            proto::op::CONTEXT_GET => match context::handle_context_get(&payload) {
-                Ok(body) => (proto::STATUS_OK, body),
-                Err(code) => (code, Vec::new()),
-            },
-            proto::op::CONTEXT_SET => match context::handle_context_set(&payload) {
-                Ok(body) => (proto::STATUS_OK, body),
-                Err(code) => (code, Vec::new()),
-            },
-            proto::op::ENGINE_SET => match handle_engine_set(&payload) {
-                Ok(body) => (proto::STATUS_OK, body),
-                Err(code) => (code, Vec::new()),
-            },
-            proto::op::EXC_POLICY_SET => match handle_exc_policy_set(&payload) {
-                Ok(body) => (proto::STATUS_OK, body),
-                Err(code) => (code, Vec::new()),
-            },
-            proto::op::EXC_POLICY_GET => (proto::STATUS_OK, handle_exc_policy_get()),
-            proto::op::STEP => match handle_step(&payload) {
-                Ok(body) => (proto::STATUS_OK, body),
-                Err(code) => (code, Vec::new()),
-            },
-            proto::op::DISASM => match disasm::handle_disasm(&payload) {
-                Ok(body) => (proto::STATUS_OK, body),
-                Err(code) => (code, Vec::new()),
-            },
-            proto::op::RESOLVE => match crate::resolve::handle_resolve(&payload) {
-                Ok(body) => (proto::STATUS_OK, body),
-                Err(code) => (code, Vec::new()),
-            },
-            proto::op::RESOLVE_NAME => match handle_resolve_name(&payload) {
-                Ok(body) => (proto::STATUS_OK, body),
-                Err(code) => (code, Vec::new()),
-            },
-            proto::op::EXPORTS => match crate::resolve::handle_exports(&payload) {
-                Ok(body) => (proto::STATUS_OK, body),
-                Err(code) => (code, Vec::new()),
-            },
-            proto::op::SYSCALL_FILTER => match handle_syscall_filter(&payload) {
-                Ok(body) => (proto::STATUS_OK, body),
-                Err(code) => (code, Vec::new()),
-            },
-            proto::op::TRACE_START => handle_trace_start(&payload),
-            proto::op::TRACE_START_SPEC => handle_trace_start_spec(&payload),
-            proto::op::TRACE_EXTEND => handle_trace_extend(&payload),
-            proto::op::TRACE_STOP => (proto::STATUS_OK, handle_trace_stop()),
-            proto::op::TRACE_STATUS => (proto::STATUS_OK, handle_trace_status()),
-            proto::op::HOOK_SET => match handle_hook_set(&payload) {
-                Ok(body) => (proto::STATUS_OK, body),
-                Err(code) => (code, Vec::new()),
-            },
-            proto::op::HOOK_REMOVE => match handle_hook_remove(&payload) {
-                Ok(body) => (proto::STATUS_OK, body),
-                Err(code) => (code, Vec::new()),
-            },
-            proto::op::HOOK_CLEAR => {
-                hooks::clear();
-                (proto::STATUS_OK, Vec::new())
-            }
-            proto::op::HOOK_LIST => (proto::STATUS_OK, handle_hook_list()),
-            proto::op::HOOK_RULE_SET => match handle_hook_rule_set(&payload) {
-                Ok(body) => (proto::STATUS_OK, body),
-                Err(code) => (code, Vec::new()),
-            },
-            proto::op::HOOK_RULE_CLEAR => {
-                hooks::clear_rules();
-                (proto::STATUS_OK, Vec::new())
-            }
-            proto::op::SCRIPT_LOAD => {
-                let reply = handle_script_load(&payload);
-                crate::diag::heap_check("qs script_load");
-                reply
-            }
-            proto::op::SCRIPT_UNLOAD => {
-                let reply = handle_script_unload(&payload);
-                crate::diag::heap_check("qs script_unload");
-                reply
-            }
-            proto::op::SCRIPT_LIST => (proto::STATUS_OK, handle_script_list()),
-            proto::op::SCRIPT_OUTPUT => match handle_script_output(&payload) {
-                Ok(body) => (proto::STATUS_OK, body),
-                Err(code) => (code, Vec::new()),
-            },
+                proto::op::PING => (proto::STATUS_OK, handle_ping()),
+                proto::op::COUNTERS => (proto::STATUS_OK, handle_counters()),
+                proto::op::RING_PAGE => match handle_ring_page(&payload) {
+                    Ok(body) => (proto::STATUS_OK, body),
+                    Err(code) => (code, Vec::new()),
+                },
+                proto::op::HOOK_EVENTS_NEWEST => match handle_hook_events_newest(&payload) {
+                    Ok(body) => (proto::STATUS_OK, body),
+                    Err(code) => (code, Vec::new()),
+                },
+                proto::op::SYSCALL_EVENTS_NEWEST => match handle_syscall_events_newest(&payload) {
+                    Ok(body) => (proto::STATUS_OK, body),
+                    Err(code) => (code, Vec::new()),
+                },
+                proto::op::PRIORITY_NEWEST => match handle_priority_newest(&payload) {
+                    Ok(body) => (proto::STATUS_OK, body),
+                    Err(code) => (code, Vec::new()),
+                },
+                proto::op::STOP => (proto::STATUS_OK, control::handle_stop()),
+                proto::op::RESUME => (proto::STATUS_OK, control::handle_resume()),
+                proto::op::READ_MEM => match control::handle_read_mem(&payload) {
+                    Ok(body) => (proto::STATUS_OK, body),
+                    Err(code) => (code, Vec::new()),
+                },
+                proto::op::MEMORY_REGION => match control::handle_memory_region(&payload) {
+                    Ok(body) => (proto::STATUS_OK, body),
+                    Err(code) => (code, Vec::new()),
+                },
+                proto::op::MEMORY_MAP => (proto::STATUS_OK, control::handle_memory_map()),
+                proto::op::WRITE_MEM => match control::handle_write_mem(&payload) {
+                    Ok(body) => (proto::STATUS_OK, body),
+                    Err(code) => (code, Vec::new()),
+                },
+                proto::op::MODULES => (proto::STATUS_OK, control::handle_modules()),
+                proto::op::BP_SET => match handle_bp_set(&payload) {
+                    Ok(body) => (proto::STATUS_OK, body),
+                    Err(code) => (code, Vec::new()),
+                },
+                proto::op::BP_LIST => (proto::STATUS_OK, handle_bp_list()),
+                proto::op::BP_REMOVE => match handle_bp_remove(&payload) {
+                    Ok(body) => (proto::STATUS_OK, body),
+                    Err(code) => (code, Vec::new()),
+                },
+                proto::op::THREADS => (proto::STATUS_OK, context::handle_threads()),
+                proto::op::CONTEXT_GET => match context::handle_context_get(&payload) {
+                    Ok(body) => (proto::STATUS_OK, body),
+                    Err(code) => (code, Vec::new()),
+                },
+                proto::op::CONTEXT_SET => match context::handle_context_set(&payload) {
+                    Ok(body) => (proto::STATUS_OK, body),
+                    Err(code) => (code, Vec::new()),
+                },
+                proto::op::ENGINE_SET => match handle_engine_set(&payload) {
+                    Ok(body) => (proto::STATUS_OK, body),
+                    Err(code) => (code, Vec::new()),
+                },
+                proto::op::EXC_POLICY_SET => match handle_exc_policy_set(&payload) {
+                    Ok(body) => (proto::STATUS_OK, body),
+                    Err(code) => (code, Vec::new()),
+                },
+                proto::op::EXC_POLICY_GET => (proto::STATUS_OK, handle_exc_policy_get()),
+                proto::op::STEP => match handle_step(&payload) {
+                    Ok(body) => (proto::STATUS_OK, body),
+                    Err(code) => (code, Vec::new()),
+                },
+                proto::op::DISASM => match disasm::handle_disasm(&payload) {
+                    Ok(body) => (proto::STATUS_OK, body),
+                    Err(code) => (code, Vec::new()),
+                },
+                proto::op::RESOLVE => match crate::resolve::handle_resolve(&payload) {
+                    Ok(body) => (proto::STATUS_OK, body),
+                    Err(code) => (code, Vec::new()),
+                },
+                proto::op::RESOLVE_NAME => match handle_resolve_name(&payload) {
+                    Ok(body) => (proto::STATUS_OK, body),
+                    Err(code) => (code, Vec::new()),
+                },
+                proto::op::EXPORTS => match crate::resolve::handle_exports(&payload) {
+                    Ok(body) => (proto::STATUS_OK, body),
+                    Err(code) => (code, Vec::new()),
+                },
+                proto::op::SYSCALL_FILTER => match handle_syscall_filter(&payload) {
+                    Ok(body) => (proto::STATUS_OK, body),
+                    Err(code) => (code, Vec::new()),
+                },
+                proto::op::TRACE_START => handle_trace_start(&payload),
+                proto::op::TRACE_START_SPEC => handle_trace_start_spec(&payload),
+                proto::op::TRACE_EXTEND => handle_trace_extend(&payload),
+                proto::op::TRACE_STOP => (proto::STATUS_OK, handle_trace_stop()),
+                proto::op::TRACE_STATUS => (proto::STATUS_OK, handle_trace_status()),
+                proto::op::HOOK_SET => match handle_hook_set(&payload) {
+                    Ok(body) => (proto::STATUS_OK, body),
+                    Err(code) => (code, Vec::new()),
+                },
+                proto::op::HOOK_SET_BATCH => match handle_hook_set_batch(&payload) {
+                    Ok(body) => (proto::STATUS_OK, body),
+                    Err(code) => (code, Vec::new()),
+                },
+                proto::op::HOOK_RANGE => match handle_hook_range(&payload) {
+                    Ok(body) => (proto::STATUS_OK, body),
+                    Err(code) => (code, Vec::new()),
+                },
+                proto::op::HOOK_REMOVE => match handle_hook_remove(&payload) {
+                    Ok(body) => (proto::STATUS_OK, body),
+                    Err(code) => (code, Vec::new()),
+                },
+                proto::op::HOOK_CLEAR => {
+                    hooks::clear();
+                    (proto::STATUS_OK, Vec::new())
+                }
+                proto::op::HOOK_LIST => (proto::STATUS_OK, handle_hook_list()),
+                proto::op::HOOK_FUNCTION_LIST => (proto::STATUS_OK, handle_hook_function_list()),
+                proto::op::HOOK_SIGNATURE_SET => match handle_hook_signature_set(&payload) {
+                    Ok(body) => (proto::STATUS_OK, body),
+                    Err(code) => (code, Vec::new()),
+                },
+                proto::op::HOOK_SIGNATURE_REMOVE => match handle_hook_signature_remove(&payload) {
+                    Ok(body) => (proto::STATUS_OK, body),
+                    Err(code) => (code, Vec::new()),
+                },
+                proto::op::HOOK_RULE_SET => match handle_hook_rule_set(&payload) {
+                    Ok(body) => (proto::STATUS_OK, body),
+                    Err(code) => (code, Vec::new()),
+                },
+                proto::op::HOOK_RULE_CLEAR => {
+                    hooks::clear_rules();
+                    (proto::STATUS_OK, Vec::new())
+                }
+                proto::op::SCRIPT_LOAD => {
+                    let reply = handle_script_load(&payload);
+                    crate::diag::heap_check("qs script_load");
+                    reply
+                }
+                proto::op::SCRIPT_UNLOAD => {
+                    let reply = handle_script_unload(&payload);
+                    crate::diag::heap_check("qs script_unload");
+                    reply
+                }
+                proto::op::SCRIPT_LIST => (proto::STATUS_OK, handle_script_list()),
+                proto::op::SCRIPT_OUTPUT => match handle_script_output(&payload) {
+                    Ok(body) => (proto::STATUS_OK, body),
+                    Err(code) => (code, Vec::new()),
+                },
                 _ => (proto::STATUS_BAD_REQUEST, Vec::new()),
             }
         };
@@ -838,6 +1275,7 @@ mod probe_mode_tests {
             proto::op::ENGINE_SET,
             proto::op::SYSCALL_FILTER,
             proto::op::HOOK_SET,
+            proto::op::HOOK_SET_BATCH,
         ] {
             assert!(requires_jit(op));
         }
@@ -845,11 +1283,18 @@ mod probe_mode_tests {
             proto::op::PING,
             proto::op::COUNTERS,
             proto::op::RING_PAGE,
+            proto::op::PRIORITY_NEWEST,
             proto::op::READ_MEM,
             proto::op::WRITE_MEM,
             proto::op::MODULES,
+            proto::op::MEMORY_MAP,
             proto::op::SCRIPT_LOAD,
             proto::op::SCRIPT_LIST,
+            proto::op::HOOK_FUNCTION_LIST,
+            proto::op::HOOK_EVENTS_NEWEST,
+            proto::op::SYSCALL_EVENTS_NEWEST,
+            proto::op::HOOK_SIGNATURE_SET,
+            proto::op::HOOK_SIGNATURE_REMOVE,
         ] {
             assert!(!requires_jit(op));
         }
@@ -875,12 +1320,9 @@ unsafe extern "C" fn server_main(argument: *mut c_void) {
     }
 }
 
-/// Binds the loopback port NOW (tool thread) and spawns the accept loop on a
-/// Pin internal thread. Binding here matters: with PINBRIDGE_ENTRY_BP the app
-/// stops at its first instruction, and a not-yet-started internal thread
-/// apparently never gets scheduled once all app threads are suspended — but
-/// an already-bound listener completes client handshakes in the kernel, so
-/// the launcher's wait_for_port succeeds regardless.
+/// Binds the loopback port on the tool thread and spawns the accept loop on a
+/// Pin internal thread. Early binding reserves the selected port, but clients
+/// require a complete protocol PING response before declaring the Agent ready.
 pub fn spawn() -> PbStatus {
     let port = crate::child_process::control_port_override().unwrap_or_else(|| {
         std::env::var("PINBRIDGE_AGENT_PORT")
@@ -892,7 +1334,9 @@ pub fn spawn() -> PbStatus {
         Ok(listener) => listener,
         Err(error) => {
             // headless-tolerant: log and run without a control plane
-            crate::log::line(&format!("query server bind 127.0.0.1:{port} failed: {error}"));
+            crate::log::line(&format!(
+                "query server bind 127.0.0.1:{port} failed: {error}"
+            ));
             return PB_OK;
         }
     };

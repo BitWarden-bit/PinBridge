@@ -26,9 +26,9 @@ static STEP_START_IP: AtomicU64 = AtomicU64::new(0);
 static STEP_MODE: AtomicU32 = AtomicU32::new(MODE_INTO as u32);
 static STEPPING: AtomicBool = AtomicBool::new(false);
 static REPLAY_PENDING: AtomicBool = AtomicBool::new(false);
+static TF_COMPAT_TID: AtomicU32 = AtomicU32::new(PB_INVALID_THREAD_ID);
 static CANDIDATE_COUNT: AtomicUsize = AtomicUsize::new(0);
-static CANDIDATES: [AtomicU64; MAX_CANDIDATES] =
-    [const { AtomicU64::new(0) }; MAX_CANDIDATES];
+static CANDIDATES: [AtomicU64; MAX_CANDIDATES] = [const { AtomicU64::new(0) }; MAX_CANDIDATES];
 
 static PARK_SEM: AtomicUsize = AtomicUsize::new(0);
 static PARKED: AtomicBool = AtomicBool::new(false);
@@ -43,6 +43,48 @@ static PARKED_IP: AtomicU64 = AtomicU64::new(0);
 /// callbacks kill the process; only Pin locks are safe here).
 static PARK_LOCK: AtomicUsize = AtomicUsize::new(0);
 static SUSPENDING: AtomicBool = AtomicBool::new(false);
+
+/// Arms Pin's POPF/TF compatibility only for the application thread selected
+/// by the manual debugger step. The bridge is pre-instrumented at startup, so
+/// this is just an analysis-safe atomic gate in pinbridge.dll.
+fn arm_tf_compat(thread_id: u32) -> Result<(), PbStatus> {
+    let previous = TF_COMPAT_TID.swap(thread_id, Ordering::AcqRel);
+    if previous != PB_INVALID_THREAD_ID && previous != thread_id {
+        unsafe {
+            let _ = pb_pin_set_single_step_passthrough(previous, 0);
+        }
+    }
+    let status = unsafe { pb_pin_set_single_step_passthrough(thread_id, 1) };
+    if status != PB_OK {
+        let _ = TF_COMPAT_TID.compare_exchange(
+            thread_id,
+            PB_INVALID_THREAD_ID,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        return Err(status);
+    }
+    Ok(())
+}
+
+/// Stops rewriting future POPF instructions for this step. A #DB already
+/// pending inside the bridge is deliberately retained and will still be
+/// delivered after the architectural successor instruction.
+fn disarm_tf_compat(thread_id: u32) {
+    if TF_COMPAT_TID
+        .compare_exchange(
+            thread_id,
+            PB_INVALID_THREAD_ID,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_ok()
+    {
+        unsafe {
+            let _ = pb_pin_set_single_step_passthrough(thread_id, 0);
+        }
+    }
+}
 
 pub fn init() -> PbStatus {
     unsafe {
@@ -146,20 +188,32 @@ pub fn park_current(thread_id: u32, address: u64) -> bool {
 }
 
 /// Arms the step. `start_ip` is the rip of the stopped thread.
-pub fn arm(thread_id: u32, start_ip: u64, over: bool) {
+pub fn arm(thread_id: u32, start_ip: u64, over: bool) -> Result<(), PbStatus> {
+    arm_tf_compat(thread_id)?;
     STEP_TID.store(thread_id, Ordering::Release);
     STEP_START_IP.store(start_ip, Ordering::Release);
-    STEP_MODE.store(if over { MODE_OVER as u32 } else { MODE_INTO as u32 }, Ordering::Release);
+    STEP_MODE.store(
+        if over {
+            MODE_OVER as u32
+        } else {
+            MODE_INTO as u32
+        },
+        Ordering::Release,
+    );
     REPLAY_PENDING.store(true, Ordering::Release);
     CANDIDATE_COUNT.store(0, Ordering::Release);
     STEPPING.store(true, Ordering::Release);
+    Ok(())
 }
 
 fn publish_candidates(thread_id: u32, start_ip: u64, candidates: &[u64]) -> usize {
     STEPPING.store(false, Ordering::Release);
     let count = candidates.len().min(MAX_CANDIDATES);
     for (index, slot) in CANDIDATES.iter().enumerate() {
-        slot.store(candidates.get(index).copied().unwrap_or(0), Ordering::Relaxed);
+        slot.store(
+            candidates.get(index).copied().unwrap_or(0),
+            Ordering::Relaxed,
+        );
     }
     STEP_TID.store(thread_id, Ordering::Relaxed);
     STEP_START_IP.store(start_ip, Ordering::Relaxed);
@@ -182,10 +236,13 @@ pub fn arm_candidates(
     if count == 0 {
         return Err(PB_ERR_INVALID_ARGUMENT);
     }
+    if let Err(status) = arm_tf_compat(thread_id) {
+        cancel();
+        return Err(status);
+    }
     for address in candidates.iter().take(count) {
-        let status = unsafe {
-            pb_pin_remove_instrumentation_in_range(*address, address.saturating_add(15))
-        };
+        let status =
+            unsafe { pb_pin_remove_instrumentation_in_range(*address, address.saturating_add(15)) };
         if status != PB_OK {
             cancel();
             return Err(status);
@@ -243,6 +300,7 @@ pub fn claim_candidate(index: usize, thread_id: u32) -> Option<u64> {
     {
         return None;
     }
+    disarm_tf_compat(thread_id);
     Some(address)
 }
 
@@ -258,6 +316,12 @@ pub fn claim_breakpoint(thread_id: u32, address: u64) -> bool {
 /// Disarms every form of step. Already-instrumented private callbacks remain
 /// harmless because they re-check this state before doing anything.
 pub fn cancel() {
+    let compat_tid = TF_COMPAT_TID.swap(PB_INVALID_THREAD_ID, Ordering::AcqRel);
+    if compat_tid != PB_INVALID_THREAD_ID {
+        unsafe {
+            let _ = pb_pin_set_single_step_passthrough(compat_tid, 0);
+        }
+    }
     STEPPING.store(false, Ordering::Release);
     REPLAY_PENDING.store(false, Ordering::Release);
     CANDIDATE_COUNT.store(0, Ordering::Release);
@@ -281,6 +345,7 @@ pub fn on_step_event(thread_id: u32, address: u64) -> bool {
     if STEP_MODE.load(Ordering::Acquire) != MODE_INTO as u32 {
         return false;
     }
+    disarm_tf_compat(thread_id);
     if !park_current(thread_id, address) {
         crate::bp::request_stop();
     }

@@ -1,9 +1,10 @@
 //! Low-frequency Pin lifecycle producers.
 //!
-//! These callbacks execute on Pin/application threads.  They never acquire
-//! the GIL and never allocate: each callback captures a fixed POD event and
-//! submits it to the native ring.  The scripting internal thread is the only
-//! place where a Python handler is invoked.
+//! These callbacks execute on Pin/application threads. Runtime event
+//! callbacks never acquire the GIL or allocate: each captures a fixed POD
+//! event and submits it to the native ring. The one-time application-start
+//! callback may initialize the embedded interpreter before target code runs;
+//! Python plugin handlers still execute only on the scripting thread.
 
 use crate::event::{
     Event, EVENT_PIN_ATTACH, EVENT_PROCESS_EXIT, EVENT_PROCESS_FINI, EVENT_PROCESS_START,
@@ -38,6 +39,12 @@ unsafe fn context_ip(context: PbConstContextHandle) -> u64 {
 }
 
 unsafe extern "C" fn on_application_start(_user_data: *mut c_void) {
+    // Pin starts internal threads and the application together. Initialize
+    // embedded Python here, after tool loading but before the target can enter
+    // a blocking console read and contend for the process standard streams.
+    if !PROCESS_STARTED.load(Ordering::Acquire) {
+        crate::scripting::initialize_before_application();
+    }
     crate::pin_session::note_application_started();
     if PROCESS_STARTED.swap(true, Ordering::AcqRel) {
         // Pin documents another application-start notification after a
@@ -169,6 +176,7 @@ unsafe extern "C" fn on_thread_start(
     flags: i32,
     _user_data: *mut c_void,
 ) {
+    crate::hooks::thread_start(thread_id);
     submit(Event {
         kind: EVENT_THREAD_START,
         thread_id,
@@ -184,6 +192,7 @@ unsafe extern "C" fn on_thread_fini(
     code: i32,
     _user_data: *mut c_void,
 ) {
+    crate::hooks::thread_fini(thread_id);
     submit(Event {
         kind: EVENT_THREAD_EXIT,
         thread_id,

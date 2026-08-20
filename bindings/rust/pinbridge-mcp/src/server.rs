@@ -281,6 +281,43 @@ mod tests {
             script["inputSchema"]["properties"]["source"]["type"],
             "string"
         );
+        assert!(script["description"]
+            .as_str()
+            .unwrap()
+            .contains("non-empty keyword-only description"));
+        assert!(tools
+            .iter()
+            .any(|tool| tool["name"] == "breakpoint_inventory"));
+        assert!(tools
+            .iter()
+            .any(|tool| tool["name"] == "hook_targets_query"));
+        assert!(tools
+            .iter()
+            .any(|tool| tool["name"] == "hook_monitor_apply"));
+        assert!(!tools.iter().any(|tool| tool["name"] == "hook_module"));
+        assert!(tools.iter().any(|tool| tool["name"] == "event_index_query"));
+        assert!(tools
+            .iter()
+            .any(|tool| tool["name"] == "event_index_export"));
+        assert!(tools.iter().any(|tool| tool["name"] == "trace_scope_query"));
+        assert!(tools
+            .iter()
+            .any(|tool| tool["name"] == "trace_record_start"));
+        assert!(tools
+            .iter()
+            .any(|tool| tool["name"] == "trace_record_status"));
+        assert!(tools.iter().any(|tool| tool["name"] == "trace_record_stop"));
+        assert!(tools.iter().any(|tool| tool["name"] == "trace_index_query"));
+        assert!(tools
+            .iter()
+            .any(|tool| tool["name"] == "trace_index_export"));
+        assert!(!tools.iter().any(|tool| tool["name"] == "hook_monitor"));
+        assert!(!tools.iter().any(|tool| tool["name"] == "hook_events_query"));
+        let script_get = tools
+            .iter()
+            .find(|tool| tool["name"] == "script_get")
+            .expect("script_get schema");
+        assert_eq!(script_get["inputSchema"]["required"][0], "name");
 
         let resolve = tools
             .iter()

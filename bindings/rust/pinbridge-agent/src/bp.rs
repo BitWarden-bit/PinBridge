@@ -323,11 +323,7 @@ pub fn instrument(ins: PbInsHandle, slot_index: usize) {
 /// same address. `candidate_index` refers to the stepper's private table.
 pub fn instrument_step(ins: PbInsHandle, candidate_index: usize) {
     unsafe {
-        pb_ins_insert_call_before_ctx(
-            ins,
-            Some(on_step_hit_ctx),
-            candidate_index as *mut c_void,
-        );
+        pb_ins_insert_call_before_ctx(ins, Some(on_step_hit_ctx), candidate_index as *mut c_void);
     }
 }
 
@@ -492,9 +488,7 @@ unsafe extern "C" fn breaker_main(_argument: *mut c_void) {
             if !crate::control::is_stopped() {
                 wait_loader_quiesce();
                 let mut stopped: u8 = 0;
-                if pb_pin_stop_application_threads(tid, &mut stopped) == PB_OK
-                    && stopped != 0
-                {
+                if pb_pin_stop_application_threads(tid, &mut stopped) == PB_OK && stopped != 0 {
                     WATCHDOG_TICKS.store(0, Ordering::Release);
                     // with the world frozen, roll the redirected thread's
                     // saved context back onto the breakpoint address

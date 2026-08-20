@@ -1,6 +1,7 @@
 [CmdletBinding()]
 param(
-    [string]$Target = "D:\vmp_trace_toolkit_bundle_20260801_clean\analysis\live-unpack-20260817\crypto.vmp.exe",
+    [Parameter(Mandatory = $true)]
+    [string]$Target,
     [UInt64]$ExpectedOep = 0x140008B70,
     [ValidateRange(15, 180)][int]$TimeoutSec = 90
 )

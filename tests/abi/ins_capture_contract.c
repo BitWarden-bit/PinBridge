@@ -3,6 +3,7 @@
 #include "pinbridge/pinbridge.h"
 
 static uint32_t g_capture_regs_calls;
+static uint32_t g_hook_monitor_calls;
 static uint32_t g_capture_regs_ctx_calls;
 static uint32_t g_memory_operand_calls;
 static uint32_t g_exec_calls;
@@ -28,6 +29,19 @@ static void PB_CALL OnCaptureRegs(
         rcx != rdx && r8 != r9)
     {
         ++g_capture_regs_calls;
+        g_last_address = address;
+    }
+}
+
+static void PB_CALL OnHookMonitor(
+    uint64_t address, uint32_t thread_id,
+    uint64_t arg0, uint64_t arg1, uint64_t arg2, uint64_t arg3,
+    uint64_t stack_pointer, uint64_t return_value, void* user_data)
+{
+    if (user_data == &g_hook_monitor_calls && thread_id != 0 &&
+        arg0 != arg1 && arg2 != arg3 && stack_pointer != return_value)
+    {
+        ++g_hook_monitor_calls;
         g_last_address = address;
     }
 }
@@ -132,6 +146,7 @@ int main(void)
     PbInsHandle ins = {7};
 
     if (pb_ins_insert_capture_regs(ins, OnCaptureRegs, &g_capture_regs_calls) != PB_OK ||
+        pb_ins_insert_hook_monitor(ins, OnHookMonitor, &g_hook_monitor_calls) != PB_OK ||
         pb_ins_insert_capture_regs_ctx(ins, OnCaptureRegsCtx, &g_capture_regs_ctx_calls) != PB_OK ||
         pb_ins_insert_memory_operands(ins, OnMemoryOperand, &g_memory_operand_calls) != PB_OK ||
         pb_ins_insert_memory_address_translation(
@@ -142,7 +157,8 @@ int main(void)
         pb_ins_insert_capture_exec_bytes(ins, OnExecBytes, &g_exec_bytes_calls) != PB_OK ||
         pb_ins_insert_memory_operands_values(ins, OnMemoryOperandValue, &g_memory_value_calls) != PB_OK)
         return 1;
-    if (g_capture_regs_calls != 1 || g_capture_regs_ctx_calls != 1 ||
+    if (g_capture_regs_calls != 1 || g_hook_monitor_calls != 1 ||
+        g_capture_regs_ctx_calls != 1 ||
         g_memory_operand_calls != 1 || g_memory_translation_calls != 1 ||
         g_exec_calls != 1 || g_branch_edge_calls != 1 ||
         g_exec_bytes_calls != 1 || g_memory_value_calls != 1)
@@ -156,6 +172,7 @@ int main(void)
 
     ins.opaque = 0;
     if (pb_ins_insert_capture_regs(ins, OnCaptureRegs, 0) != PB_ERR_INVALID_ARGUMENT ||
+        pb_ins_insert_hook_monitor(ins, OnHookMonitor, 0) != PB_ERR_INVALID_ARGUMENT ||
         pb_ins_insert_capture_regs_ctx(ins, OnCaptureRegsCtx, 0) != PB_ERR_INVALID_ARGUMENT ||
         pb_ins_insert_memory_operands(ins, OnMemoryOperand, 0) != PB_ERR_INVALID_ARGUMENT ||
         pb_ins_insert_memory_address_translation(
@@ -167,6 +184,7 @@ int main(void)
         return 4;
     ins.opaque = 1;
     if (pb_ins_insert_capture_regs(ins, 0, 0) != PB_ERR_INVALID_ARGUMENT ||
+        pb_ins_insert_hook_monitor(ins, 0, 0) != PB_ERR_INVALID_ARGUMENT ||
         pb_ins_insert_capture_regs_ctx(ins, 0, 0) != PB_ERR_INVALID_ARGUMENT ||
         pb_ins_insert_memory_operands(ins, 0, 0) != PB_ERR_INVALID_ARGUMENT ||
         pb_ins_insert_memory_address_translation(
@@ -178,7 +196,8 @@ int main(void)
         pb_ins_insert_capture_exec_bytes(ins, 0, 0) != PB_ERR_INVALID_ARGUMENT ||
         pb_ins_insert_memory_operands_values(ins, 0, 0) != PB_ERR_INVALID_ARGUMENT)
         return 5;
-    if (g_capture_regs_calls != 1 || g_capture_regs_ctx_calls != 1 ||
+    if (g_capture_regs_calls != 1 || g_hook_monitor_calls != 1 ||
+        g_capture_regs_ctx_calls != 1 ||
         g_memory_operand_calls != 1 || g_memory_translation_calls != 1 ||
         g_exec_calls != 1 || g_branch_edge_calls != 1 ||
         g_exec_bytes_calls != 1 || g_memory_value_calls != 1)

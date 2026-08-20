@@ -45,6 +45,13 @@ def verify_observers(event):
 
 
 def intercept_skip(event):
+    decoded = pb.disasm(event["address"], 2)
+    if not decoded or decoded[0][0] != event["address"]:
+        raise RuntimeError("synchronous Hook disassembly failed")
+    pb.print(
+        "HOOK_SYNC_DISASM address=0x%x size=%d text=%s"
+        % (decoded[0][0], decoded[0][1], decoded[0][4])
+    )
     registers = event["registers"]
     argument_register = "rcx" if "rcx" in registers else "stack0"
     argument = registers.get("rcx", event["arguments"][0])
@@ -101,10 +108,12 @@ def pb_init():
     )
     pb.on("process.prepare_fini", verify_observers, once=True)
     entry_id = pb.intercept(
-        "hook.entry", intercept_skip, address=skip_address, once=False
+        "hook.entry", intercept_skip, address=skip_address,
+        description="skip the fixture entry and return the configured value", once=False
     )
     return_id = pb.intercept(
-        "hook.return", intercept_return, address=return_address, once=True
+        "hook.return", intercept_return, address=return_address,
+        description="inspect and replace the fixture return value once", once=True
     )
     pb.print(
         "HOOK_INTERCEPT_READY entry_id=%d return_id=%d observe=%d/%d entry=0x%x return=0x%x"

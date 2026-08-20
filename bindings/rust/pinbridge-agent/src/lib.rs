@@ -9,17 +9,18 @@ mod bp;
 mod child_process;
 mod context;
 mod control;
+mod debugger;
 mod diag;
 mod disasm;
-mod debugger;
 mod emergency;
 mod engines;
 mod event;
 mod event_channel;
-mod execution_trap;
 mod exception;
-mod hooks;
+mod execution_trap;
 mod high_priority;
+mod hook_events;
+mod hooks;
 mod instrumentation_lifecycle;
 mod lifecycle;
 mod log;
@@ -31,13 +32,13 @@ mod query_server;
 mod record;
 mod resolve;
 mod ring;
-mod sync_intercept;
 #[cfg(feature = "scripting")]
 mod scripting;
 #[cfg(not(feature = "scripting"))]
 #[path = "scripting_stub.rs"]
 mod scripting;
 mod stepper;
+mod sync_intercept;
 mod syscall_engine;
 
 use core::ffi::{c_char, c_int, c_void};
@@ -61,8 +62,7 @@ pub(crate) fn entry_bp_address() -> u64 {
 /// threads. The fixed-key SipHash hasher never touches TLS; the keys hashed
 /// here (addresses, plugin names) are not adversarial, so deterministic
 /// hashing is fine.
-pub type TlsFreeBuild =
-    std::hash::BuildHasherDefault<std::collections::hash_map::DefaultHasher>;
+pub type TlsFreeBuild = std::hash::BuildHasherDefault<std::collections::hash_map::DefaultHasher>;
 pub type TlsFreeMap<K, V> = std::collections::HashMap<K, V, TlsFreeBuild>;
 pub type TlsFreeSet<K> = std::collections::HashSet<K, TlsFreeBuild>;
 
@@ -85,11 +85,34 @@ fn agent_main(argc: c_int, argv: *mut *mut c_char) -> c_int {
     };
     log::init(child_process::control_port_override());
     unsafe {
-        // Routine-name instrumentation (including the early process-exit
-        // edge) requires Pin's symbol manager. Pin requires this before
-        // pb_pin_init/PIN_Init.
-        let symbols_status = pb_pin_init_symbols();
-        log::line(&format!("pb_pin_init_symbols -> {symbols_status}"));
+        // Pin's symbol manager is observable by protected applications and
+        // changes the control flow of some VMP targets. Keep native behavior
+        // as the default; users who explicitly need Pin symbol lookup can opt
+        // in before launch with PINBRIDGE_SYMBOLS=export or =full.
+        let symbols_setting = std::env::var("PINBRIDGE_SYMBOLS").ok();
+        let symbols_status = match symbols_setting.as_deref() {
+            Some("export") => {
+                let mut enabled = 0u8;
+                let status = pb_pin_init_symbols_alt(PB_EXPORT_SYMBOLS, &mut enabled);
+                log::line(&format!(
+                    "Pin export symbols init -> {status} enabled={enabled}"
+                ));
+                if status == PB_OK && enabled == 0 {
+                    PB_ERR_INTERNAL
+                } else {
+                    status
+                }
+            }
+            Some("full") | Some("1") => {
+                let status = pb_pin_init_symbols();
+                log::line(&format!("Pin full symbols init -> {status}"));
+                status
+            }
+            _ => {
+                log::line("Pin symbols disabled (native-behavior default)");
+                PB_OK
+            }
+        };
         if symbols_status != PB_OK {
             return 11;
         }
@@ -127,6 +150,10 @@ fn agent_main(argc: c_int, argv: *mut *mut c_char) -> c_int {
         if observation::init() != PB_OK {
             log::line("filtered observation queue init failed");
             return 20;
+        }
+        if hook_events::init() != PB_OK {
+            log::line("Hook event queue init failed");
+            return 23;
         }
         let bp_status = bp::init();
         log::line(&format!("breakpoint engine init -> {bp_status}"));
@@ -166,11 +193,12 @@ fn agent_main(argc: c_int, argv: *mut *mut c_char) -> c_int {
         } else {
             scripting::initialize_native_policies()
         };
-        log::line(&format!("python native policies init -> {native_policy_status}"));
+        log::line(&format!(
+            "python native policies init -> {native_policy_status}"
+        ));
         if native_policy_status != PB_OK {
             return 15;
         }
-
         // Finish native session setup before starting the Python host. A user
         // script may call pin_detach() as soon as its top level runs, so no
         // session-scoped callback can be registered after scripting::spawn.
@@ -202,7 +230,6 @@ fn agent_main(argc: c_int, argv: *mut *mut c_char) -> c_int {
                 log::line("entry bp: img callback registration failed");
             }
         }
-
         let (trace_start, trace_end) = engines::trace_range();
         let (hook_start, hook_end) = engines::hook_range();
         log::line(&format!(
@@ -213,9 +240,8 @@ fn agent_main(argc: c_int, argv: *mut *mut c_char) -> c_int {
         if spawn_status != PB_OK {
             return 4;
         }
-        let script_status = scripting::spawn(query_server::BOUND_PORT.load(
-            core::sync::atomic::Ordering::Acquire,
-        ));
+        let script_status =
+            scripting::spawn(query_server::BOUND_PORT.load(core::sync::atomic::Ordering::Acquire));
         log::line(&format!("scripting spawn -> {script_status}"));
         if script_status != PB_OK {
             return 8;

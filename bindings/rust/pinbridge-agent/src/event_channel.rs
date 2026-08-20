@@ -69,12 +69,7 @@ impl<const CAPACITY: usize> EventChannel<CAPACITY> {
             .saturating_sub(self.retained_total.load(Ordering::Acquire))
     }
 
-    pub fn try_page(
-        &self,
-        after: u64,
-        limit: usize,
-        out: &mut Vec<Event>,
-    ) -> Option<(u64, u64)> {
+    pub fn try_page(&self, after: u64, limit: usize, out: &mut Vec<Event>) -> Option<(u64, u64)> {
         let mutex = self.mutex.load(Ordering::Acquire) as PbMutexHandle;
         if mutex.is_null() {
             return None;

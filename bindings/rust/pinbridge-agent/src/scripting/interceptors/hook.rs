@@ -154,30 +154,44 @@ pub(super) fn dispatch(request: crate::sync_intercept::InterceptRequest) {
         } else {
             DecisionSelector::HookEntry
         };
+        let targets = super::hook_dispatch_targets(
+            request.address,
+            request.kind == crate::sync_intercept::HOOK_RETURN,
+            request.thread_id,
+        );
         let mut handlers = with_registry(|registry| {
             let mut handlers = Vec::new();
-            for (name, plugin) in registry {
+            let targets = targets
+                .all_threads
+                .iter()
+                .chain(targets.current_thread.iter())
+                .flat_map(|bucket| bucket.iter());
+            for (name, id) in targets {
+                let Some(plugin) = registry.get(name) else {
+                    continue;
+                };
                 if plugin.state != STATE_RUNNING {
                     continue;
                 }
-                for (id, subscription) in &plugin.decisions {
-                    if subscription.selector != selector
-                        || subscription.address != Some(request.address)
-                        || subscription
-                            .thread_id
-                            .map(|thread_id| thread_id != request.thread_id)
-                            .unwrap_or(false)
-                    {
-                        continue;
-                    }
-                    handlers.push(Handler {
-                        plugin: name.clone(),
-                        id: *id,
-                        callback: subscription.callback.clone_ref(py),
-                        once: subscription.once,
-                        order: subscription.order,
-                    });
+                let Some(subscription) = plugin.decisions.get(&id) else {
+                    continue;
+                };
+                if subscription.selector != selector
+                    || subscription.address != Some(request.address)
+                    || subscription
+                        .thread_id
+                        .map(|thread_id| thread_id != request.thread_id)
+                        .unwrap_or(false)
+                {
+                    continue;
                 }
+                handlers.push(Handler {
+                    plugin: name.clone(),
+                    id: *id,
+                    callback: subscription.callback.clone_ref(py),
+                    once: subscription.once,
+                    order: subscription.order,
+                });
             }
             handlers
         });

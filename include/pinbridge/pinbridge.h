@@ -28,7 +28,7 @@ extern "C" {
 #endif
 
 #define PB_ABI_VERSION_MAJOR 1u
-#define PB_ABI_VERSION_MINOR 10u
+#define PB_ABI_VERSION_MINOR 11u
 #define PB_ABI_VERSION ((PB_ABI_VERSION_MAJOR << 16u) | PB_ABI_VERSION_MINOR)
 
 typedef int32_t PbStatus;
@@ -975,6 +975,13 @@ PB_API PbStatus PB_CALL pb_ins_insert_fill_buffer_then(
 typedef void (PB_CALL* PbInsCaptureRegsCallback)(
     uint64_t address, uint32_t thread_id,
     uint64_t rcx, uint64_t rdx, uint64_t r8, uint64_t r9, void* user_data);
+/* ABI v1.11 passive Hook monitor capture. Unlike the context-bearing
+   callback below, this path cannot modify application state. stack_pointer
+   permits ABI-aware safe reads and return_value is RAX/EAX at the point. */
+typedef void (PB_CALL* PbInsHookMonitorCallback)(
+    uint64_t address, uint32_t thread_id,
+    uint64_t arg0, uint64_t arg1, uint64_t arg2, uint64_t arg3,
+    uint64_t stack_pointer, uint64_t return_value, void* user_data);
 /* Context-bearing variant for synchronous Hook actions. The register values
    are captured without querying Pin from the application thread; the borrowed
    context may be changed with pb_pin_set_context_reg or the ABI-aware stack
@@ -997,6 +1004,8 @@ typedef void (PB_CALL* PbInsBranchEdgeCallback)(
 
 PB_API PbStatus PB_CALL pb_ins_insert_capture_regs(
     PbInsHandle ins, PbInsCaptureRegsCallback callback, void* user_data);
+PB_API PbStatus PB_CALL pb_ins_insert_hook_monitor(
+    PbInsHandle ins, PbInsHookMonitorCallback callback, void* user_data);
 PB_API PbStatus PB_CALL pb_ins_insert_capture_regs_ctx(
     PbInsHandle ins, PbInsContextCaptureRegsCallback callback, void* user_data);
 PB_API PbStatus PB_CALL pb_ins_insert_memory_operands(
@@ -1526,11 +1535,16 @@ PB_API PbStatus PB_CALL pb_pin_add_internal_exception_handler(
     PbCallbackHandle* out_callback);
 /* Windows/JIT compatibility for application code that enables the x86 trap
    flag with POPF/POPFD/POPFQ. Pin 3.x otherwise receives the resulting #DB
-   in its translated code cache as an internal exception. The bridge
-   virtualizes that one instruction boundary and raises the single-step back
-   in the application context, preserving normal VEH/SEH delivery. */
+   in its translated code cache as an internal exception. Registration starts
+   in legacy process-wide enabled mode. Call the setter with
+   PB_INVALID_THREAD_ID/0 immediately after registration for dormant/scoped
+   mode, then arm only the application thread being manually stepped. A
+   pending virtualized #DB is still delivered after disabling so an intervening
+   debugger stop cannot discard the application's architectural trap. */
 PB_API PbStatus PB_CALL pb_pin_enable_single_step_passthrough(
     PbCallbackHandle* out_callback);
+PB_API PbStatus PB_CALL pb_pin_set_single_step_passthrough(
+    PbThreadId thread_id, uint8_t enabled);
 PB_API PbStatus PB_CALL pb_pin_try_start(
     PbThreadId thread_id, PbInternalExceptionCallback callback, void* user_data,
     PbCallbackHandle* out_scope);

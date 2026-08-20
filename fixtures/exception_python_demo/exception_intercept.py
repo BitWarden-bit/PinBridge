@@ -85,6 +85,13 @@ def verify_observers(event):
 def handle_exception(event):
     if event["code"] != EXCEPTION_CODE:
         raise RuntimeError("unexpected exception code 0x%x" % event["code"])
+    decoded = pb.disasm(event["address"], 3)
+    if not decoded or decoded[0][0] != event["address"]:
+        raise RuntimeError("synchronous exception disassembly failed")
+    pb.print(
+        "EXCEPTION_SYNC_DISASM address=0x%x size=%d text=%s"
+        % (decoded[0][0], decoded[0][1], decoded[0][4])
+    )
     target_registers = event["registers"]
     instruction_pointer = "rip" if "rip" in target_registers else "eip"
     patch = {instruction_pointer: RECOVERY_ADDRESS}

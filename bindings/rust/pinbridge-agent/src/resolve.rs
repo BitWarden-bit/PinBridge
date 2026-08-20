@@ -21,7 +21,7 @@ struct ExportEntry {
 }
 
 struct Resolver {
-    modules: Vec<Module>, // sorted by low
+    modules: Vec<Module>,                              // sorted by low
     exports: crate::TlsFreeMap<u64, Vec<ExportEntry>>, // by module low, sorted by rva
     failed: crate::TlsFreeSet<u64>, // modules whose export parse failed (don't retry)
 }
@@ -100,11 +100,7 @@ fn refresh_modules(r: &mut Resolver) {
             } else {
                 String::new()
             };
-            let short = name
-                .rsplit(['\\', '/'])
-                .next()
-                .unwrap_or(&name)
-                .to_string();
+            let short = name.rsplit(['\\', '/']).next().unwrap_or(&name).to_string();
             modules.push(Module { low, high, short });
             let mut next = PbImgHandle { opaque: 0 };
             if pb_img_next(img, &mut next) != PB_OK {
@@ -142,9 +138,9 @@ fn parse_exports(base: u64) -> Option<Vec<ExportEntry>> {
     let header = read_mem(base, 0x40)?;
     let pe_off = u32::from_le_bytes(header[0x3c..0x40].try_into().ok()?) as u64;
     let magic = read_u16(base + pe_off + 24)?; // optional header magic
-    // IMAGE_OPTIONAL_HEADER32 and IMAGE_OPTIONAL_HEADER64 place the data
-    // directory at different offsets. The export table fields themselves are
-    // identical once its RVA has been located.
+                                               // IMAGE_OPTIONAL_HEADER32 and IMAGE_OPTIONAL_HEADER64 place the data
+                                               // directory at different offsets. The export table fields themselves are
+                                               // identical once its RVA has been located.
     let data_directory_offset = match magic {
         0x10b => 96u64,  // PE32
         0x20b => 112u64, // PE32+
@@ -167,8 +163,7 @@ fn parse_exports(base: u64) -> Option<Vec<ExportEntry>> {
     let ords = read_mem(base + ords_rva, (num_names * 2) as usize)?;
     let mut out = Vec::with_capacity(num_names as usize);
     for i in 0..num_names as usize {
-        let name_rva =
-            u32::from_le_bytes(name_rvas[i * 4..i * 4 + 4].try_into().ok()?) as u64;
+        let name_rva = u32::from_le_bytes(name_rvas[i * 4..i * 4 + 4].try_into().ok()?) as u64;
         let ord = u16::from_le_bytes(ords[i * 2..i * 2 + 2].try_into().ok()?) as u64;
         if ord >= num_funcs {
             continue;
@@ -181,7 +176,10 @@ fn parse_exports(base: u64) -> Option<Vec<ExportEntry>> {
         let end = raw.iter().position(|b| *b == 0).unwrap_or(raw.len());
         let name = String::from_utf8_lossy(&raw[..end]).into_owned();
         if !name.is_empty() {
-            out.push(ExportEntry { rva: func_rva, name });
+            out.push(ExportEntry {
+                rva: func_rva,
+                name,
+            });
         }
     }
     out.sort_by_key(|e| e.rva);
@@ -296,13 +294,15 @@ pub fn invalidate(base: u64) {
 
 /// EXPORTS: [u16 name_len][module short name] ->
 /// [u32 count][count × (u64 addr, u16 name_len, name bytes)] with
-/// addr = base + rva, capped at 8192 entries.
+/// addr = base + rva, capped at the 32768 native Hook capacity.
 /// Failure policy: unknown module or unparseable export table ->
 /// Err(STATUS_INTERNAL); the query server normalizes that to an empty body
 /// (same as the other Result-returning handlers). A known module with a
 /// valid-but-empty table still returns STATUS_OK with count 0.
 pub fn handle_exports(payload: &[u8]) -> Result<Vec<u8>, u8> {
-    const EXPORTS_MAX: usize = 8192;
+    // A module-wide Hook workflow must not silently truncate large generated
+    // export surfaces below the native 32768 Hook capacity.
+    const EXPORTS_MAX: usize = crate::hooks::MAX_HOOK_POINTS;
     let mut reader = pinbridge_proto::Reader::new(payload);
     let len = reader.u16().ok_or(pinbridge_proto::STATUS_BAD_REQUEST)? as usize;
     let rest = reader.remaining();
@@ -310,9 +310,7 @@ pub fn handle_exports(payload: &[u8]) -> Result<Vec<u8>, u8> {
         return Err(pinbridge_proto::STATUS_BAD_REQUEST);
     }
     let module_name = String::from_utf8_lossy(&rest[..len]).into_owned();
-    let _guard = RESOLVE_LOCK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let _guard = RESOLVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let r = resolver();
     refresh_modules(r);
     let base = match r
@@ -360,16 +358,18 @@ pub fn resolve_name(spec: &str) -> Option<u64> {
     exports
         .iter()
         .find(|e| e.name == export_name)
-        .or_else(|| exports.iter().find(|e| e.name.eq_ignore_ascii_case(export_name)))
+        .or_else(|| {
+            exports
+                .iter()
+                .find(|e| e.name.eq_ignore_ascii_case(export_name))
+        })
         .map(|e| base + e.rva as u64)
 }
 
 /// RESOLVE: [u32 count][count × u64 address] ->
 /// [u32 count] × [u8 kind][u64 base][u64 offset][u16 mlen][module][u16 slen][symbol]
 pub fn handle_resolve(payload: &[u8]) -> Result<Vec<u8>, u8> {
-    let _guard = RESOLVE_LOCK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let _guard = RESOLVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut reader = pinbridge_proto::Reader::new(payload);
     let count = reader.u32().ok_or(pinbridge_proto::STATUS_BAD_REQUEST)?;
     if count > 4096 {

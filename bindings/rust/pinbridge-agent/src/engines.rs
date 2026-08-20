@@ -16,15 +16,25 @@ use core::ffi::c_void;
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 use pinbridge_sys::*;
 
+const HOOK_CONTEXT_FLAG_RETURN: usize = 1 << 0;
+const HOOK_CONTEXT_FLAG_FUNCTION_ENTRY: usize = 1 << 1;
+const HOOK_CONTEXT_FLAG_CALLBACK: usize = 1 << 2;
+
 static ENGINE_ACTIVE: AtomicBool = AtomicBool::new(true);
 static TRACE_START: AtomicU64 = AtomicU64::new(0x1000);
 static TRACE_END: AtomicU64 = AtomicU64::new(u64::MAX);
 static HOOK_START: AtomicU64 = AtomicU64::new(0);
 static HOOK_END: AtomicU64 = AtomicU64::new(0); // empty range: hook engine off
-static ENABLE_EXEC: AtomicBool = AtomicBool::new(true);
-static ENABLE_MEMORY: AtomicBool = AtomicBool::new(true);
-static ENABLE_BRANCH: AtomicBool = AtomicBool::new(true);
-static DEFAULT_INSTRUMENTATION_KINDS: AtomicU64 = AtomicU64::new(0);
+                                                // Start quiescent. Capturing every instruction, memory operand, and branch
+                                                // before the UI/MCP asks for it changes timing and observable behavior in
+                                                // protected targets. Breakpoints, Hooks, stepping, and exception monitoring
+                                                // remain independently active through the shared instrumentation callback.
+static ENABLE_EXEC: AtomicBool = AtomicBool::new(false);
+static ENABLE_MEMORY: AtomicBool = AtomicBool::new(false);
+static ENABLE_BRANCH: AtomicBool = AtomicBool::new(false);
+// Legacy ENGINE_SET / PINBRIDGE_AGENT_ENGINES owns this global mask. Python
+// instrumentation policies remain range/thread scoped in the policy snapshot.
+static GLOBAL_ENGINE_KINDS: AtomicU64 = AtomicU64::new(0);
 
 pub const INSTRUMENT_EXEC: u32 = 1 << EVENT_EXEC;
 pub const INSTRUMENT_MEMORY: u32 = 1 << EVENT_MEMORY;
@@ -33,9 +43,13 @@ pub const INSTRUMENT_DECODE: u32 = 1 << EVENT_INSTRUCTION_DECODE;
 pub const INSTRUMENT_TRACE: u32 = 1 << EVENT_TRACE_INSTRUMENT;
 pub const INSTRUMENT_ROUTINE: u32 = 1 << EVENT_ROUTINE_INSTRUMENT;
 pub const INSTRUMENT_BBL: u32 = 1 << EVENT_BBL_INSTRUMENT;
-pub const INSTRUMENT_ALL: u32 =
-    INSTRUMENT_EXEC | INSTRUMENT_MEMORY | INSTRUMENT_BRANCH | INSTRUMENT_DECODE
-        | INSTRUMENT_TRACE | INSTRUMENT_ROUTINE | INSTRUMENT_BBL;
+pub const INSTRUMENT_ALL: u32 = INSTRUMENT_EXEC
+    | INSTRUMENT_MEMORY
+    | INSTRUMENT_BRANCH
+    | INSTRUMENT_DECODE
+    | INSTRUMENT_TRACE
+    | INSTRUMENT_ROUTINE
+    | INSTRUMENT_BBL;
 pub const MAX_INSTRUMENTATION_RANGES: usize = 64;
 pub const MAX_INSTRUMENTATION_THREADS: usize = 64;
 
@@ -94,30 +108,10 @@ static RETIRED_INSTRUMENTATION_POLICIES: std::sync::Mutex<Vec<usize>> =
     std::sync::Mutex::new(Vec::new());
 static POLICY_GENERATION: AtomicU64 = AtomicU64::new(0);
 
-fn default_kinds() -> u32 {
-    let mut kinds = 0;
-    if ENABLE_EXEC.load(Ordering::Relaxed) {
-        kinds |= INSTRUMENT_EXEC;
-    }
-    if ENABLE_MEMORY.load(Ordering::Relaxed) {
-        kinds |= INSTRUMENT_MEMORY;
-    }
-    if ENABLE_BRANCH.load(Ordering::Relaxed) {
-        kinds |= INSTRUMENT_BRANCH;
-    }
-    kinds
-}
-
 fn default_policy() -> InstrumentationPolicy {
-    let (start, end) = trace_range();
     InstrumentationPolicy {
         generation: 0,
-        rules: vec![InstrumentationRule {
-            kinds: DEFAULT_INSTRUMENTATION_KINDS.load(Ordering::Relaxed) as u32,
-            start,
-            end,
-            threads: Vec::new(),
-        }],
+        rules: Vec::new(),
     }
 }
 
@@ -152,27 +146,45 @@ fn policy() -> &'static InstrumentationPolicy {
 
 #[inline]
 pub(crate) fn wants_at_instrumentation(address: u64, kind: u32) -> bool {
-    policy()
-        .rules
-        .iter()
-        .any(|rule| rule.matches_instrumentation(address, kind))
+    global_engine_matches(address, kind)
+        || policy()
+            .rules
+            .iter()
+            .any(|rule| rule.matches_instrumentation(address, kind))
 }
 
 pub(crate) fn wants_instrumentation_kind(kind: u32) -> bool {
-    policy()
-        .rules
-        .iter()
-        .any(|rule| rule.kinds & (1 << kind) != 0)
+    GLOBAL_ENGINE_KINDS.load(Ordering::Acquire) & (1 << kind) != 0
+        || policy()
+            .rules
+            .iter()
+            .any(|rule| rule.kinds & (1 << kind) != 0)
 }
 
 #[inline]
 pub(crate) fn instrumentation_generation(address: u64, kind: u32) -> Option<u64> {
-    policy().instrumentation_generation(address, kind)
+    if global_engine_matches(address, kind) {
+        Some(POLICY_GENERATION.load(Ordering::Acquire))
+    } else {
+        policy().instrumentation_generation(address, kind)
+    }
 }
 
 #[inline]
 fn analysis_generation(address: u64, thread_id: u32, kind: u32) -> Option<u64> {
-    policy().analysis_generation(address, thread_id, kind)
+    if global_engine_matches(address, kind) {
+        Some(POLICY_GENERATION.load(Ordering::Acquire))
+    } else {
+        policy().analysis_generation(address, thread_id, kind)
+    }
+}
+
+#[inline]
+fn global_engine_matches(address: u64, kind: u32) -> bool {
+    let (start, end) = trace_range();
+    GLOBAL_ENGINE_KINDS.load(Ordering::Acquire) & (1 << kind) != 0
+        && address >= start
+        && address < end
 }
 
 #[cfg(test)]
@@ -212,11 +224,9 @@ pub fn set_instrumentation_policies(
     let mut rules = Vec::new();
     let mut flush_ranges = Vec::new();
     if configs.is_empty() {
+        flush_ranges.extend(policy().rules.iter().map(|rule| (rule.start, rule.end)));
         let default = default_policy();
-        for rule in &default.rules {
-            flush_ranges.push((rule.start, rule.end));
-        }
-        let kinds = default.rules.iter().fold(0, |mask, rule| mask | rule.kinds);
+        let kinds = GLOBAL_ENGINE_KINDS.load(Ordering::Acquire) as u32;
         ENABLE_EXEC.store(kinds & INSTRUMENT_EXEC != 0, Ordering::Release);
         ENABLE_MEMORY.store(kinds & INSTRUMENT_MEMORY != 0, Ordering::Release);
         ENABLE_BRANCH.store(kinds & INSTRUMENT_BRANCH != 0, Ordering::Release);
@@ -259,7 +269,10 @@ pub fn set_instrumentation_policies(
     }
     flush_ranges.sort_unstable();
     flush_ranges.dedup();
-    let kinds = rules.iter().fold(0, |mask, rule| mask | rule.kinds);
+    let kinds = rules.iter().fold(
+        GLOBAL_ENGINE_KINDS.load(Ordering::Acquire) as u32,
+        |mask, rule| mask | rule.kinds,
+    );
     ENABLE_EXEC.store(kinds & INSTRUMENT_EXEC != 0, Ordering::Release);
     ENABLE_MEMORY.store(kinds & INSTRUMENT_MEMORY != 0, Ordering::Release);
     ENABLE_BRANCH.store(kinds & INSTRUMENT_BRANCH != 0, Ordering::Release);
@@ -300,14 +313,30 @@ pub fn configure_from_env() {
             HOOK_END.store(end, Ordering::Relaxed);
         }
     }
-    // Debug/verification aid: comma list out of exec,memory,branch.
+    let mut global_kinds = 0u32;
+    // Explicit startup capture: comma list out of exec,memory,branch.
     if let Ok(value) = std::env::var("PINBRIDGE_AGENT_ENGINES") {
-        ENABLE_EXEC.store(value.contains("exec"), Ordering::Relaxed);
-        ENABLE_MEMORY.store(value.contains("memory"), Ordering::Relaxed);
-        ENABLE_BRANCH.store(value.contains("branch"), Ordering::Relaxed);
+        if value.contains("exec") {
+            global_kinds |= INSTRUMENT_EXEC;
+        }
+        if value.contains("memory") {
+            global_kinds |= INSTRUMENT_MEMORY;
+        }
+        if value.contains("branch") {
+            global_kinds |= INSTRUMENT_BRANCH;
+        }
     }
-    DEFAULT_INSTRUMENTATION_KINDS.store(default_kinds() as u64, Ordering::Relaxed);
+    GLOBAL_ENGINE_KINDS.store(global_kinds as u64, Ordering::Release);
+    ENABLE_EXEC.store(global_kinds & INSTRUMENT_EXEC != 0, Ordering::Release);
+    ENABLE_MEMORY.store(global_kinds & INSTRUMENT_MEMORY != 0, Ordering::Release);
+    ENABLE_BRANCH.store(global_kinds & INSTRUMENT_BRANCH != 0, Ordering::Release);
     publish_policy(default_policy());
+    crate::log::line(&format!(
+        "capture startup exec={} memory={} branch={}",
+        ENABLE_EXEC.load(Ordering::Relaxed),
+        ENABLE_MEMORY.load(Ordering::Relaxed),
+        ENABLE_BRANCH.load(Ordering::Relaxed)
+    ));
 }
 
 pub fn trace_range() -> (u64, u64) {
@@ -327,12 +356,39 @@ pub fn hook_range() -> (u64, u64) {
 /// Runtime engine toggle (immediate: checked inside the analysis callback).
 /// kind: 2=memory 3=exec 4=branch_edge 5=syscall. Returns false on bad kind.
 pub fn set_engine_enabled(kind: u32, on: bool) -> bool {
-    match kind {
-        EVENT_MEMORY => ENABLE_MEMORY.store(on, Ordering::Relaxed),
-        EVENT_EXEC => ENABLE_EXEC.store(on, Ordering::Relaxed),
-        EVENT_BRANCH_EDGE => ENABLE_BRANCH.store(on, Ordering::Relaxed),
-        EVENT_SYSCALL => crate::syscall_engine::set_enabled(on),
+    let (flag, mask) = match kind {
+        EVENT_MEMORY => (&ENABLE_MEMORY, INSTRUMENT_MEMORY as u64),
+        EVENT_EXEC => (&ENABLE_EXEC, INSTRUMENT_EXEC as u64),
+        EVENT_BRANCH_EDGE => (&ENABLE_BRANCH, INSTRUMENT_BRANCH as u64),
+        EVENT_SYSCALL => {
+            crate::syscall_engine::set_enabled(on);
+            return true;
+        }
         _ => return false,
+    };
+    let previous_kinds = if on {
+        GLOBAL_ENGINE_KINDS.fetch_or(mask, Ordering::AcqRel)
+    } else {
+        GLOBAL_ENGINE_KINDS.fetch_and(!mask, Ordering::AcqRel)
+    };
+    let changed = (previous_kinds & mask != 0) != on;
+    let policy_uses_kind = policy()
+        .rules
+        .iter()
+        .any(|rule| rule.kinds as u64 & mask != 0);
+    flag.store(on || policy_uses_kind, Ordering::Release);
+    if changed {
+        POLICY_GENERATION.fetch_add(1, Ordering::AcqRel);
+        let (start, end) = trace_range();
+        let status = unsafe { pb_pin_remove_instrumentation_in_range(start, end) };
+        if status != PB_OK {
+            GLOBAL_ENGINE_KINDS.store(previous_kinds, Ordering::Release);
+            flag.store(
+                previous_kinds & mask != 0 || policy_uses_kind,
+                Ordering::Release,
+            );
+            return false;
+        }
     }
     true
 }
@@ -343,7 +399,10 @@ fn in_range(address: u64, start: u64, end: u64) -> bool {
 }
 
 #[inline]
-unsafe fn query_bool(ins: PbInsHandle, query: unsafe extern "C" fn(PbInsHandle, *mut u8) -> PbStatus) -> bool {
+unsafe fn query_bool(
+    ins: PbInsHandle,
+    query: unsafe extern "C" fn(PbInsHandle, *mut u8) -> PbStatus,
+) -> bool {
     let mut value: u8 = 0;
     query(ins, &mut value) == PB_OK && value != 0
 }
@@ -385,12 +444,93 @@ pub unsafe extern "C" fn on_ins(ins: PbInsHandle, _user_data: *mut c_void) {
         pb_ins_insert_capture_regs(ins, Some(on_hook_regs), core::ptr::null_mut());
     }
 
-    // Runtime hook points receive a borrowed Pin context. The callback still
-    // emits the normal kind-1 event, then applies any precompiled action rules
-    // directly to that context before the application instruction continues.
+    // Monitoring and callback Hooks are different primitives. Passive points
+    // get only register/SP snapshots; a writable Pin context is reserved for
+    // explicit Python interceptors, native action rules, and typed floating
+    // point signatures that cannot be represented by the fixed monitor ABI.
+    let mut runtime_hook_flags = 0usize;
     if runtime_hook {
-        crate::hooks::mark_return(address, query_bool(ins, pb_ins_is_ret));
-        pb_ins_insert_capture_regs_ctx(ins, Some(on_hook_context), core::ptr::null_mut());
+        let is_return = query_bool(ins, pb_ins_is_ret);
+        if is_return {
+            runtime_hook_flags |= HOOK_CONTEXT_FLAG_RETURN;
+        } else if crate::hooks::function_contains(address) {
+            runtime_hook_flags |= HOOK_CONTEXT_FLAG_FUNCTION_ENTRY;
+        }
+        let callback_hook = crate::hooks::rule_interested(address)
+            || crate::sync_intercept::hook_callback_interested(address, is_return);
+        let rich_signature = runtime_hook_flags & HOOK_CONTEXT_FLAG_FUNCTION_ENTRY != 0
+            && crate::hooks::function_signature(address)
+                .map(|signature| signature.float_parameter_mask != 0)
+                .unwrap_or(false);
+        if callback_hook || rich_signature {
+            if callback_hook {
+                runtime_hook_flags |= HOOK_CONTEXT_FLAG_CALLBACK;
+            }
+            pb_ins_insert_capture_regs_ctx(
+                ins,
+                Some(on_hook_context),
+                runtime_hook_flags as *mut c_void,
+            );
+        } else {
+            pb_ins_insert_hook_monitor(
+                ins,
+                Some(on_hook_monitor),
+                runtime_hook_flags as *mut c_void,
+            );
+        }
+    }
+
+    // One-click function Hooks associate every normal `ret` with its routine
+    // entry. The common instruction path pays one flag query only while at
+    // least one function logger exists; only return instructions perform the
+    // routine lookup and lock-free selected-function search.
+    if crate::hooks::functions_any()
+        && (if runtime_hook {
+            runtime_hook_flags & HOOK_CONTEXT_FLAG_RETURN != 0
+        } else {
+            query_bool(ins, pb_ins_is_ret)
+        })
+    {
+        let mut routine = PbRtnHandle { opaque: 0 };
+        let mut routine_start = 0u64;
+        let mut routine_size = 0u64;
+        let routine_owner = if pb_ins_rtn(ins, &mut routine) == PB_OK
+            && pb_rtn_address(routine, &mut routine_start) == PB_OK
+            && pb_rtn_size(routine, &mut routine_size) == PB_OK
+        {
+            let routine_end = routine_start.saturating_add(routine_size.max(1));
+            crate::hooks::function_for_return(address, routine_start, routine_end)
+        } else {
+            None
+        };
+        if let Some(function_address) =
+            routine_owner.or_else(|| crate::hooks::function_for_return_near(address, 0xffff))
+        {
+            let callback_return =
+                crate::sync_intercept::hook_callback_interested(function_address, true);
+            let rich_return = crate::hooks::function_signature(function_address)
+                .map(|signature| signature.return_kind != crate::hooks::VALUE_INTEGER)
+                .unwrap_or(false);
+            if callback_return {
+                pb_ins_insert_capture_regs_ctx(
+                    ins,
+                    Some(on_function_return_callback_context),
+                    function_address as usize as *mut c_void,
+                );
+            } else if rich_return {
+                pb_ins_insert_capture_regs_ctx(
+                    ins,
+                    Some(on_function_return_context),
+                    function_address as usize as *mut c_void,
+                );
+            } else {
+                pb_ins_insert_hook_monitor(
+                    ins,
+                    Some(on_function_return_monitor),
+                    function_address as usize as *mut c_void,
+                );
+            }
+        }
     }
 
     // Python only publishes immutable mapping rules. If this instruction is
@@ -402,13 +542,17 @@ pub unsafe extern "C" fn on_ins(ins: PbInsHandle, _user_data: *mut c_void) {
     // enables; insertions are inert until a session arms (analysis-time
     // re-check inside the record callbacks)
     let (rec_lo, rec_hi) = crate::record::instrumentation_range();
-    let recording = crate::record::instrumentation_enabled()
-        && in_range(address, rec_lo, rec_hi);
+    let recording = crate::record::instrumentation_enabled() && in_range(address, rec_lo, rec_hi);
 
-    if !policy()
-        .rules
-        .iter()
-        .any(|rule| address >= rule.start && address < rule.end)
+    let global_capture = {
+        let (start, end) = trace_range();
+        GLOBAL_ENGINE_KINDS.load(Ordering::Acquire) != 0 && address >= start && address < end
+    };
+    if !global_capture
+        && !policy()
+            .rules
+            .iter()
+            .any(|rule| address >= rule.start && address < rule.end)
     {
         if recording {
             let branchy = query_bool(ins, pb_ins_is_call)
@@ -514,8 +658,157 @@ unsafe extern "C" fn on_hook_regs(
         arg3: r9,
         ..Event::EMPTY
     };
-    if crate::hooks::observation_enabled() {
+    if crate::hooks::observation_interested(address, false) {
         crate::observation::submit(event);
+    }
+    crate::hook_events::submit(event);
+    submit(event);
+}
+
+#[inline]
+unsafe fn monitor_stack_argument(stack_pointer: u64, index: usize) -> u64 {
+    let width = if crate::arch::is_64() { 8u64 } else { 4u64 };
+    let first = if crate::arch::is_64() { 0x28u64 } else { 4u64 };
+    let source = stack_pointer.saturating_add(first + (index as u64).saturating_mul(width));
+    let mut copied = 0u64;
+    if crate::arch::is_64() {
+        let mut value = 0u64;
+        if pb_pin_safe_copy((&mut value as *mut u64).cast(), source, width, &mut copied) == PB_OK
+            && copied == width
+        {
+            value
+        } else {
+            0
+        }
+    } else {
+        let mut value = 0u32;
+        if pb_pin_safe_copy((&mut value as *mut u32).cast(), source, width, &mut copied) == PB_OK
+            && copied == width
+        {
+            u64::from(value)
+        } else {
+            0
+        }
+    }
+}
+
+unsafe fn capture_monitor_signature_arguments(
+    signature: crate::hooks::FunctionSignatureLayout,
+    integer_registers: [u64; 4],
+    stack_pointer: u64,
+) -> [u64; 16] {
+    let mut arguments = [0u64; 16];
+    let count = (signature.parameter_count as usize).min(arguments.len());
+    for index in 0..count {
+        if crate::arch::is_64() && index < 4 {
+            arguments[index] = integer_registers[index];
+            continue;
+        }
+        if crate::arch::is_32()
+            && signature.calling_convention == crate::hooks::CALL_CONV_X86_FASTCALL
+            && index < 2
+        {
+            arguments[index] = integer_registers[index];
+            continue;
+        }
+        let stack_index = if crate::arch::is_64() {
+            index.saturating_sub(4)
+        } else if signature.calling_convention == crate::hooks::CALL_CONV_X86_FASTCALL {
+            index.saturating_sub(2)
+        } else {
+            index
+        };
+        arguments[index] = monitor_stack_argument(stack_pointer, stack_index);
+    }
+    arguments
+}
+
+/// Passive Hook monitor callback. It has no writable context and therefore
+/// cannot run native action rules or rendezvous with Python interceptors.
+unsafe extern "C" fn on_hook_monitor(
+    address: u64,
+    thread_id: u32,
+    arg0: u64,
+    arg1: u64,
+    arg2: u64,
+    arg3: u64,
+    stack_pointer: u64,
+    return_value: u64,
+    user_data: *mut c_void,
+) {
+    if crate::hooks::take_replay_guard(thread_id, address) {
+        return;
+    }
+    let flags = user_data as usize;
+    let is_return = flags & HOOK_CONTEXT_FLAG_RETURN != 0;
+    let function_entry = flags & HOOK_CONTEXT_FLAG_FUNCTION_ENTRY != 0;
+    let signature = function_entry
+        .then(|| crate::hooks::function_signature(address))
+        .flatten();
+    let integer_registers = [arg0, arg1, arg2, arg3];
+    let signature_arguments = signature.map(|signature| {
+        capture_monitor_signature_arguments(signature, integer_registers, stack_pointer)
+    });
+    let event = if is_return {
+        Event {
+            kind: EVENT_HOOK_RETURN,
+            thread_id,
+            address,
+            arg0: return_value,
+            arg1: arg0,
+            arg2: arg1,
+            arg3: arg2,
+            arg4: arg3,
+            ..Event::EMPTY
+        }
+    } else if let Some(arguments) = signature_arguments {
+        Event {
+            kind: EVENT_HOOK_REGS,
+            thread_id,
+            address,
+            arg0: arguments[0],
+            arg1: arguments[1],
+            arg2: arguments[2],
+            arg3: arguments[3],
+            arg4: arguments[4],
+            arg5: arguments[5],
+            arg6: arguments[6],
+            arg7: arguments[7],
+            ..Event::EMPTY
+        }
+    } else {
+        Event {
+            kind: EVENT_HOOK_REGS,
+            thread_id,
+            address,
+            arg0,
+            arg1,
+            arg2,
+            arg3,
+            arg4: monitor_stack_argument(stack_pointer, 0),
+            arg5: monitor_stack_argument(stack_pointer, 1),
+            arg6: monitor_stack_argument(stack_pointer, 2),
+            arg7: monitor_stack_argument(stack_pointer, 3),
+            ..Event::EMPTY
+        }
+    };
+    if function_entry {
+        crate::hooks::track_function_entry_stack(thread_id, stack_pointer, address);
+    }
+    if crate::hooks::observation_interested(address, is_return) {
+        crate::observation::submit(event);
+    }
+    if let (Some(signature), Some(arguments)) = (signature, signature_arguments) {
+        crate::hook_events::submit_signature_entry(
+            address,
+            thread_id,
+            signature.parameter_count,
+            arguments,
+        );
+    } else if function_entry {
+        crate::hook_events::submit_function(event);
+    } else {
+        crate::hook_events::submit(event);
     }
     submit(event);
 }
@@ -528,8 +821,10 @@ unsafe extern "C" fn on_hook_context(
     rdx: u64,
     r8: u64,
     r9: u64,
-    _user_data: *mut c_void,
+    user_data: *mut c_void,
 ) {
+    let hook_flags = user_data as usize;
+    let callback_hook = hook_flags & HOOK_CONTEXT_FLAG_CALLBACK != 0;
     if crate::hooks::take_replay_guard(thread_id, address) {
         return;
     }
@@ -537,16 +832,18 @@ unsafe extern "C" fn on_hook_context(
     // fixed a0..a3 slots remain the captured register values for compatibility
     // with existing hook scripts.
     let mut stack_args = [0u64; 4];
-    let is_return = crate::hooks::is_return(address);
+    let is_return = hook_flags & HOOK_CONTEXT_FLAG_RETURN != 0;
     if !is_return {
         for (index, value) in stack_args.iter_mut().enumerate() {
-            let _ = pb_pin_get_context_stack_arg(
-                context as PbConstContextHandle,
-                index as u32,
-                value,
-            );
+            let _ =
+                pb_pin_get_context_stack_arg(context as PbConstContextHandle, index as u32, value);
         }
     }
+    let function_entry = hook_flags & HOOK_CONTEXT_FLAG_FUNCTION_ENTRY != 0;
+    let signature = function_entry
+        .then(|| crate::hooks::function_signature(address))
+        .flatten();
+    let mut signature_arguments = None;
     let event = if is_return {
         let mut return_value = 0;
         let _ = pb_pin_get_context_reg(
@@ -571,6 +868,27 @@ unsafe extern "C" fn on_hook_context(
             arg7: stack_args[2],
             ..Event::EMPTY
         }
+    } else if let Some(signature) = signature {
+        let arguments = capture_signature_arguments(
+            context as PbConstContextHandle,
+            signature,
+            [rcx, rdx, r8, r9],
+        );
+        signature_arguments = Some(arguments);
+        Event {
+            kind: EVENT_HOOK_REGS,
+            thread_id,
+            address,
+            arg0: arguments[0],
+            arg1: arguments[1],
+            arg2: arguments[2],
+            arg3: arguments[3],
+            arg4: arguments[4],
+            arg5: arguments[5],
+            arg6: arguments[6],
+            arg7: arguments[7],
+            ..Event::EMPTY
+        }
     } else {
         Event {
             kind: EVENT_HOOK_REGS,
@@ -587,34 +905,238 @@ unsafe extern "C" fn on_hook_context(
             ..Event::EMPTY
         }
     };
-    if crate::hooks::observation_enabled() {
+    if function_entry {
+        crate::hooks::track_function_entry(thread_id, context, address);
+    }
+    if crate::hooks::observation_interested(address, is_return) {
         crate::observation::submit(event);
     }
+    if let (Some(signature), Some(arguments)) = (signature, signature_arguments) {
+        crate::hook_events::submit_signature_entry(
+            address,
+            thread_id,
+            signature.parameter_count,
+            arguments,
+        );
+    } else if function_entry {
+        crate::hook_events::submit_function(event);
+    } else {
+        crate::hook_events::submit(event);
+    }
     submit(event);
+    if !callback_hook {
+        return;
+    }
     let mut changed =
-        crate::hooks::apply_rules(address, thread_id, context, [rcx, rdx, r8, r9]) > 0;
-    if let Some(response) = crate::sync_intercept::decide_hook(
-        address,
-        thread_id,
-        is_return,
-        context,
-        stack_args,
-    ) {
+        crate::hooks::apply_rules(address, thread_id, context, [rcx, rdx, r8, r9], is_return) > 0;
+    if let Some(response) =
+        crate::sync_intercept::decide_hook(address, thread_id, is_return, context, stack_args)
+    {
         changed |= crate::sync_intercept::apply_hook_response(context, &response, is_return);
         if response.action == crate::sync_intercept::HOOK_ACTION_RETURN
             && !is_return
             && crate::sync_intercept::return_from_hook(context)
         {
+            if function_entry {
+                crate::hooks::cancel_function_entry(thread_id, address);
+            }
             let _ = pb_pin_execute_at(context as PbConstContextHandle);
             return;
         }
         if crate::sync_intercept::response_changes_instruction_pointer(&response) && changed {
+            if function_entry {
+                crate::hooks::cancel_function_entry(thread_id, address);
+            }
             let _ = pb_pin_execute_at(context as PbConstContextHandle);
             return;
         }
     }
     if changed {
         let _ = crate::hooks::execute_modified_context(thread_id, address, context);
+    }
+}
+
+#[inline]
+unsafe fn context_xmm_low(context: PbConstContextHandle, index: u32) -> u64 {
+    let mut bytes = [0u8; 16];
+    let mut required = 0u64;
+    let reg = pinbridge_sys::PB_REG_XMM0 + index;
+    if pb_pin_get_context_regval(
+        context,
+        reg,
+        bytes.as_mut_ptr(),
+        bytes.len() as u64,
+        &mut required,
+    ) != PB_OK
+        || required < 4
+    {
+        return 0;
+    }
+    u64::from_le_bytes(bytes[..8].try_into().unwrap_or([0u8; 8]))
+}
+
+/// Resolve the first eight declared arguments to their ABI locations. The
+/// signature layout is an immutable sorted snapshot; this path performs no
+/// allocation, text parsing, locking, or Python dispatch.
+unsafe fn capture_signature_arguments(
+    context: PbConstContextHandle,
+    signature: crate::hooks::FunctionSignatureLayout,
+    integer_registers: [u64; 4],
+) -> [u64; 16] {
+    let mut arguments = [0u64; 16];
+    let count = (signature.parameter_count as usize).min(arguments.len());
+    for index in 0..count {
+        let floating = signature.float_parameter_mask & (1u32 << index) != 0;
+        if crate::arch::is_64() && index < 4 {
+            arguments[index] = if floating {
+                context_xmm_low(context, index as u32)
+            } else {
+                integer_registers[index]
+            };
+            continue;
+        }
+        if crate::arch::is_32()
+            && signature.calling_convention == crate::hooks::CALL_CONV_X86_FASTCALL
+            && index < 2
+            && !floating
+        {
+            arguments[index] = integer_registers[index];
+            continue;
+        }
+        let stack_index = if crate::arch::is_64() {
+            index.saturating_sub(4)
+        } else if signature.calling_convention == crate::hooks::CALL_CONV_X86_FASTCALL {
+            index.saturating_sub(2)
+        } else {
+            index
+        };
+        let _ = pb_pin_get_context_stack_arg(context, stack_index as u32, &mut arguments[index]);
+    }
+    arguments
+}
+
+unsafe extern "C" fn on_function_return_monitor(
+    return_instruction: u64,
+    thread_id: u32,
+    _arg0: u64,
+    _arg1: u64,
+    _arg2: u64,
+    _arg3: u64,
+    stack_pointer: u64,
+    return_value: u64,
+    user_data: *mut c_void,
+) {
+    if crate::hooks::take_replay_guard(thread_id, return_instruction) {
+        return;
+    }
+    let function_address = user_data as usize as u64;
+    if function_address == 0 || !crate::hooks::function_contains(function_address) {
+        return;
+    }
+    if !crate::hooks::take_function_return_stack(thread_id, stack_pointer, function_address) {
+        return;
+    }
+    let signature = crate::hooks::function_signature(function_address);
+    let event = Event {
+        kind: EVENT_HOOK_RETURN,
+        thread_id,
+        address: function_address,
+        arg0: return_value,
+        ..Event::EMPTY
+    };
+    if crate::hooks::observation_interested(function_address, true) {
+        crate::observation::submit(event);
+    }
+    if signature.is_some() {
+        crate::hook_events::submit_signature_return(function_address, thread_id, return_value);
+    } else {
+        crate::hook_events::submit_function(event);
+    }
+    submit(event);
+}
+
+unsafe extern "C" fn on_function_return_context(
+    return_instruction: u64,
+    thread_id: u32,
+    context: PbContextHandle,
+    _rcx: u64,
+    _rdx: u64,
+    _r8: u64,
+    _r9: u64,
+    user_data: *mut c_void,
+) {
+    handle_function_return_context(return_instruction, thread_id, context, user_data, false);
+}
+
+unsafe extern "C" fn on_function_return_callback_context(
+    return_instruction: u64,
+    thread_id: u32,
+    context: PbContextHandle,
+    _rcx: u64,
+    _rdx: u64,
+    _r8: u64,
+    _r9: u64,
+    user_data: *mut c_void,
+) {
+    handle_function_return_context(return_instruction, thread_id, context, user_data, true);
+}
+
+unsafe fn handle_function_return_context(
+    return_instruction: u64,
+    thread_id: u32,
+    context: PbContextHandle,
+    user_data: *mut c_void,
+    callback_hook: bool,
+) {
+    if callback_hook && crate::hooks::take_replay_guard(thread_id, return_instruction) {
+        return;
+    }
+    let function_address = user_data as usize as u64;
+    if function_address == 0
+        || !crate::hooks::function_contains(function_address)
+        || !crate::hooks::take_function_return(thread_id, context, function_address)
+    {
+        return;
+    }
+    let signature = crate::hooks::function_signature(function_address);
+    let mut return_value = 0u64;
+    if signature
+        .map(|layout| layout.return_kind != crate::hooks::VALUE_INTEGER)
+        .unwrap_or(false)
+    {
+        return_value = context_xmm_low(context as PbConstContextHandle, 0);
+    } else {
+        let _ = pb_pin_get_context_reg(
+            context as PbConstContextHandle,
+            crate::arch::return_reg(),
+            &mut return_value,
+        );
+    }
+    let event = Event {
+        kind: EVENT_HOOK_RETURN,
+        thread_id,
+        address: function_address,
+        arg0: return_value,
+        ..Event::EMPTY
+    };
+    if crate::hooks::observation_interested(function_address, true) {
+        crate::observation::submit(event);
+    }
+    if signature.is_some() {
+        crate::hook_events::submit_signature_return(function_address, thread_id, return_value);
+    } else {
+        crate::hook_events::submit_function(event);
+    }
+    submit(event);
+    if !callback_hook {
+        return;
+    }
+    if let Some(response) =
+        crate::sync_intercept::decide_hook(function_address, thread_id, true, context, [0; 4])
+    {
+        if crate::sync_intercept::apply_hook_response(context, &response, true) {
+            let _ = crate::hooks::execute_modified_context(thread_id, return_instruction, context);
+        }
     }
 }
 
@@ -644,12 +1166,7 @@ unsafe extern "C" fn on_memory(
     });
 }
 
-unsafe extern "C" fn on_exec(
-    address: u64,
-    thread_id: u32,
-    size: u32,
-    _user_data: *mut c_void,
-) {
+unsafe extern "C" fn on_exec(address: u64, thread_id: u32, size: u32, _user_data: *mut c_void) {
     if crate::stepper::on_step_event(thread_id, address) {
         return;
     }

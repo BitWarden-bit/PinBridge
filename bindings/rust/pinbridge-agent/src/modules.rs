@@ -79,6 +79,10 @@ pub fn register() -> PbStatus {
         if status != PB_OK {
             return status;
         }
-        pb_img_add_unload_function(Some(on_img_unload), core::ptr::null_mut(), &mut unload_handle)
+        pb_img_add_unload_function(
+            Some(on_img_unload),
+            core::ptr::null_mut(),
+            &mut unload_handle,
+        )
     }
 }
